@@ -1,0 +1,2 @@
+# Preserve audited source and upstream license bytes on every checkout.
+* -text
