@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chasteady-local-worker"
+version = "0.1.0"
+description = "Local ChaSteady media stabilization worker and loopback API"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy==1.26.4",
+  "scipy==1.13.1",
+  "opencv-python-headless==4.11.0.86",
+]
+
+[project.scripts]
+chasteady = "cha_stabilizer.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cha_stabilizer*"]

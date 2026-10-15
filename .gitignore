@@ -1,0 +1,59 @@
+# Local environments, downloads, private audits and media data.
+/private/
+.venv/
+.env
+.env.*
+!.env.example
+**/__pycache__/
+**/*.py[cod]
+
+# Generated development and compiler output.
+.dart_tool/
+build/
+/ui/.dart_tool/
+/ui/build/
+/ui/windows/flutter/ephemeral/
+**/.vs/
+**/CMakeFiles/
+**/CMakeCache.txt
+*.pdb
+*.ilk
+*.exp
+*.obj
+*.exe
+*.dll
+*.pyd
+*.wasm
+*.vsix
+
+# Footage, trajectory caches, dumps, logs and downloaded archives.
+*.[mM][pP]4
+*.[mM][oO][vV]
+*.[mM][xX][fF]
+*.[mM][kK][vV]
+*.[aA][vV][iI]
+*.wav
+*.aac
+*.flac
+*.mp3
+*.npz
+*.npy
+*.gyroflow
+*.log
+*.dmp
+*.zip
+*.7z
+*.tar
+*.gz
+
+# This third-party font is acquired from its pinned provenance during CI.
+/ui/assets/fonts/NotoSansSC-wght.ttf
+
+# Public documentation is an explicit allowlist, not a mirror of local audits.
+/docs/*
+!/docs/CI_BUILD.md
+!/docs/WINDOWS_PORTABLE_GUIDE.md
+!/docs/licenses/
+!/docs/worker_math_golden_summary_*.json
+/docs/licenses/collection-manifest.json
+/docs/licenses/**/*.xml

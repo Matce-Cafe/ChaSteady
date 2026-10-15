@@ -1,0 +1,72 @@
+# Third-party notices
+
+ChaSteady's original code is licensed under [MIT](LICENSE). Third-party code, fonts, libraries, Windows components and external applications retain their own terms. The project license does not relicense them.
+
+This file describes the source project and intended build inputs. **It is not legal advice, a complete artifact-specific SBOM, or certification of redistribution compliance.** Consult the exact artifact manifest, retained upstream texts and build configuration. A directory of historical notices is not a list of binaries present in every build.
+
+## Python Worker and build tools
+
+The Windows source-build workflow targets the following stable inputs. Their hashes and actual build outcomes must be recorded by the build; this table is not evidence that a particular Worker has passed its tests.
+
+| Component | Target version | License and notice considerations |
+|---|---:|---|
+| CPython | 3.15.0 | PSF license and the additional notices included with the official interpreter archive. |
+| NumPy | 2.5.4 | BSD-3-Clause project terms and the complete wheel-bundled library notices. |
+| SciPy | 1.18.1 | BSD-3-Clause project terms and the complete wheel-bundled library notices. |
+| opencv-python-headless | 5.0.0.93 | Apache-2.0 project terms and complete upstream/wheel third-party notices. The Python module reports `cv2.__version__` as `5.0.0`; it is not the distribution's full version. |
+| PyInstaller | 6.22.3 | GPL terms with PyInstaller's distribution exception. The exception does not clear the licenses of everything it freezes. |
+| pyinstaller-hooks-contrib | 2026.8 | Retain the exact distribution's copied upstream license and notices. |
+
+The pinned Python build requirements also include pip, altgraph, packaging, pefile, pywin32-ctypes and setuptools. See the provisioning script's explicit version/hash pins and the versioned notice collection for their respective terms. A build dependency is not automatically a bundled runtime component.
+
+The source notice collection is under [docs/licenses/](docs/licenses/), including `python-worker-runtime/` and `python-runtime/`. It can contain notices for previous development versions; those are historical texts, not a claim that the old Python interpreter or wheels are shipped in the current package. Private local provisioning reports, download paths and environment manifests are deliberately not published.
+
+NumPy/SciPy wheel notices include OpenBLAS/LAPACK and may include GCC runtime, GCC Runtime Library Exception and libquadmath LGPL text. OpenCV's combined third-party notice can include platform-specific or optional components. Preserve complete upstream texts rather than assuming that a Python package's top-level license covers every DLL or selectively shortening the notices without an artifact-level review.
+
+The local CPython acquisition checked the official archive digest and Windows PSF Authenticode identity. Matching the digest in a Sigstore bundle is not independent verification of its certificate signature or Rekor inclusion proof, and the interpreter's signature does not sign third-party wheel libraries or the generated Worker.
+
+## Flutter, Dart, UI packages and Windows scaffold
+
+The current SDK target is Flutter 3.47.7 / Dart 3.13.5. Flutter's own pinned dependency combination is retained; overriding SDK-internal packages merely to obtain a higher version is not part of this build.
+
+Retained notice texts include:
+
+- [Flutter framework](docs/licenses/flutter/3.47.7/Flutter-LICENSE.txt).
+- [Dart SDK](docs/licenses/dart/3.13.5/Dart-SDK-LICENSE.txt).
+- [Flutter engine and sky_engine](docs/licenses/flutter-engine/3.47.7/), including the corresponding Chromium/engine notice texts.
+- [Hosted Dart package notices](docs/licenses/pub/), including the bilingual UI lock snapshot. The lock file is authoritative for the resolved package versions.
+- [Generated Web notice snapshots](docs/licenses/flutter-web-build/). A successful new build must also retain its own generated `assets/NOTICES`.
+
+The Flutter Windows runner includes SDK scaffold material; the root MIT license does not replace Flutter's applicable terms. The original application-specific native player uses Windows Media Foundation, D3D11 and Flutter Texture integration. It does not bundle libmpv, MDK or a WebView media shell.
+
+## Fonts and application assets
+
+- The Material Icons attribution text is retained under [docs/licenses/fonts/](docs/licenses/fonts/), along with the copied Roboto and Roboto Condensed notices.
+- Noto Sans SC is licensed under the **SIL Open Font License 1.1**, not MIT. Its full [OFL](ui/assets/fonts/OFL.txt) and pinned [provenance](ui/assets/fonts/PROVENANCE.txt) are retained. The source-build preparation obtains the font as data from the fixed Google Fonts revision/blob, checks its byte count and digests, and bundles it locally. The application must not fetch its normal UI fonts from a runtime CDN.
+- The application icon is generated by this project's original icon generator. Referenced Flutter fonts and engine assets remain third-party materials.
+
+## CanvasKit / Skia coverage boundary
+
+The generated Web notice text contains an explicit Skia entry, including Google copyright and BSD terms; the copied `sky_engine` notice also contains Skia terms. A historical scan that found no CanvasKit-specific LICENSE filename in one SDK subdirectory did **not** establish that Skia notices were missing throughout the SDK.
+
+However, **complete artifact-specific CanvasKit/Skia third-party coverage remains unresolved**. Aggregate notices and source dependency declarations do not by themselves establish a verified mapping of every exact JS/WASM variant, build flag and transitive dependency to its required texts. Retain the generated notices and obtain the authoritative inventory for the precise release artifacts before claiming complete coverage. Neither a successful build nor the presence of a Skia entry establishes legal clearance.
+
+## Windows runtime components
+
+The native application and any app-local Microsoft C/C++ runtime components are subject to their respective Microsoft terms and redistribution conditions, not the project's MIT license. Record the exact copied runtime version and hashes. An installer or publisher signature is a provenance check, not a substitute for those terms or a signature on ChaSteady's locally built executable.
+
+## Separately installed media applications
+
+FFmpeg/ffprobe, Gyroflow and Sony Catalyst Browse are configured as existing local tools. This project does not default to bundling their executables. Their presence on a user's computer is not a redistribution grant.
+
+- **FFmpeg/ffprobe:** the effective license depends on the exact build configuration and linked components; builds may be LGPL- or GPL-configured. A future bundled build requires its own binary/configuration audit and applicable notices/source obligations. Do not infer its license from a filename.
+- **Gyroflow:** upstream declares GPL-3.0-or-later. Its executable and source are not copied into this project's original code under MIT. Any proposed redistribution must review the precise build, dependencies and corresponding-source obligations.
+- **Sony Catalyst Browse:** proprietary software under Sony's terms. No entitlement to Catalyst Prepare or permission to redistribute Sony binaries is implied. No login, activation or license checks are bypassed.
+
+A separate-process boundary is an implementation fact, **not an automatic GPL exception or legal safe harbor**. The legal characterization depends on the actual technical and distribution model.
+
+## Build and publication status
+
+The public repository publishes the project's authorized source, necessary notice texts and explicitly sanitized validation summaries. It does not publish user media, experiment caches, profiles, credentials, private machine configuration or local prebuilt Worker bundles.
+
+Cloud-produced directory/ZIP packages are distinct build artifacts. Their `BUILD_STATUS.json` and manifests must state the actual versions and checks, whether they are unsigned, and whether native runtime acceptance was performed. `public_distribution_cleared: false` must not be presented as a legal or safety certification. Source publication under MIT, a successful build and mathematical regression checks do not establish complete redistribution clearance, native playback acceptance or perceptual quality.
