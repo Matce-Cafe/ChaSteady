@@ -58,7 +58,8 @@ EXPECTED_THRESHOLDS = {"matrix_max_absolute_error": 1e-9,
 EXPECTED_RUNNER_LABEL = "windows-2025-vs2026"
 MIN_VISUAL_STUDIO = (18, 11, 0)
 MIN_MSVC = (14, 50)
-MIN_CMAKE = (4, 4, 3)
+# Stable VS 18.11 official bundle baseline, not standalone upstream latest.
+MIN_CMAKE = (4, 3, 1)
 MIN_WINDOWS_SDK = (10, 0, 28000, 0)
 MIN_WINDOWS_SDK_PRODUCT = (10, 1, 28000, 2957)
 MIN_WINDOWS_SDK_INSTALLER_SERVICING = (10, 0, 28000, 2957)

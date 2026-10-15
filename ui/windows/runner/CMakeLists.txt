@@ -35,7 +35,10 @@ target_compile_definitions(${BINARY_NAME} PRIVATE "NOMINMAX")
 
 # Add dependency libraries and include directories. Add any application-specific
 # dependencies here.
-target_link_libraries(${BINARY_NAME} PRIVATE flutter flutter_wrapper_app)
+# The native bridge uses PluginRegistrarWindows from the plugin wrapper.
+target_link_libraries(${BINARY_NAME} PRIVATE
+  flutter flutter_wrapper_app flutter_wrapper_plugin
+)
 target_link_libraries(${BINARY_NAME} PRIVATE
   dwmapi mfplat mf mfuuid d3d11 dxgi ole32 oleaut32 shell32 advapi32 uuid
 )

@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 from pathlib import Path
+import re
 import sys
 import tempfile
 import unittest
@@ -156,8 +157,8 @@ class CiBuildWindowsTests(unittest.TestCase):
                 "sdk_installer": sdk_audit}, cmake
 
     def test_cmake_versions_accept_stable_plain_and_microsoft_suffix_only(self):
-        accepted = {"4.4.3": (4, 4, 3), "4.4.3-msvc1": (4, 4, 3),
-                    "4.4.4-msvc12": (4, 4, 4)}
+        accepted = {"4.3.1": (4, 3, 1), "4.3.1-msvc1": (4, 3, 1),
+                    "4.4.3": (4, 4, 3), "4.4.3-msvc1": (4, 4, 3), "4.4.4-msvc12": (4, 4, 4)}
         for raw, numeric in accepted.items():
             with self.subTest(raw=raw):
                 self.assertEqual(ci._parse_cmake_version(raw), numeric)
@@ -170,7 +171,9 @@ class CiBuildWindowsTests(unittest.TestCase):
 
     def test_microsoft_cmake_suffix_preserves_provenance_without_relaxing_numeric_floor(self):
         report, cmake = self._toolchain_report()
-        for raw, passes in (("4.4.3-msvc1", True), ("4.4.2-msvc99", False)):
+        self.assertEqual(ci.MIN_CMAKE, (4, 3, 1))
+        for raw, passes in (("4.3.1-msvc1", True), ("4.3.0-msvc99", False),
+                            ("4.4.3", True), ("4.4.3-msvc1", True)):
             candidate = copy.deepcopy(report)
             candidate["cmake_version"] = raw
             candidate["cmake_version_output"] = "cmake version " + raw + "\n"
@@ -222,7 +225,7 @@ class CiBuildWindowsTests(unittest.TestCase):
         cache = build_root / "CMakeCache.txt"
         cache.write_text("\n".join((
             "CHASTEADY_CMAKE_COMMAND:INTERNAL=" + str(cmake),
-            "CHASTEADY_CMAKE_VERSION:INTERNAL=4.4.3",
+            "CHASTEADY_CMAKE_VERSION:INTERNAL=4.3.1-msvc1",
             "CHASTEADY_CMAKE_GENERATOR:INTERNAL=Visual Studio 18 2026",
             "CHASTEADY_CMAKE_GENERATOR_INSTANCE:INTERNAL=" + str(vs),
             "CHASTEADY_CMAKE_GENERATOR_PLATFORM:INTERNAL=x64",
@@ -230,14 +233,16 @@ class CiBuildWindowsTests(unittest.TestCase):
             "CHASTEADY_CXX_COMPILER_VERSION:INTERNAL=19.50.35717",
             "CHASTEADY_WINDOWS_SDK_VERSION:INTERNAL=10.0.28000.0",
         )), encoding="utf-8")
-        report = {"cmake_path": str(cmake), "cmake_version": "4.4.3", "visual_studio_path": str(vs),
+        report = {"cmake_path": str(cmake), "cmake_version": "4.3.1-msvc1", "visual_studio_path": str(vs),
                   "msvc_toolset_path": str(msvc), "msvc_toolset_version": "14.50.35717",
                   "windows_sdk_version": "10.0.28000.0", "windows_sdk_product_version": "10.1.28000.2957"}
-        completed = subprocess_completed([str(cmake), "--version"], 0, b"cmake version 4.4.3\n")
+        completed = subprocess_completed([str(cmake), "--version"], 0, b"cmake version 4.3.1-msvc1\n")
         with mock.patch.object(ci.subprocess, "run", return_value=completed):
             result = ci.validate_flutter_windows_toolchain(build_root, report)
         self.assertEqual(result["generator"], "Visual Studio 18 2026")
         self.assertEqual(result["windows_sdk_include_version"], "10.0.28000.0")
+        self.assertEqual(result["cmake_version"], "4.3.1-msvc1")
+        self.assertEqual(result["cmake_configured_version"], "4.3.1-msvc1")
         report["cmake_version"] = "4.4.3-msvc1"
         vendor_output = b"cmake version 4.4.3-msvc1\r\n"
         completed = subprocess_completed([str(cmake), "--version"], 0, vendor_output)
@@ -296,6 +301,16 @@ class CiBuildWindowsTests(unittest.TestCase):
             expression = 'set(' + recorded + ' "${' + actual + '}" CACHE INTERNAL '
             with self.subTest(recorded=recorded):
                 self.assertGreater(source.index(expression), project)
+
+    def test_native_registrar_links_the_plugin_wrapper_implementation(self):
+        runner = Path(ci.ROOT) / "ui" / "windows" / "runner"
+        window = (runner / "flutter_window.cpp").read_text(encoding="utf-8")
+        self.assertIn("PluginRegistrarManager::GetInstance()", window)
+        self.assertIn("GetRegistrar<flutter::PluginRegistrarWindows>", window)
+        cmake = (runner / "CMakeLists.txt").read_text(encoding="utf-8")
+        commands = re.findall(r"target_link_libraries\(\$\{BINARY_NAME\}\s+PRIVATE\s+([^)]*)\)", cmake)
+        libraries = {item for command in commands for item in command.split()}
+        self.assertTrue({"flutter", "flutter_wrapper_app", "flutter_wrapper_plugin"}.issubset(libraries))
 
     def test_pyinstaller_manifest_handoff_binds_current_docs_file_without_mutating_env(self):
         manifest = self.root / "docs" / ".ci-worker-runtime-fixture.json"
