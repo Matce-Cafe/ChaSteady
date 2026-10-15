@@ -20,6 +20,17 @@ $minimumSdkServicingRevision = 2957
 $installerRoot = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer'
 $vswhere = Join-Path $installerRoot 'vswhere.exe'
 $setup = Join-Path $installerRoot 'setup.exe'
+$preflightTimer = [Diagnostics.Stopwatch]::StartNew()
+
+function ConvertFrom-StableCmakeVersion([string]$RawVersion) {
+    # Microsoft's VS-bundled stable CMake adds only the official -msvcN suffix.
+    # Do not accept rc/alpha/beta/dev or arbitrary suffixes as stable releases.
+    $match = [regex]::Match($RawVersion, '^(\d+\.\d+\.\d+)(?:-msvc[0-9]+)?$')
+    if (-not $match.Success) {
+        throw "CMake version is not an approved stable/plain or Microsoft -msvcN version: $RawVersion"
+    }
+    return [Version]$match.Groups[1].Value
+}
 
 function Assert-MicrosoftSignature([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
@@ -106,8 +117,12 @@ function Install-OfficialWindowsSdk {
         '--max-filesize', '1073741824', '--dump-header', $headers,
         '--output', $installer, '--write-out', $writeOut, $sdkUrl
     )
+    Write-Host ("[{0:o}] Windows SDK download starting from the official Microsoft entry." -f [DateTime]::UtcNow)
+    $downloadTimer = [Diagnostics.Stopwatch]::StartNew()
     $responseLines = @(& $curl @curlArgs)
     $curlExit = $LASTEXITCODE
+    Write-Host ("Windows SDK download exit={0}; elapsed={1:N2}s." -f $curlExit, $downloadTimer.Elapsed.TotalSeconds)
+    $sdkAuditTimer = [Diagnostics.Stopwatch]::StartNew()
     if ($curlExit -ne 0 -or $responseLines.Count -lt 2) {
         throw "Official Windows SDK download failed (curl exit $curlExit)."
     }
@@ -151,13 +166,19 @@ function Install-OfficialWindowsSdk {
         throw 'Signed Windows SDK installer version is older than the required 28000.2957 servicing level.'
     }
 
+    Write-Host ("Windows SDK installer version={0}; SHA256={1}; signature={2}; audit elapsed={3:N2}s." -f
+        $fileVersion, $installerHash, $signature.Status, $sdkAuditTimer.Elapsed.TotalSeconds)
     # The official Windows SDK 10.0.28000 product line is published as a Burn
     # installer with silent /q mode. Do not specify unverified optional feature IDs.
+    Write-Host ("[{0:o}] Windows SDK install starting with /q /norestart (default feature selection)." -f [DateTime]::UtcNow)
+    $sdkInstallTimer = [Diagnostics.Stopwatch]::StartNew()
     $process = Start-Process -FilePath $installer -ArgumentList '/q /norestart' `
         -WorkingDirectory $env:RUNNER_TEMP -Wait -PassThru -NoNewWindow
+    Write-Host ("Windows SDK install exit={0}; elapsed={1:N2}s." -f $process.ExitCode, $sdkInstallTimer.Elapsed.TotalSeconds)
     if ($process.ExitCode -ne 0) {
         throw "Official Windows SDK quiet install returned exit code $($process.ExitCode)."
     }
+    $sdkVerifyTimer = [Diagnostics.Stopwatch]::StartNew()
     $installedVersion = Get-InstalledTargetSdkVersion
     if (-not $installedVersion) {
         throw 'Windows SDK installation did not register a verified 28000.2957-or-newer servicing version.'
@@ -167,6 +188,24 @@ function Install-OfficialWindowsSdk {
     if (-not (Test-Path -LiteralPath $includePath -PathType Container)) {
         throw 'Windows SDK servicing installer did not install the required 10.0.28000.0 include tree.'
     }
+    $kitsRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'
+    $requiredDesktopFiles = @(
+        'Include\10.0.28000.0\um\Windows.h',
+        'Include\10.0.28000.0\shared\sdkddkver.h',
+        'Include\10.0.28000.0\ucrt\stdio.h',
+        'Lib\10.0.28000.0\um\x64\kernel32.lib',
+        'Lib\10.0.28000.0\um\x64\user32.lib',
+        'Lib\10.0.28000.0\ucrt\x64\ucrt.lib',
+        'bin\10.0.28000.0\x64\rc.exe',
+        'bin\10.0.28000.0\x64\mt.exe'
+    )
+    foreach ($relative in $requiredDesktopFiles) {
+        if (-not (Test-Path -LiteralPath (Join-Path $kitsRoot $relative) -PathType Leaf)) {
+            throw "Installed Windows SDK is missing a required x64 desktop header/library/tool: $relative"
+        }
+    }
+    Write-Host ("Windows SDK installed product={0}; include=10.0.28000.0; x64 desktop headers/libraries/tools verified; validation elapsed={1:N2}s." -f
+        $installedVersion, $sdkVerifyTimer.Elapsed.TotalSeconds)
     return [ordered]@{
         source_id = 'microsoft-official-windows-sdk-fwlink-2382519'
         download_host = $effectiveUri.Host
@@ -183,6 +222,7 @@ function Install-OfficialWindowsSdk {
 }
 
 if ($UpdateStableVisualStudio) {
+    $vsUpdateTimer = [Diagnostics.Stopwatch]::StartNew()
     $updateTarget = Get-FlutterStableVisualStudioInstance
     if (-not $updateTarget.installationPath -or [bool]$updateTarget.isPrerelease -or
         ([Version]$updateTarget.installationVersion -lt [Version]'18.0.0.0') -or
@@ -198,19 +238,18 @@ if ($UpdateStableVisualStudio) {
     # Start-Process -Wait provides synchronous completion; setup.exe is not given --wait.
     $arguments = 'update --quiet --norestart --installPath "{0}" --channelUri https://aka.ms/vs/stable/channel' -f $installPath
     $workingDirectory = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }
+    Write-Host ("[{0:o}] Visual Studio product update starting: version={1}; instance={2}." -f
+        [DateTime]::UtcNow, $updateTarget.installationVersion, $installPath)
     $process = Start-Process -FilePath $setup -ArgumentList $arguments -WorkingDirectory $workingDirectory -Wait -PassThru -NoNewWindow
+    Write-Host ("Visual Studio product update exit={0}; elapsed={1:N2}s." -f $process.ExitCode, $vsUpdateTimer.Elapsed.TotalSeconds)
     if ($process.ExitCode -ne 0) {
         throw "Official Visual Studio stable product update returned exit code $($process.ExitCode)."
     }
+    $updatedInstance = Get-FlutterStableVisualStudioInstance
+    Write-Host ("Visual Studio product version after update: {0}." -f $updatedInstance.installationVersion)
 }
 
-$sdkInstall = $null
-if ($InstallLatestWindowsSdk) {
-    $sdkInstall = Install-OfficialWindowsSdk
-} else {
-    throw 'CI requires the official Windows SDK installer audit and update step; use -InstallLatestWindowsSdk.'
-}
-
+$toolchainVerifyTimer = [Diagnostics.Stopwatch]::StartNew()
 $visualStudio = Get-FlutterStableVisualStudioInstance
 if (-not $visualStudio.installationPath -or [bool]$visualStudio.isPrerelease -or
     ([Version]$visualStudio.installationVersion -lt $targetVisualStudio) -or
@@ -222,13 +261,23 @@ $msvcRoot = Join-Path $visualStudioPath 'VC\Tools\MSVC'
 if (-not (Test-Path -LiteralPath $msvcRoot -PathType Container)) {
     throw 'The selected Visual Studio instance has no MSVC toolset directory.'
 }
-$msvcToolset = Get-ChildItem -LiteralPath $msvcRoot -Directory | Where-Object {
-    $_.Name -match '^\d+\.\d+(\.\d+){0,2}$' -and ([Version]$_.Name -ge $targetMsvc)
-} | Sort-Object { [Version]$_.Name } -Descending | Select-Object -First 1
-if (-not $msvcToolset) {
-    $found = (Get-ChildItem -LiteralPath $msvcRoot -Directory | ForEach-Object Name) -join ', '
-    throw "MSVC 14.50 or newer is required; found: $found. Compatibility components below 14.50 are not accepted."
+# Flutter supplies no -T override: audit the installed product's default
+# toolset rather than selecting an unrelated highest/preview directory.
+$msvcDefaultFile = Join-Path $visualStudioPath 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt'
+if (-not (Test-Path -LiteralPath $msvcDefaultFile -PathType Leaf)) {
+    throw 'The Flutter-selected Visual Studio instance has no official default MSVC version file.'
 }
+$msvcDefaultVersion = [IO.File]::ReadAllText($msvcDefaultFile).Trim()
+Write-Host ("Visual Studio default MSVC toolset file={0}; raw version={1}." -f $msvcDefaultFile, $msvcDefaultVersion)
+if ($msvcDefaultVersion -cnotmatch '^\d+\.\d+\.\d+(\.\d+)?$' -or
+    ([Version]$msvcDefaultVersion -lt $targetMsvc)) {
+    throw "MSVC 14.50 or newer is required; product default is $msvcDefaultVersion. No preview or compatibility toolset is substituted."
+}
+$msvcDefaultPath = Join-Path $msvcRoot $msvcDefaultVersion
+if (-not (Test-Path -LiteralPath $msvcDefaultPath -PathType Container)) {
+    throw 'The official default MSVC version file points to a missing toolset directory.'
+}
+$msvcToolset = Get-Item -LiteralPath $msvcDefaultPath
 $msvcCompiler = Join-Path $msvcToolset.FullName 'bin\Hostx64\x64\cl.exe'
 Assert-MicrosoftSignature $msvcCompiler
 
@@ -238,17 +287,47 @@ if (-not (Test-Path -LiteralPath $cmakePath -PathType Leaf)) {
     throw 'The Flutter-selected Visual Studio instance has no bundled CMake executable.'
 }
 $cmakePath = [IO.Path]::GetFullPath($cmakePath)
-$cmakeOutput = & $cmakePath --version
-if ($LASTEXITCODE -ne 0 -or -not $cmakeOutput) {
-    throw 'The VS-bundled CMake executable used by Flutter could not report its version.'
+Write-Host ("Actual Flutter-selected VS version={0}; MSVC toolset={1}; CMake executable={2}" -f
+    $visualStudio.installationVersion, $msvcToolset.Name, $cmakePath)
+$cmakeOutput = @(& $cmakePath --version 2>&1)
+$cmakeExit = $LASTEXITCODE
+$cmakeOutputText = ($cmakeOutput | ForEach-Object { [string]$_ }) -join "`n"
+Write-Host 'Actual CMake --version output follows (before parsing):'
+Write-Host $cmakeOutputText
+$cmakeHelpOutput = @(& $cmakePath --help 2>&1)
+$cmakeHelpExit = $LASTEXITCODE
+$cmakeHelpText = ($cmakeHelpOutput | ForEach-Object { [string]$_ }) -join "`n"
+$cmakeGeneratorLines = @($cmakeHelpText -split "`n" | Where-Object {
+    $_ -cmatch '^[ \t]*(?:\*[ \t]*)?Visual Studio 18 2026[ \t]*='
+})
+$cmakeSupportsVs2026 = $cmakeHelpExit -eq 0 -and $cmakeGeneratorLines.Count -gt 0
+Write-Host ("CMake --help supports Visual Studio 18 2026 generator={0}; exit={1}." -f $cmakeSupportsVs2026, $cmakeHelpExit)
+foreach ($line in $cmakeGeneratorLines) { Write-Host $line }
+Write-Host ("Toolchain version probe elapsed={0:N2}s; preflight elapsed so far={1:N2}s." -f
+    $toolchainVerifyTimer.Elapsed.TotalSeconds, $preflightTimer.Elapsed.TotalSeconds)
+if ($cmakeExit -ne 0 -or -not $cmakeOutputText) {
+    throw "The VS-bundled CMake executable used by Flutter could not report its version (exit $cmakeExit)."
 }
-$cmakeMatch = [regex]::Match(($cmakeOutput -join "`n"), '(?im)^cmake version (\d+\.\d+\.\d+)\s*$')
-if (-not $cmakeMatch.Success) {
-    throw 'CMake reported an unrecognized version format.'
+$cmakeMatches = [regex]::Matches($cmakeOutputText, '(?m)^cmake version ([^\r\n]+)\r?$')
+if ($cmakeMatches.Count -ne 1) {
+    throw 'CMake output did not contain exactly one recognizable version line; raw output was printed above.'
 }
-$cmakeVersion = [Version]$cmakeMatch.Groups[1].Value
+$cmakeRawVersion = $cmakeMatches[0].Groups[1].Value.Trim()
+$cmakeVersion = ConvertFrom-StableCmakeVersion $cmakeRawVersion
 if ($cmakeVersion -lt $targetCmake) {
-    throw "CMake 4.4.3 or newer is required; found $cmakeVersion."
+    throw "CMake 4.4.3 or newer is required; found raw=$cmakeRawVersion, numeric=$cmakeVersion."
+}
+if (-not $cmakeSupportsVs2026) {
+    throw 'The actual VS-bundled CMake did not advertise the required Visual Studio 18 2026 generator.'
+}
+$toolchainVerifyTimer.Stop()
+Write-Host ("Fast VS/MSVC/CMake checks passed in {0:N2}s; only now entering the SDK phase." -f $toolchainVerifyTimer.Elapsed.TotalSeconds)
+
+$sdkInstall = $null
+if ($InstallLatestWindowsSdk) {
+    $sdkInstall = Install-OfficialWindowsSdk
+} else {
+    throw 'CI requires the official Windows SDK installer audit and update step; use -InstallLatestWindowsSdk.'
 }
 
 $windowsKitsInclude = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\Include'
@@ -280,7 +359,8 @@ $record = [ordered]@{
     visual_studio_prerelease = $false
     msvc_toolset_version = [string]$msvcToolset.Name
     msvc_toolset_path = [IO.Path]::GetFullPath($msvcToolset.FullName)
-    cmake_version = [string]$cmakeVersion
+    cmake_version = $cmakeRawVersion
+    cmake_version_output = $cmakeOutputText
     cmake_path = $cmakePath
     windows_sdk_version = [string]$windowsSdk.Name
     windows_sdk_product_version = [string]$installedSdkVersion
@@ -291,3 +371,5 @@ $json = ConvertTo-Json -InputObject $record -Depth 6
 Write-Output ("Verified stable VS {0}, MSVC {1}, CMake {2}, Windows SDK {3} servicing {4}." -f
     $record.visual_studio_version, $record.msvc_toolset_version, $record.cmake_version,
     $record.windows_sdk_version, $record.windows_sdk_product_version)
+Write-Host ("Toolchain version validation elapsed={0:N2}s; complete preflight elapsed={1:N2}s." -f
+    $toolchainVerifyTimer.Elapsed.TotalSeconds, $preflightTimer.Elapsed.TotalSeconds)

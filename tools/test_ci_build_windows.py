@@ -151,8 +151,40 @@ class CiBuildWindowsTests(unittest.TestCase):
                 "visual_studio_version": "18.11.0", "visual_studio_path": str(vs),
                 "visual_studio_prerelease": False, "msvc_toolset_version": "14.50.35717",
                 "msvc_toolset_path": str(msvc), "cmake_version": "4.4.3", "cmake_path": str(cmake),
+                "cmake_version_output": "cmake version 4.4.3\n",
                 "windows_sdk_version": "10.0.28000.0", "windows_sdk_product_version": "10.1.28000.2957",
                 "sdk_installer": sdk_audit}, cmake
+
+    def test_cmake_versions_accept_stable_plain_and_microsoft_suffix_only(self):
+        accepted = {"4.4.3": (4, 4, 3), "4.4.3-msvc1": (4, 4, 3),
+                    "4.4.4-msvc12": (4, 4, 4)}
+        for raw, numeric in accepted.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(ci._parse_cmake_version(raw), numeric)
+                output = ("cmake version " + raw + "\r\n\r\nCMake suite maintained and supported by Kitware (kitware.com/cmake).\r\n").encode("ascii")
+                self.assertEqual(ci._cmake_version_from_output(output), raw)
+        for raw in ("4.4.3-rc1", "4.5.0-alpha1", "4.5.0-beta1", "4.5.0-dev",
+                    "4.5.0-msvc1-rc1", "4.4.3-msvc", "4.4.3-local", "4.4.3.1"):
+            with self.subTest(rejected=raw), self.assertRaises(ci.ValidationError):
+                ci._cmake_version_from_output("cmake version " + raw + "\n")
+
+    def test_microsoft_cmake_suffix_preserves_provenance_without_relaxing_numeric_floor(self):
+        report, cmake = self._toolchain_report()
+        for raw, passes in (("4.4.3-msvc1", True), ("4.4.2-msvc99", False)):
+            candidate = copy.deepcopy(report)
+            candidate["cmake_version"] = raw
+            candidate["cmake_version_output"] = "cmake version " + raw + "\n"
+            completed = subprocess_completed([str(cmake), "--version"], 0,
+                                              candidate["cmake_version_output"].encode("ascii"))
+            with self.subTest(raw=raw), \
+                    mock.patch.dict("os.environ", {"ProgramFiles(x86)": str(self.root / "Program Files (x86)")}), \
+                    mock.patch.object(ci.subprocess, "run", return_value=completed):
+                if passes:
+                    self.assertIs(ci.validate_toolchain_report(candidate), candidate)
+                    self.assertEqual(candidate["cmake_version"], raw)
+                else:
+                    with self.assertRaises(ci.ValidationError):
+                        ci.validate_toolchain_report(candidate)
 
     def test_toolchain_report_versions_and_signed_sdk_evidence_are_strict(self):
         report, cmake = self._toolchain_report()
@@ -206,6 +238,19 @@ class CiBuildWindowsTests(unittest.TestCase):
             result = ci.validate_flutter_windows_toolchain(build_root, report)
         self.assertEqual(result["generator"], "Visual Studio 18 2026")
         self.assertEqual(result["windows_sdk_include_version"], "10.0.28000.0")
+        report["cmake_version"] = "4.4.3-msvc1"
+        vendor_output = b"cmake version 4.4.3-msvc1\r\n"
+        completed = subprocess_completed([str(cmake), "--version"], 0, vendor_output)
+        for configured in ("4.4.3", "4.4.3-msvc1"):
+            content = cache.read_text(encoding="utf-8")
+            content = __import__("re").sub(r"(?m)^CHASTEADY_CMAKE_VERSION:INTERNAL=.*$",
+                                           "CHASTEADY_CMAKE_VERSION:INTERNAL=" + configured, content)
+            cache.write_text(content, encoding="utf-8")
+            with self.subTest(configured=configured), mock.patch.object(ci.subprocess, "run", return_value=completed):
+                result = ci.validate_flutter_windows_toolchain(build_root, report)
+            self.assertEqual(result["cmake_version"], "4.4.3-msvc1")
+            self.assertEqual(result["cmake_configured_version"], configured)
+            self.assertEqual(result["cmake_version_output"], vendor_output.decode("ascii"))
         cache.write_text(cache.read_text(encoding="utf-8").replace("Visual Studio 18 2026", "Visual Studio 17 2022"),
                          encoding="utf-8")
         with mock.patch.object(ci.subprocess, "run", return_value=completed):
