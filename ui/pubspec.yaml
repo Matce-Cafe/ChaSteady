@@ -1,0 +1,30 @@
+name: cha_stabilizer_ui
+description: Local-first video stabilization workbench UI.
+publish_to: none
+version: 0.1.0+1
+
+environment:
+  sdk: '>=3.8.0 <4.0.0'
+  flutter: '>=3.33.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  http: ^1.2.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
+  generate: true
+  assets:
+    - assets/fonts/OFL.txt
+    - assets/fonts/PROVENANCE.txt
+  fonts:
+    - family: NotoSansSC
+      fonts:
+        - asset: assets/fonts/NotoSansSC-wght.ttf

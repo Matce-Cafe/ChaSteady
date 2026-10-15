@@ -1,0 +1,25 @@
+Noto Sans SC font asset provenance
+===================================
+
+Asset: NotoSansSC-wght.ttf
+Family registered by the UI: NotoSansSC
+Source repository: https://github.com/google/fonts
+Pinned Google Fonts commit: a85815a42757630ce188fdad368c2dfc444d4773
+Pinned path: ofl/notosanssc/NotoSansSC[wght].ttf
+Pinned Git blob SHA-1: fb0637bafbcd804fe32152370a1225990745b4bc
+Downloaded bytes: 17,772,300
+Downloaded SHA-256: a3041811a78c361b1de50f953c805e0244951c21c5bd412f7232ef0d899af0da
+The downloaded file's Git blob SHA-1 was recomputed locally and matches the pinned blob.
+
+The pinned Google Fonts commit records its verified upstream Noto CJK source as:
+https://github.com/notofonts/noto-cjk/tree/523d033d6cb47f4a80c58a35753646f5c3608a78
+Google Fonts commit message states that its source metadata was blob-verified against that upstream commit.
+
+License: SIL Open Font License 1.1, full text in OFL.txt.
+License source: https://github.com/google/fonts/blob/a85815a42757630ce188fdad368c2dfc444d4773/ofl/notosanssc/OFL.txt
+License Git blob SHA-1: 1c9f43281b8f216c5461fe9ac729afbade7724e4
+License SHA-256: 1c05c68c34f9708415aada51f17e1b0092d2cea709bf4a94cd38114f9e73d7d9
+
+Acquisition used curl.exe over HTTPS with certificate validation enabled, TLS 1.2 or newer, and no redirect following or TLS-verification bypass. The API asset was requested by its pinned Git blob SHA. The font was treated only as data; no downloaded scripts or executables were run.
+
+Coverage check: a local cmap parser confirmed representative Simplified Chinese UI task labels and warning text in this font, including 任务处理, 任务警告, 路径已配置, 参考区间, 原始视频, 融合任务失败, and 导出完成. The UI registers this licensed font as a ThemeData font fallback. The web bootstrap sets Flutter's fontFallbackBaseUrl to the app-local assets/fonts/ URL, so unsupported glyph fallback cannot request fonts.gstatic.com. These checks do not assert coverage for every Unicode code point.
