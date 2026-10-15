@@ -1,4 +1,6 @@
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include "native_media.h"
 
 #include <d3d11.h>
@@ -801,7 +803,7 @@ class NativeMediaManager::Core final
     // The weak reference avoids a Player -> TextureVariant -> callback -> Player
     // ownership cycle. Flutter PixelBufferTexture gives each returned buffer a
     // release callback, so frames remain immutable while Flutter copies them.
-    player->texture = flutter::PixelBufferTexture(
+    player->texture.emplace<flutter::PixelBufferTexture>(
         [weak_player = std::weak_ptr<Player>(player)](size_t, size_t)
             -> const FlutterDesktopPixelBuffer* {
           const std::shared_ptr<Player> current = weak_player.lock();

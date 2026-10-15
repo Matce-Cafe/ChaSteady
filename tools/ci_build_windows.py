@@ -173,6 +173,30 @@ def _parse_version(value, label: str, parts: int | None = None) -> tuple[int, ..
     return numbers
 
 
+def _parse_cmake_version(value, label: str = "CMake version") -> tuple[int, ...]:
+    if not isinstance(value, str):
+        raise ValidationError(label + " must be a stable version string")
+    match = re.fullmatch(r"(\d+\.\d+\.\d+)(?:-msvc[0-9]+)?", value)
+    if not match:
+        raise ValidationError(label + " is not a stable plain or Microsoft -msvcN version")
+    return _parse_version(match.group(1), label, 3)
+
+
+def _cmake_version_from_output(output: bytes | str) -> str:
+    try:
+        text = output.decode("utf-8") if isinstance(output, bytes) else output
+    except UnicodeError as error:
+        raise ValidationError("CMake version output is not UTF-8") from error
+    if not isinstance(text, str):
+        raise ValidationError("CMake version output must be text")
+    matches = re.findall(r"(?m)^cmake version ([^\r\n]+)\r?$", text)
+    if len(matches) != 1:
+        raise ValidationError("CMake output must contain exactly one version line")
+    raw_version = matches[0].strip()
+    _parse_cmake_version(raw_version)
+    return raw_version
+
+
 def _at_least(found: tuple[int, ...], required: tuple[int, ...]) -> bool:
     length = max(len(found), len(required))
     return found + (0,) * (length - len(found)) >= required + (0,) * (length - len(required))
@@ -181,7 +205,7 @@ def _at_least(found: tuple[int, ...], required: tuple[int, ...]) -> bool:
 def validate_toolchain_report(report: dict) -> dict:
     expected = {"schema_version", "runner_label", "visual_studio_version", "visual_studio_path",
                 "visual_studio_prerelease", "msvc_toolset_version", "msvc_toolset_path",
-                "cmake_version", "cmake_path", "windows_sdk_version",
+                "cmake_version", "cmake_version_output", "cmake_path", "windows_sdk_version",
                 "windows_sdk_product_version", "sdk_installer"}
     exact_keys(report, expected, "Runner toolchain report")
     if report["schema_version"] != 1 or report["runner_label"] != EXPECTED_RUNNER_LABEL:
@@ -196,9 +220,12 @@ def validate_toolchain_report(report: dict) -> dict:
         "windows_sdk_product_version": (MIN_WINDOWS_SDK_PRODUCT, 4),
     }
     for field, (minimum, parts) in versions.items():
-        found = _parse_version(report[field], field, parts)
+        found = (_parse_cmake_version(report[field], field) if field == "cmake_version"
+                 else _parse_version(report[field], field, parts))
         if not _at_least(found, minimum):
             raise ValidationError(field + " is older than the required stable toolchain floor")
+    if _cmake_version_from_output(report["cmake_version_output"]) != report["cmake_version"]:
+        raise ValidationError("Preserved CMake output differs from its reported raw version")
     sdk_installer = report["sdk_installer"]
     exact_keys(sdk_installer, {"source_id", "download_host", "bytes", "sha256", "authenticode_status",
                                "signer_subject", "installer_file_version", "installer_arguments",
@@ -237,11 +264,9 @@ def validate_toolchain_report(report: dict) -> dict:
             != os.path.normcase(os.path.abspath(reported_cmake))):
         raise ValidationError("Preflight CMake is not the executable bundled with Flutter's selected Visual Studio instance")
     cmake_result = subprocess.run([str(reported_cmake), "--version"], check=False, capture_output=True, timeout=30)
-    match = re.search(rb"(?im)^cmake version (\d+\.\d+\.\d+)\s*$", cmake_result.stdout)
-    if (cmake_result.returncode != 0 or not match
-            or _parse_version(match.group(1).decode("ascii"), "CMake executable version", 3)
-            != _parse_version(report["cmake_version"], "CMake report version", 3)):
-        raise ValidationError("CMake executable version differs from the runner preflight report")
+    if (cmake_result.returncode != 0
+            or _cmake_version_from_output(cmake_result.stdout) != report["cmake_version"]):
+        raise ValidationError("CMake executable raw version differs from the runner preflight report")
     kits_root = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Windows Kits" / "10" / "Include"
     sdk_path = kits_root / report["windows_sdk_version"]
     if not sdk_path.is_dir() or is_reparse(sdk_path):
@@ -589,8 +614,8 @@ def validate_flutter_windows_toolchain(windows_build_root: Path, toolchain_repor
     if (values["CHASTEADY_CMAKE_GENERATOR"] != "Visual Studio 18 2026"
             or values["CHASTEADY_CMAKE_GENERATOR_PLATFORM"] != "x64"):
         raise ValidationError("Flutter selected a generator/platform other than stable VS 2026 x64")
-    if (_parse_version(values["CHASTEADY_CMAKE_VERSION"], "Configured CMake version", 3)
-            != _parse_version(toolchain_report["cmake_version"], "Audited CMake version", 3)):
+    if (_parse_cmake_version(values["CHASTEADY_CMAKE_VERSION"], "Configured CMake version")
+            != _parse_cmake_version(toolchain_report["cmake_version"], "Audited CMake version")):
         raise ValidationError("Post-project CMake version differs from the audited VS-bundled executable")
     cmake_command = Path(values["CHASTEADY_CMAKE_COMMAND"])
     expected_cmake = Path(toolchain_report["cmake_path"])
@@ -600,11 +625,9 @@ def validate_flutter_windows_toolchain(windows_build_root: Path, toolchain_repor
         raise ValidationError("Flutter's CMake generator used a different executable from the audited runner CMake")
     cmake_result = subprocess.run([str(cmake_command), "--version"], check=False,
                                   capture_output=True, timeout=30)
-    cmake_match = re.search(rb"(?im)^cmake version (\d+\.\d+\.\d+)\s*$", cmake_result.stdout)
-    if (cmake_result.returncode != 0 or not cmake_match
-            or _parse_version(cmake_match.group(1).decode("ascii"), "Actual CMake version", 3)
-            != _parse_version(toolchain_report["cmake_version"], "Audited CMake version", 3)):
-        raise ValidationError("Actual Flutter Windows configuration did not use the audited CMake version")
+    if (cmake_result.returncode != 0
+            or _cmake_version_from_output(cmake_result.stdout) != toolchain_report["cmake_version"]):
+        raise ValidationError("Actual Flutter Windows configuration did not use the audited CMake raw version")
 
     instance = Path(values["CHASTEADY_CMAKE_GENERATOR_INSTANCE"])
     if (not instance.is_absolute() or not instance.is_dir() or is_reparse(instance)
@@ -626,6 +649,8 @@ def validate_flutter_windows_toolchain(windows_build_root: Path, toolchain_repor
     return {"generator": values["CHASTEADY_CMAKE_GENERATOR"],
             "platform": values["CHASTEADY_CMAKE_GENERATOR_PLATFORM"],
             "cmake_version": toolchain_report["cmake_version"],
+            "cmake_configured_version": values["CHASTEADY_CMAKE_VERSION"],
+            "cmake_version_output": cmake_result.stdout.decode("utf-8"),
             "msvc_toolset_version": toolchain_report["msvc_toolset_version"],
             "cxx_compiler_version": actual_compiler_version,
             "windows_sdk_include_version": actual_sdk,
@@ -980,6 +1005,7 @@ def run_build(args) -> dict:
             "visual_studio_version": toolchain_report["visual_studio_version"],
             "msvc_toolset_version": toolchain_report["msvc_toolset_version"],
             "cmake_version": toolchain_report["cmake_version"],
+            "cmake_version_output": toolchain_report["cmake_version_output"],
             "windows_sdk_version": toolchain_report["windows_sdk_version"],
             "windows_sdk_product_version": toolchain_report["windows_sdk_product_version"],
             "windows_sdk_installer": {

@@ -177,7 +177,7 @@ EncodableValue ErrorDetails(const WorkerFailure& failure) {
   return EncodableValue(std::move(details));
 }
 
-void CompleteError(std::unique_ptr<MethodResult> result,
+void CompleteMethodError(std::unique_ptr<MethodResult> result,
                    const std::string& code,
                    const std::string& key,
                    const std::string& message) {
@@ -785,7 +785,7 @@ class NativeBridge::Impl final {
     const EncodableValue* arguments = call.arguments();
     if (method == "bootstrap") {
       if (!NoArguments(arguments)) {
-        CompleteError(std::move(result), "invalid_arguments", "nativeProtocol.error.invalidRequest",
+        CompleteMethodError(std::move(result), "invalid_arguments", "nativeProtocol.error.invalidRequest",
                       "bootstrap does not accept arguments.");
         return;
       }
@@ -823,7 +823,7 @@ class NativeBridge::Impl final {
       if (!IsMap(arguments, &map) || !HasExactKeys(*map, {"kind"}) ||
           !GetString(FindValue(map, "kind"), &kind) ||
           (kind != "video" && kind != "project" && kind != "folder" && kind != "executable")) {
-        CompleteError(std::move(result), "invalid_picker_kind", "nativePicker.error.invalidKind",
+        CompleteMethodError(std::move(result), "invalid_picker_kind", "nativePicker.error.invalidKind",
                       "The requested local picker type is not supported.");
         return;
       }
@@ -831,7 +831,7 @@ class NativeBridge::Impl final {
       if (picked.cancelled) {
         result->Success();
       } else if (!picked.error_code.empty()) {
-        CompleteError(std::move(result), picked.error_code, "nativePicker.error.failed",
+        CompleteMethodError(std::move(result), picked.error_code, "nativePicker.error.failed",
                       "The local file picker could not complete.");
       } else {
         result->Success(EncodableValue(picked.path));
@@ -841,7 +841,7 @@ class NativeBridge::Impl final {
 
     if (method == "openWeb") {
       if (!NoArguments(arguments)) {
-        CompleteError(std::move(result), "invalid_arguments", "nativeProtocol.error.invalidRequest",
+        CompleteMethodError(std::move(result), "invalid_arguments", "nativeProtocol.error.invalidRequest",
                       "openWeb does not accept arguments.");
         return;
       }
@@ -869,7 +869,7 @@ class NativeBridge::Impl final {
       if (!IsMap(arguments, &map) || !HasExactKeys(*map, {"artifact_id"}) ||
           !GetString(FindValue(map, "artifact_id"), &artifact_id) ||
           !IsCanonicalUuid(artifact_id)) {
-        CompleteError(std::move(result), "invalid_native_artifact", "nativeMedia.error.invalidArtifact",
+        CompleteMethodError(std::move(result), "invalid_native_artifact", "nativeMedia.error.invalidArtifact",
                       "The requested preview artifact is invalid.");
         return;
       }
@@ -912,7 +912,7 @@ class NativeBridge::Impl final {
 
     if (method == "requestShutdown") {
       if (!NoArguments(arguments)) {
-        CompleteError(std::move(result), "invalid_arguments", "nativeProtocol.error.invalidRequest",
+        CompleteMethodError(std::move(result), "invalid_arguments", "nativeProtocol.error.invalidRequest",
                       "requestShutdown does not accept arguments.");
         return;
       }
@@ -993,19 +993,19 @@ class NativeBridge::Impl final {
                           const EncodableValue* arguments,
                           std::unique_ptr<MethodResult> result) {
     if (shutdown_in_progress_.load(std::memory_order_acquire)) {
-      CompleteError(std::move(result), "worker_shutting_down", "nativeWorker.error.stopping",
+      CompleteMethodError(std::move(result), "worker_shutting_down", "nativeWorker.error.stopping",
                     "The private worker is shutting down.");
       return;
     }
     const EncodableMap* map = nullptr;
     if (!IsMap(arguments, &map)) {
-      CompleteError(std::move(result), "invalid_player_arguments", "nativeMedia.error.invalidPlayer",
+      CompleteMethodError(std::move(result), "invalid_player_arguments", "nativeMedia.error.invalidPlayer",
                     "A native player identifier is required.");
       return;
     }
     std::string player_id;
     if (!GetString(FindValue(map, "player_id"), &player_id) || player_id.empty()) {
-      CompleteError(std::move(result), "invalid_player_arguments", "nativeMedia.error.invalidPlayer",
+      CompleteMethodError(std::move(result), "invalid_player_arguments", "nativeMedia.error.invalidPlayer",
                     "A native player identifier is required.");
       return;
     }
@@ -1015,26 +1015,26 @@ class NativeBridge::Impl final {
     if (method == "seek") {
       if (!HasExactKeys(*map, {"player_id", "position_seconds"}) ||
           !GetFiniteNumber(FindValue(map, "position_seconds"), &number) || number < 0.0) {
-        CompleteError(std::move(result), "invalid_seek_position", "nativeMedia.error.invalidPosition",
+        CompleteMethodError(std::move(result), "invalid_seek_position", "nativeMedia.error.invalidPosition",
                       "The seek position is invalid.");
         return;
       }
     } else if (method == "volume") {
       if (!HasExactKeys(*map, {"player_id", "volume"}) ||
           !GetFiniteNumber(FindValue(map, "volume"), &number) || number < 0.0 || number > 1.0) {
-        CompleteError(std::move(result), "invalid_volume", "nativeMedia.error.invalidVolume",
+        CompleteMethodError(std::move(result), "invalid_volume", "nativeMedia.error.invalidVolume",
                       "The player volume must be between zero and one.");
         return;
       }
     } else if (method == "muted") {
       if (!HasExactKeys(*map, {"player_id", "muted"}) ||
           !GetBoolean(FindValue(map, "muted"), &boolean)) {
-        CompleteError(std::move(result), "invalid_muted_value", "nativeMedia.error.invalidMuted",
+        CompleteMethodError(std::move(result), "invalid_muted_value", "nativeMedia.error.invalidMuted",
                       "The player muted state is invalid.");
         return;
       }
     } else if (!HasExactKeys(*map, {"player_id"})) {
-      CompleteError(std::move(result), "invalid_player_arguments", "nativeMedia.error.invalidPlayer",
+      CompleteMethodError(std::move(result), "invalid_player_arguments", "nativeMedia.error.invalidPlayer",
                     "The player request contains unsupported fields.");
       return;
     }

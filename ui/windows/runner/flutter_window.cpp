@@ -1,5 +1,7 @@
 #include "flutter_window.h"
 
+#include <flutter/plugin_registrar_windows.h>
+
 #include <optional>
 
 #include "flutter/generated_plugin_registrant.h"
@@ -25,9 +27,17 @@ bool FlutterWindow::OnCreate() {
     return false;
   }
   RegisterPlugins(flutter_controller_->engine());
+  auto* core_registrar = flutter_controller_->engine()->GetRegistrarForPlugin(
+      "ChaSteadyNativeBridge");
+  if (core_registrar == nullptr) {
+    return false;
+  }
+  // The manager keeps this wrapper alive until its engine registrar is destroyed.
+  auto* registrar = flutter::PluginRegistrarManager::GetInstance()
+                        ->GetRegistrar<flutter::PluginRegistrarWindows>(
+                            core_registrar);
   native_bridge_ = std::make_unique<chasteady::NativeBridge>(
-      GetHandle(), flutter_controller_->engine()->messenger(),
-      flutter_controller_->engine()->texture_registrar());
+      GetHandle(), registrar->messenger(), registrar->texture_registrar());
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
