@@ -19,7 +19,7 @@ class ToolchainPreflightScriptTests(unittest.TestCase):
         cls.text = SCRIPT.read_text(encoding="utf-8")
 
     def test_source_uses_only_official_stable_version_floors(self):
-        for text in ("18.11.0.0", "14.50.0", "4.4.3", "10.0.28000.0", "2957"):
+        for text in ("18.11.0.0", "14.50.0", "4.3.1", "10.0.28000.0", "2957"):
             with self.subTest(text=text):
                 self.assertIn(text, self.text)
         self.assertIn("windows-2025-vs2026", self.text)
@@ -35,7 +35,8 @@ class ToolchainPreflightScriptTests(unittest.TestCase):
         self.assertIn("Get-InstalledTargetSdkVersion", self.text)
         self.assertIn("10.0.28000.0", self.text)
         self.assertIn("MSVC 14.50 or newer is required", self.text)
-        self.assertIn("CMake 4.4.3 or newer is required", self.text)
+        self.assertIn("VS-bundled CMake 4.3.1 or newer is required", self.text)
+        self.assertIn("not a claim about the newest standalone upstream Kitware CMake release", self.text)
 
     def test_cmake_audit_uses_flutter_selected_visual_studio_bundle_not_path(self):
         self.assertIn("function Get-FlutterStableVisualStudioInstance", self.text)
@@ -88,7 +89,7 @@ class ToolchainPreflightScriptTests(unittest.TestCase):
         powershell = shutil.which("powershell.exe") or shutil.which("pwsh")
         if not powershell:
             self.skipTest("No PowerShell parser is installed in this test environment")
-        # Execute only the isolated, repository-owned string parser function.
+        # Execute only the isolated string parser and its numeric policy assignment.
         # The preflight script body and all installer commands are never invoked.
         command = r"""
 $tokens=$null; $parseErrors=$null
@@ -100,7 +101,20 @@ $parserFunction=$ast.FindAll({ param($node)
 }, $true) | Select-Object -First 1
 if (-not $parserFunction) { throw 'CMake parser function is missing' }
 Invoke-Expression $parserFunction.Extent.Text
-foreach ($raw in @('4.4.3','4.4.3-msvc1','4.4.4-msvc12','4.4.2-msvc99')) {
+$baselineAssignment=$ast.FindAll({ param($node)
+    $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+    $node.Left.Extent.Text -eq '$targetCmake'
+}, $true) | Select-Object -First 1
+if (-not $baselineAssignment) { throw 'Bundled CMake baseline assignment is missing' }
+Invoke-Expression $baselineAssignment.Extent.Text
+if ($targetCmake -ne [Version]'4.3.1') { throw 'Wrong VS-bundled CMake baseline' }
+foreach ($raw in @('4.3.1-msvc1','4.4.3','4.4.3-msvc1')) {
+    if ((ConvertFrom-StableCmakeVersion $raw) -lt $targetCmake) { throw ('Stable bundled version rejected: ' + $raw) }
+}
+if ((ConvertFrom-StableCmakeVersion '4.3.0-msvc99') -ge $targetCmake) {
+    throw 'Older CMake vendor build bypassed the numeric baseline'
+}
+foreach ($raw in @('4.3.1','4.3.1-msvc1','4.4.3','4.4.3-msvc1','4.4.4-msvc12','4.3.0-msvc99')) {
     $numeric=ConvertFrom-StableCmakeVersion $raw
     Write-Output ($raw + '=' + $numeric.ToString())
 }
@@ -113,8 +127,8 @@ foreach ($raw in @('4.4.3-rc1','4.5.0-alpha1','4.5.0-beta1','4.5.0-dev','4.5.0-m
         result = subprocess.run([powershell, "-NoLogo", "-NoProfile", "-Command", command],
                                 check=False, capture_output=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
-        for expected in ("4.4.3=4.4.3", "4.4.3-msvc1=4.4.3", "4.4.4-msvc12=4.4.4",
-                         "4.4.2-msvc99=4.4.2"):
+        for expected in ("4.3.1=4.3.1", "4.3.1-msvc1=4.3.1", "4.4.3=4.4.3",
+                         "4.4.3-msvc1=4.4.3", "4.4.4-msvc12=4.4.4", "4.3.0-msvc99=4.3.0"):
             self.assertIn(expected, result.stdout.decode("utf-8", "replace"))
 
     def test_script_has_no_powershell_parse_errors_when_parser_is_available(self):

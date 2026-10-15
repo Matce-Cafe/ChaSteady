@@ -14,7 +14,9 @@ $ErrorActionPreference = 'Stop'
 
 $targetVisualStudio = [Version]'18.11.0.0'
 $targetMsvc = [Version]'14.50.0'
-$targetCmake = [Version]'4.4.3'
+# Baseline of stable VS 18.11's official bundle (4.3.1-msvc1 observed in CI),
+# not a claim about the newest standalone upstream Kitware CMake release.
+$targetCmake = [Version]'4.3.1'
 $targetSdkInclude = [Version]'10.0.28000.0'
 $minimumSdkServicingRevision = 2957
 $installerRoot = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer'
@@ -315,7 +317,7 @@ if ($cmakeMatches.Count -ne 1) {
 $cmakeRawVersion = $cmakeMatches[0].Groups[1].Value.Trim()
 $cmakeVersion = ConvertFrom-StableCmakeVersion $cmakeRawVersion
 if ($cmakeVersion -lt $targetCmake) {
-    throw "CMake 4.4.3 or newer is required; found raw=$cmakeRawVersion, numeric=$cmakeVersion."
+    throw "VS-bundled CMake 4.3.1 or newer is required; found raw=$cmakeRawVersion, numeric=$cmakeVersion."
 }
 if (-not $cmakeSupportsVs2026) {
     throw 'The actual VS-bundled CMake did not advertise the required Visual Studio 18 2026 generator.'
