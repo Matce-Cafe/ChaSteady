@@ -457,6 +457,13 @@ class CiBuildWindowsTests(unittest.TestCase):
         self.assertLess(assignment.lineno, stages["bundle_metadata"])
         self.assertLess(stages["bundle_metadata"], stages["bundle_legal_notices"])
         self.assertLess(stages["bundle_legal_notices"], stages["public_inventory"])
+        inventory_calls = [node for node in ast.walk(run_build) if isinstance(node, ast.Call)
+                           and isinstance(node.func, ast.Name) and node.func.id == "assert_public_bundle"]
+        self.assertEqual(len(inventory_calls), 1)
+        forwarded = next(keyword.value for keyword in inventory_calls[0].keywords
+                         if keyword.arg == "runtime_report")
+        self.assertIsInstance(forwarded, ast.Name)
+        self.assertEqual(forwarded.id, "runtime_report")
 
     def test_windows_cmake_selects_sdk_before_project_and_records_actual_project_facts(self):
         source = (Path(ci.ROOT) / "ui" / "windows" / "CMakeLists.txt").read_text(encoding="utf-8")
@@ -479,6 +486,16 @@ class CiBuildWindowsTests(unittest.TestCase):
             expression = 'set(' + recorded + ' "${' + actual + '}" CACHE INTERNAL '
             with self.subTest(recorded=recorded):
                 self.assertGreater(source.index(expression), project)
+
+        pubspec = (Path(ci.ROOT) / "ui/pubspec.yaml").read_text(encoding="utf-8")
+        self.assertIn("        - asset: assets/fonts/NotoSansSC-wght.ttf", pubspec)
+        self.assertIn('set(INSTALL_BUNDLE_DATA_DIR "${CMAKE_INSTALL_PREFIX}/data")', source)
+        self.assertIn('set(FLUTTER_ASSET_DIR_NAME "flutter_assets")', source)
+        self.assertIn('DESTINATION "${INSTALL_BUNDLE_DATA_DIR}" COMPONENT Runtime)', source)
+        self.assertEqual(ci.BUNDLE_FONT_PATHS, {
+            "data/flutter_assets/assets/fonts/NotoSansSC-wght.ttf",
+            "web/assets/assets/fonts/NotoSansSC-wght.ttf",
+        })
 
     def test_native_registrar_links_the_plugin_wrapper_implementation(self):
         runner = Path(ci.ROOT) / "ui" / "windows" / "runner"
@@ -543,12 +560,13 @@ class CiBuildWindowsTests(unittest.TestCase):
             "THIRD_PARTY_NOTICES.md": b"notices",
             "web/index.html": b"<html></html>",
             "web/flutter_bootstrap.js": b"bootstrap",
-            "web/assets/fonts/NotoSansSC-wght.ttf": b"fixture font; never parsed or executed",
+            "web/assets/assets/fonts/NotoSansSC-wght.ttf": b"fixture font; never parsed or executed",
             "licenses/fonts/noto-sans-sc/OFL.txt": b"OFL fixture text",
             "Worker/Worker.exe": b"fixture worker; never executed",
             "data/icudtl.dat": b"fixture data",
+            "data/flutter_assets/assets/fonts/NotoSansSC-wght.ttf": b"fixture font; never parsed or executed",
         }
-        font_digest = hashlib.sha256(files["web/assets/fonts/NotoSansSC-wght.ttf"]).hexdigest()
+        font_digest = hashlib.sha256(files["web/assets/assets/fonts/NotoSansSC-wght.ttf"]).hexdigest()
         license_digest = hashlib.sha256(files["licenses/fonts/noto-sans-sc/OFL.txt"]).hexdigest()
         for relative, payload in files.items():
             target = app / relative
@@ -558,10 +576,170 @@ class CiBuildWindowsTests(unittest.TestCase):
                 mock.patch.object(ci.ci_prepare_assets, "FONT_LICENSE_SHA256", license_digest):
             rows = ci.assert_public_bundle(app, self.root)
             self.assertEqual(len(rows), len(files))
+            for relative in ci.BUNDLE_FONT_PATHS:
+                with self.subTest(missing_exact_font=relative):
+                    target = app / relative
+                    payload = target.read_bytes()
+                    target.unlink()
+                    # A same-basename font elsewhere must not satisfy either
+                    # exact Web/native layout, even when its bytes are correct.
+                    misplaced = app / "web/assets/fonts/NotoSansSC-wght.ttf"
+                    misplaced.parent.mkdir(parents=True, exist_ok=True)
+                    misplaced.write_bytes(payload)
+                    with self.assertRaises(ci.ValidationError) as failure:
+                        ci.assert_public_bundle(app, self.root)
+                    self.assertIn("code=CI_BUNDLE_REQUIRED_FILES",
+                                  ci.ci_failure_diagnostic(failure.exception, "public_inventory"))
+                    misplaced.unlink()
+                    target.write_bytes(payload)
+            for relative in [*sorted(ci.BUNDLE_FONT_PATHS), "licenses/fonts/noto-sans-sc/OFL.txt"]:
+                with self.subTest(altered_identity=relative):
+                    target = app / relative
+                    original = target.read_bytes()
+                    target.write_bytes(b"altered fixture bytes")
+                    with self.assertRaises(ci.ValidationError) as failure:
+                        ci.assert_public_bundle(app, self.root)
+                    self.assertIn("code=CI_BUNDLE_FONT_IDENTITY",
+                                  ci.ci_failure_diagnostic(failure.exception, "public_inventory"))
+                    target.write_bytes(original)
             (app / "private").mkdir()
             (app / "private" / "profile.txt").write_text("must not ship", encoding="utf-8")
             with self.assertRaises(ci.ValidationError):
                 ci.assert_public_bundle(app, self.root)
+
+    def test_all_public_inventory_fixed_guards_have_exact_safe_codes(self):
+        module = ast.parse(Path(ci.__file__).read_text(encoding="utf-8"))
+        function = next(node for node in module.body if isinstance(node, ast.FunctionDef)
+                        and node.name == "assert_public_bundle")
+        guards = [node.exc for node in ast.walk(function) if isinstance(node, ast.Raise)
+                  and isinstance(node.exc, ast.Call)]
+        self.assertGreaterEqual(len(guards), 10)
+        for guard in guards:
+            self.assertIsInstance(guard.func, ast.Name)
+            self.assertIn(guard.func.id, {"ValidationError", "_public_bundle_failure"})
+            self.assertIsInstance(guard.args[0], ast.Constant)
+            message = guard.args[0].value
+            with self.subTest(message=message):
+                self.assertIn(message, ci.SAFE_VALIDATION_CODES)
+                diagnostic = ci.ci_failure_diagnostic(ci.ValidationError(message), "public_inventory")
+                self.assertIn("code=CI_BUNDLE_", diagnostic)
+                self.assertNotIn("CI_VALIDATION_FAILED", diagnostic)
+                augmented = message + r" D:\PRIVATE\token.txt bearer=never-print"
+                diagnostic = ci.ci_failure_diagnostic(ci.ValidationError(augmented), "public_inventory")
+                self.assertIn("code=CI_VALIDATION_FAILED", diagnostic)
+                self.assertNotIn("never-print", diagnostic)
+                self.assertNotIn("D:\\PRIVATE", diagnostic)
+
+    def test_inventory_failure_context_is_only_safe_category_and_full_relative_path_hash(self):
+        message = "Staged public bundle contains a prohibited media/cache/log file"
+        relative = "Worker/vendor-private-token/secret-cache.npz"
+        error = ci._public_bundle_failure(message, relative)
+        diagnostic = ci.ci_failure_diagnostic(error, "public_inventory")
+        self.assertIn("category=worker relative_path_sha256=" + hashlib.sha256(relative.encode()).hexdigest(),
+                      diagnostic)
+        self.assertNotIn(relative, diagnostic)
+        self.assertNotIn("vendor-private-token", diagnostic)
+        self.assertNotIn("secret-cache", diagnostic)
+        for context in ((relative, "a" * 64), ("worker", relative), ("worker", "A" * 64), ["worker", "a" * 64]):
+            with self.subTest(context_type=type(context).__name__):
+                error._ci_bundle_context = context
+                diagnostic = ci.ci_failure_diagnostic(error, "public_inventory")
+                self.assertNotIn("category=", diagnostic)
+                self.assertNotIn("relative_path_sha256=", diagnostic)
+                self.assertNotIn(relative, diagnostic)
+        error = ci._public_bundle_failure(message, relative)
+        self.assertNotIn("category=", ci.ci_failure_diagnostic(error, "bundle_metadata"))
+        error = ci._public_bundle_failure("unknown vendor text " + relative, relative)
+        diagnostic = ci.ci_failure_diagnostic(error, "public_inventory")
+        self.assertIn("CI_VALIDATION_FAILED", diagnostic)
+        self.assertNotIn("category=", diagnostic)
+        self.assertNotIn(relative, diagnostic)
+
+    @staticmethod
+    def runtime_wheel_report_fixture():
+        return {"packages": [dict(pin, sha256_published=pin["sha256"], yanked=False,
+                                  latest_release_version=pin["version"], latest_release_metadata_checked=True)
+                             for pin in provision_worker_runtime.WHEELS]}
+
+    def test_sobol_resource_accepts_only_exact_fixture_bytes_and_audited_runtime_wheel(self):
+        # Mock only the data-byte identity for this non-executed unit fixture.
+        # Real wheel/Worker bytes are checked separately in the bounded local probe.
+        payload = b"Sobol guard fixture; not an NPZ archive; never loaded"
+        resource = copy.deepcopy(ci.SCIPY_SOBOL_RESOURCE)
+        resource.update(bytes=len(payload), sha256=hashlib.sha256(payload).hexdigest())
+        app = self.root / "app"
+        path = app / resource["bundle_path"]
+        path.parent.mkdir(parents=True)
+        path.write_bytes(payload)
+        runtime = self.runtime_wheel_report_fixture()
+        with mock.patch.object(ci, "SCIPY_SOBOL_RESOURCE", resource):
+            with self.assertRaises(ci.ValidationError) as failure:
+                ci.assert_public_bundle(app, self.root, runtime_report=runtime)
+        # Passing just this exact resource reaches (not bypasses) native presence.
+        self.assertIn("code=CI_BUNDLE_REQUIRED_FILES",
+                      ci.ci_failure_diagnostic(failure.exception, "public_inventory"))
+        canonical = next(pin for pin in provision_worker_runtime.WHEELS if pin["name"] == "scipy")
+        self.assertTrue(all(canonical[key] == value for key, value in resource["wheel"].items()))
+        self.assertEqual(resource["bundle_path"], "Worker/" + resource["wheel_entry"])
+
+    def test_sobol_resource_rejects_changed_bytes_or_missing_stale_and_changed_source_pins(self):
+        payload = b"Sobol guard fixture; never loaded"
+        resource = copy.deepcopy(ci.SCIPY_SOBOL_RESOURCE)
+        resource.update(bytes=len(payload), sha256=hashlib.sha256(payload).hexdigest())
+        app = self.root / "app"
+        path = app / resource["bundle_path"]
+        path.parent.mkdir(parents=True)
+        runtime = self.runtime_wheel_report_fixture()
+        cases = [("missing_manifest", payload, None), ("missing_packages", payload, {}),
+                 ("changed_size", payload + b"x", runtime),
+                 ("changed_hash_same_size", b"X" + payload[1:], runtime)]
+        for field, value in (("version", "0.0.0"), ("filename", "wrong-source.whl"),
+                             ("sha256", "0" * 64), ("sha256_published", "0" * 64),
+                             ("latest_release_metadata_checked", False)):
+            changed = copy.deepcopy(runtime)
+            record = next(row for row in changed["packages"] if row["name"] == "scipy")
+            record[field] = value
+            cases.append(("source_" + field, payload, changed))
+        with mock.patch.object(ci, "SCIPY_SOBOL_RESOURCE", resource):
+            for label, content, report in cases:
+                with self.subTest(case=label):
+                    path.write_bytes(content)
+                    with self.assertRaises(ci.ValidationError) as failure:
+                        ci.assert_public_bundle(app, self.root, runtime_report=report)
+                    self.assertIn("code=CI_BUNDLE_VENDOR_RESOURCE_IDENTITY",
+                                  ci.ci_failure_diagnostic(failure.exception, "public_inventory"))
+            changed_pins = copy.deepcopy(provision_worker_runtime.WHEELS)
+            next(row for row in changed_pins if row["name"] == "scipy")["sha256"] = "f" * 64
+            with mock.patch.object(provision_worker_runtime, "WHEELS", changed_pins):
+                path.write_bytes(payload)
+                changed_report = self.runtime_wheel_report_fixture()
+                with self.assertRaises(ci.ValidationError) as failure:
+                    ci.assert_public_bundle(app, self.root, runtime_report=changed_report)
+                self.assertIn("code=CI_BUNDLE_VENDOR_RESOURCE_IDENTITY",
+                              ci.ci_failure_diagnostic(failure.exception, "public_inventory"))
+
+    def test_sobol_resource_never_allows_other_npz_npy_or_private_profile_paths(self):
+        payload = b"Sobol guard fixture; never loaded"
+        resource = copy.deepcopy(ci.SCIPY_SOBOL_RESOURCE)
+        resource.update(bytes=len(payload), sha256=hashlib.sha256(payload).hexdigest())
+        paths = ["Worker/scipy/stats/other.npz", "Worker/scipy/stats/_sobol_direction_numbers.npy",
+                 "Worker/_internal/scipy/stats/_sobol_direction_numbers.npz",
+                 "web/_sobol_direction_numbers.npz", "Worker/scipy/stats/_sobol_direction_numbers.NPZ",
+                 "Worker/private/_sobol_direction_numbers.npz", "Worker/profile/_sobol_direction_numbers.npz"]
+        with mock.patch.object(ci, "SCIPY_SOBOL_RESOURCE", resource):
+            for index, relative in enumerate(paths):
+                with self.subTest(case=index):
+                    app = self.root / ("app-" + str(index))
+                    path = app / relative
+                    path.parent.mkdir(parents=True)
+                    path.write_bytes(payload)
+                    with self.assertRaises(ci.ValidationError) as failure:
+                        ci.assert_public_bundle(app, self.root, runtime_report=self.runtime_wheel_report_fixture())
+                    expected = "CI_BUNDLE_PRIVATE_COMPONENT" if "/private/" in relative or "/profile/" in relative \
+                        else "CI_BUNDLE_FORBIDDEN_SUFFIX"
+                    diagnostic = ci.ci_failure_diagnostic(failure.exception, "public_inventory")
+                    self.assertIn("code=" + expected, diagnostic)
+                    self.assertNotIn(relative, diagnostic)
 
     def test_license_copy_excludes_private_json_and_nonlicense_model_files(self):
         source = self.root / "docs" / "licenses"
