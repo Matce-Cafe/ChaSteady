@@ -92,7 +92,7 @@ CI_STAGES = frozenset({
     "stage_ui", "flutter_environment", "flutter_version", "flutter_pub", "flutter_l10n",
     "flutter_windows", "native_toolchain", "flutter_web", "native_outputs", "worker_runtime",
     "local_math_identity", "stage_app", "worker_build_and_smoke", "worker_inventory",
-    "bundle_metadata", "public_inventory", "artifact_zip", "artifact_manifest",
+    "bundle_metadata", "public_inventory", "artifact_zip", "artifact_manifest", "flutter_preflight_result",
 })
 # Exact messages authored in this file only. Never print arbitrary exception
 # strings, a prefix-matched vendor log line, argv, paths, or protocol output.
@@ -111,6 +111,8 @@ SAFE_VALIDATION_CODES = {
     "Flutter provisioning report has missing or unknown fields": "CI_FLUTTER_REPORT_SCHEMA",
     "Flutter provisioning report differs from the pinned official stable archive": "CI_FLUTTER_ARCHIVE_IDENTITY",
     "Flutter SDK paths escaped their isolated download/extraction roots": "CI_FLUTTER_REPORT_PATHS",
+    "Flutter preflight stage overlaps SDK or source files": "CI_FLUTTER_PREFLIGHT_STAGE",
+    "CI output directory must be new and non-reparse": "CI_STAGE_OUTPUT_NOT_NEW",
     "Pinned font acquisition report has missing or unknown fields": "CI_FONT_REPORT_SCHEMA",
     "Pinned font content changed after acquisition": "CI_FONT_CONTENT_IDENTITY",
     "Noto Sans SC provenance or OFL license failed its pinned identity": "CI_FONT_LICENSE_IDENTITY",
@@ -121,7 +123,7 @@ SAFE_VALIDATION_CODES = {
     "Executed Flutter/Dart versions differ from the pinned stable SDK": "CI_FLUTTER_VERSION_IDENTITY",
     "Math sidecar worker/math source hashes differ from the current checkout": "CI_MATH_SOURCE_IDENTITY",
 }
-for _flutter_stage in ("version", "pub", "l10n", "windows", "web"):
+for _flutter_stage in ("bootstrap", "version", "pub", "l10n", "windows", "web"):
     SAFE_VALIDATION_CODES[
         "Flutter {} exited unsuccessfully; raw runner-local logs are not uploaded".format(_flutter_stage)
     ] = "CI_FLUTTER_{}_EXIT".format(_flutter_stage.upper())
@@ -636,15 +638,51 @@ def run_flutter(label: str, sdk_root: Path, args: list[str], cwd: Path, env: dic
         if registry.snapshot():
             registry.terminate_all()
     if code != 0:
+        flutter_json_shape_diagnostic(stdout_path.read_bytes(), stderr_path, RuntimeError())
         raise ValidationError("Flutter {} exited unsuccessfully; raw runner-local logs are not uploaded".format(label))
     return stdout_path.read_bytes()
 
 
+def flutter_json_shape_diagnostic(raw: bytes, stderr_path: Path, error: Exception) -> None:
+    """Print only bounded numeric/boolean shape, never child output or paths."""
+    stderr_bytes, stderr_sample = None, b""
+    try:
+        if stderr_path.is_file() and not is_reparse(stderr_path):
+            stderr_bytes = stderr_path.stat().st_size
+            with stderr_path.open("rb") as stream:
+                stderr_sample = stream.read(64 * 1024)
+    except OSError:
+        pass
+    try:
+        raw.decode("utf-8")
+        utf8_valid = True
+    except UnicodeError:
+        utf8_valid = False
+    position = getattr(error, "pos", None)
+    shape = {"stdout_bytes": len(raw), "stderr_bytes": stderr_bytes,
+             "stdout_utf8_bom": raw.startswith(b"\xef\xbb\xbf"), "stdout_utf8_valid": utf8_valid,
+             "json_error_pos": position if type(position) is int and position >= 0 else None}
+    # Exact launcher markers from the pinned official Windows SDK source.
+    markers = {"tool_build": b"Building flutter tool...", "pub_upgrade": b"Running pub upgrade...",
+               "dart_version_check": b"Checking Dart SDK version..."}
+    for name, marker in markers.items():
+        shape["stdout_" + name] = marker in raw
+        shape["stderr_" + name] = marker in stderr_sample
+    print("ChaSteady Flutter JSON diagnostic " + json.dumps(shape, sort_keys=True), flush=True)
+
+
 def flutter_version_check(sdk_root: Path, cwd: Path, env: dict, stage: Path) -> dict:
+    # A cold official Windows SDK may bootstrap its tool through dart pub upgrade,
+    # whose inherited stdout precedes even machine JSON. Capture one supported
+    # plain version/bootstrap separately; never strip text from the strict query.
+    print("ChaSteady Flutter version step=bootstrap started", flush=True)
+    run_flutter("bootstrap", sdk_root, ["--version"], cwd, env, stage, timeout=300)
+    print("ChaSteady Flutter version step=strict_machine started", flush=True)
     raw = run_flutter("version", sdk_root, ["--version", "--machine"], cwd, env, stage, timeout=300)
     try:
         info = json.loads(raw.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as error:
+        flutter_json_shape_diagnostic(raw, stage / "version.stderr.log", error)
         raise ValidationError("Pinned Flutter SDK did not return its machine-readable version") from error
     if (info.get("frameworkVersion") != "3.47.7" or info.get("channel") != "stable"
             or info.get("dartSdkVersion") != "3.13.5"):
@@ -938,6 +976,36 @@ def write_zip(app_root: Path, archive_path: Path) -> None:
             archive.write(str(path), "ChaSteady/" + relative)
 
 
+def run_flutter_preflight(args) -> dict:
+    """Execute only the pinned Flutter identity gate, before VS/SDK installation."""
+    mark_ci_stage(args, "checkout")
+    root = args.root.resolve(strict=True)
+    if root != ROOT.resolve(strict=True):
+        raise ValidationError("Build root differs from the repository containing this trusted CI helper")
+    mark_ci_stage(args, "flutter_report")
+    result = validate_flutter_result(args.flutter_result, args.flutter_scratch)
+    sdk_root = Path(result["sdk_root"])
+    stage_path = args.preflight_stage.resolve()
+    excluded = [sdk_root, Path(result["extraction_directory"]), Path(result["download_directory"]),
+                root / "tools", root / "worker", root / "ui"]
+    if any(stage_path.is_relative_to(path.resolve()) or path.resolve().is_relative_to(stage_path)
+           for path in excluded):
+        raise ValidationError("Flutter preflight stage overlaps SDK or source files")
+    stage = make_new_directory(stage_path)
+    mark_ci_stage(args, "flutter_environment")
+    environment = create_flutter_environment(os.environ, stage)
+    mark_ci_stage(args, "flutter_version")
+    identity = flutter_version_check(sdk_root, root, environment, stage)
+    mark_ci_stage(args, "flutter_preflight_result")
+    receipt = {"schema_version": 1, "scope": "pinned_flutter_executable_identity_only",
+               "archive_sha256": result["archive_sha256"], "identity": identity,
+               "strict_machine_json_verified": True, "native_build_executed": False,
+               "worker_tests_or_math_executed": False, "runtime_acceptance_verified": False}
+    _write_json_new(stage / "flutter-preflight.json", receipt)
+    print("Pinned Flutter executable identity preflight passed; no native or Worker build was run.", flush=True)
+    return receipt
+
+
 def run_build(args) -> dict:
     mark_ci_stage(args, "checkout")
     root = args.root.resolve(strict=True)
@@ -1136,17 +1204,35 @@ def run_build(args) -> dict:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT)
-    parser.add_argument("--toolchain-report", type=Path, required=True)
+    parser.add_argument("--preflight-flutter-only", action="store_true",
+                        help="Verify only the pinned Flutter executable identity; never build native/Worker outputs")
+    parser.add_argument("--preflight-stage", type=Path, help="New isolated stage for version-only preflight logs/receipt")
+    parser.add_argument("--toolchain-report", type=Path)
     parser.add_argument("--flutter-result", type=Path, required=True)
     parser.add_argument("--flutter-scratch", type=Path, required=True)
-    parser.add_argument("--font-result", type=Path, required=True)
-    parser.add_argument("--font-scratch", type=Path, required=True)
-    parser.add_argument("--worker-manifest", type=Path, required=True)
-    parser.add_argument("--math-sidecar", type=Path, required=True)
-    parser.add_argument("--artifact-dir", type=Path, required=True)
+    parser.add_argument("--font-result", type=Path)
+    parser.add_argument("--font-scratch", type=Path)
+    parser.add_argument("--worker-manifest", type=Path)
+    parser.add_argument("--math-sidecar", type=Path)
+    parser.add_argument("--artifact-dir", type=Path)
     args = parser.parse_args(argv)
+    full_fields = ("toolchain_report", "font_result", "font_scratch", "worker_manifest", "math_sidecar", "artifact_dir")
+    if args.preflight_flutter_only:
+        if args.preflight_stage is None:
+            parser.error("--preflight-flutter-only requires --preflight-stage")
+        if any(getattr(args, field) is not None for field in full_fields):
+            parser.error("--preflight-flutter-only cannot accept full-build inputs or an artifact directory")
+    else:
+        if args.preflight_stage is not None:
+            parser.error("--preflight-stage requires --preflight-flutter-only")
+        missing = ["--" + field.replace("_", "-") for field in full_fields if getattr(args, field) is None]
+        if missing:
+            parser.error("Full build requires " + ", ".join(missing))
     try:
-        run_build(args)
+        if args.preflight_flutter_only:
+            run_flutter_preflight(args)
+        else:
+            run_build(args)
     except Exception as error:
         # Print only fixed stages/codes and exact allowlisted author messages.
         # Unknown exception strings and all raw child/process logs stay private.

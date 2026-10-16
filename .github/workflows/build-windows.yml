@@ -84,21 +84,6 @@ jobs:
             }
           }
 
-      - name: Update official stable Visual Studio and Windows SDK
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $ciRoot = '${{ steps.run-root.outputs.ci_root }}'
-          $toolchainReport = Join-Path $ciRoot 'toolchain-preflight.json'
-          & (Join-Path $env:GITHUB_WORKSPACE 'tools/ci_toolchain_preflight.ps1') `
-            -OutputPath $toolchainReport `
-            -RunnerLabel 'windows-2025-vs2026' `
-            -UpdateStableVisualStudio `
-            -InstallLatestWindowsSdk
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
-          }
-
       - name: Create fresh Worker runtime using the current repository root
         id: worker-runtime
         shell: pwsh
@@ -163,6 +148,38 @@ jobs:
           }
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "result=$result" -Encoding utf8
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "scratch=$scratch" -Encoding utf8
+
+      - name: Verify Flutter executable identity before long toolchain updates
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repo = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
+          $ciRoot = '${{ steps.run-root.outputs.ci_root }}'
+          $stage = Join-Path $ciRoot ('flutter-preflight-' + [Guid]::NewGuid().ToString('N'))
+          & '${{ steps.host-python.outputs.path }}' -I (Join-Path $repo 'tools/ci_build_windows.py') `
+            --root $repo `
+            --preflight-flutter-only `
+            --flutter-result '${{ steps.flutter.outputs.result }}' `
+            --flutter-scratch '${{ steps.flutter.outputs.scratch }}' `
+            --preflight-stage $stage
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Update official stable Visual Studio and Windows SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ciRoot = '${{ steps.run-root.outputs.ci_root }}'
+          $toolchainReport = Join-Path $ciRoot 'toolchain-preflight.json'
+          & (Join-Path $env:GITHUB_WORKSPACE 'tools/ci_toolchain_preflight.ps1') `
+            -OutputPath $toolchainReport `
+            -RunnerLabel 'windows-2025-vs2026' `
+            -UpdateStableVisualStudio `
+            -InstallLatestWindowsSdk
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
 
       - name: Build, rerun backend tests, validate local math identity, and stage public-safe bundle
         shell: pwsh

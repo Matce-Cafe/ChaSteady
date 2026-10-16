@@ -19,7 +19,15 @@ All toolchain updates happen only on the disposable hosted runner. The workflow 
 
 `tools/ci_provision_flutter.py` downloads Flutter 3.47.7 stable only from Google's official Flutter release bucket. It rejects redirects, verifies the pinned archive byte count and SHA-256 before ZIP inspection, audits bounded safe members, and extracts to a separate new UUID directory. The font helper fetches the Noto Sans SC variable font by its pinned Google Fonts Git blob through the official GitHub API, verifies Git blob SHA-1/SHA-256/size and TrueType structure, and puts it only in an ephemeral build directory. The TTF binary is intentionally not part of the public source checkout; its SIL Open Font License and provenance text remain available.
 
-The UI pipeline runs only:
+### Early executable identity gate
+
+The workflow provisions the Worker runtime, font and pinned Flutter archive **before** the long Visual Studio/Windows SDK update. It then invokes the existing helper's restricted `--preflight-flutter-only` mode with only the Flutter provision result, scratch root and a new isolated `--preflight-stage`. That mode reuses the pinned receipt/path checks, child-only environment and strict executable-version gate; it does not require a Microsoft toolchain report and cannot accept an artifact directory or other full-build inputs. Its receipt is explicitly identity-only, not native compilation, Worker testing, mathematical reproduction or runtime acceptance.
+
+Both that early check and the later full build use the same version preparation: one supported plain `flutter --version` call, with private stdout/stderr capture, followed by `flutter --version --machine` whose **entire stdout must still be a single valid JSON document** with the expected stable versions. A cold extraction of the pinned official ZIP was observed to bootstrap its tool through `dart pub upgrade`, whose dependency-status stdout preceded the first machine JSON. On a second independent cold extraction, plain-version warmup followed by the strict machine query passed. No arbitrary prefix/tail, first-run notice, BOM or multiple-JSON workaround is accepted by the parser.
+
+The official child-only `FLUTTER_SUPPRESS_ANALYTICS=true` switch selects NoOp analytics, independently preventing the first-run telemetry notice. Normal version/bootstrap operations can still write SDK caches and isolated tool state; this is not a zero-cache-write claim or a patched SDK. Failed version checks expose only fixed stages/codes and numeric/boolean output shape (byte counts, UTF-8/BOM and JSON-error position, known launcher-marker flags), never arbitrary raw stdout, credentials, command arguments or vendor/private paths. The full build independently revalidates all original toolchain, source/runtime identity, Worker, packaging and inventory gates after the early check.
+
+The UI build pipeline then runs only:
 
 1. `flutter pub get --enforce-lockfile`
 2. `flutter gen-l10n`
