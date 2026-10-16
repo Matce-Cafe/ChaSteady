@@ -50,6 +50,8 @@ On success, the workflow uploads only:
 
 The app bundle contains the real `ChaSteady.exe`, Flutter Windows engine/data, freshly built one-folder Worker, offline web assets, README, `BUILD_STATUS.json`, original `LICENSE`, third-party notices, and selected license text files. License JSON manifests, non-license model files, caches, profiles, private build state, logs, credentials, and source media are excluded. The artifact expires after seven days.
 
+Selected license notices, including SciPy's extensionless `LICENSE_DOP` redistribution notice, are copied byte-for-byte, without rewriting upstream text or exempting whole files/URLs from privacy checks. Drive-path detection requires a drive-token boundary, so the `p:/` suffix in `http://` and `ftp://`, or `s:/` in `https://`, is not mistaken for a Windows path. Actual drive/UNC paths (including those embedded in a URL), NUL bytes, repository/home markers, reparse points, invalid UTF-8 and oversized notices remain rejected. Fixed `bundle_license_texts`, `bundle_metadata`, `bundle_legal_notices` and `public_inventory` stages distinguish license copying, status JSON, top-level legal notices and the final scan; safe license/privacy error codes never include offending text or local paths. A license-only probe reaching the required-native-file guard after scanning is not a complete product inventory or an accepted build artifact.
+
 `BUILD_STATUS.json` and the manifest explicitly keep `runtime_acceptance_verified`, `public_distribution_cleared`, signing, and legal certification false. **MIT applies only to original ChaSteady code**; bundled third-party terms remain applicable. A successful CI build is not a release or an end-user runtime acceptance test.
 
 ## Sources pinned or checked by CI

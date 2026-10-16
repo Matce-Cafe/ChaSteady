@@ -92,7 +92,8 @@ CI_STAGES = frozenset({
     "stage_ui", "flutter_environment", "flutter_version", "flutter_pub", "flutter_l10n",
     "flutter_windows", "native_toolchain", "flutter_web", "native_outputs", "worker_runtime",
     "local_math_identity", "stage_app", "worker_build_and_smoke", "worker_inventory",
-    "bundle_metadata", "public_inventory", "artifact_zip", "artifact_manifest", "flutter_preflight_result",
+    "bundle_license_texts", "bundle_metadata", "bundle_legal_notices", "public_inventory",
+    "artifact_zip", "artifact_manifest", "flutter_preflight_result",
 })
 # Exact messages authored in this file only. Never print arbitrary exception
 # strings, a prefix-matched vendor log line, argv, paths, or protocol output.
@@ -122,6 +123,16 @@ SAFE_VALIDATION_CODES = {
     "Pinned Flutter SDK did not return its machine-readable version": "CI_FLUTTER_VERSION_JSON",
     "Executed Flutter/Dart versions differ from the pinned stable SDK": "CI_FLUTTER_VERSION_IDENTITY",
     "Math sidecar worker/math source hashes differ from the current checkout": "CI_MATH_SOURCE_IDENTITY",
+    "License source must be regular and destination must be new": "CI_LICENSE_TREE_INPUT",
+    "License tree contains a reparse point": "CI_LICENSE_REPARSE",
+    "A license text exceeds the configured public-copy size bound": "CI_LICENSE_SIZE",
+    "A selected license notice is not UTF-8 text": "CI_LICENSE_UTF8",
+    "A selected license notice contains a machine-specific path": "CI_LICENSE_PATH_PRIVACY",
+    "License copy target is not a new regular file": "CI_LICENSE_COPY_TARGET",
+    "Selected license texts omit the exact Noto Sans SC OFL notice": "CI_LICENSE_NOTO_NOTICE",
+    "Application metadata source or target is not a new regular file": "CI_METADATA_FILE",
+    "A staged file contains a local build-root or profile path": "CI_BUNDLE_PATH_PRIVACY",
+    "Staged app bundle is missing a required native, Worker, web, README or license file": "CI_BUNDLE_REQUIRED_FILES",
 }
 for _flutter_stage in ("bootstrap", "version", "pub", "l10n", "windows", "web"):
     SAFE_VALIDATION_CODES[
@@ -861,7 +872,7 @@ def _copy_file(source: Path, destination: Path) -> None:
 
 
 LICENSE_TEXT_SUFFIXES = {".txt", ".md", ".license", ".licence", ".notice", ".copying"}
-LICENSE_TEXT_BASENAMES = {"license", "licence", "copying", "notice", "copyright", "ofl"}
+LICENSE_TEXT_BASENAMES = {"license", "licence", "copying", "notice", "copyright", "ofl", "license_dop"}
 
 
 def copy_license_texts(source: Path, destination: Path, repo_root: Path) -> list[dict]:
@@ -870,7 +881,10 @@ def copy_license_texts(source: Path, destination: Path, repo_root: Path) -> list
     destination.mkdir(exist_ok=False)
     repo_marker = str(repo_root.resolve(strict=True)).encode("utf-8", "ignore").lower()
     home_marker = str(Path.home()).encode("utf-8", "ignore").lower()
-    windows_path = re.compile(r"(?i)(?:[A-Z]:[\\/]|\\\\[A-Z0-9_.-]+[\\/])")
+    # A drive letter must start a token: the final p:/ in http:// (or s:/
+    # in https://) is not a Windows path. Do not exempt URLs or license files;
+    # real drive/UNC paths and the independent root/home checks still apply.
+    windows_path = re.compile(r"(?i)(?:(?<![A-Z0-9_])[A-Z]:[\\/]|\\\\[A-Z0-9_.-]+[\\/])")
     rows = []
     for item in sorted(source.rglob("*")):
         if is_reparse(item):
@@ -1103,8 +1117,9 @@ def run_build(args) -> dict:
                                            "inventory": {"files": worker_inventory["files"]}}},
     })
 
-    mark_ci_stage(args, "bundle_metadata")
+    mark_ci_stage(args, "bundle_license_texts")
     copied_license_texts = copy_license_texts(root / "docs" / "licenses", app_stage / "licenses", root)
+    mark_ci_stage(args, "bundle_metadata")
     build_status = {
         "schema_version": 1,
         "native_compiled": True,
@@ -1130,6 +1145,7 @@ def run_build(args) -> dict:
         "license_scope": "MIT covers original ChaSteady code only; bundled third-party license notices are retained.",
     }
     _write_json_new(app_stage / "BUILD_STATUS.json", build_status)
+    mark_ci_stage(args, "bundle_legal_notices")
     _copy_file(root / "LICENSE", app_stage / "LICENSE")
     _copy_file(root / "THIRD_PARTY_NOTICES.md", app_stage / "THIRD_PARTY_NOTICES.md")
     _copy_file(root / "docs" / "WINDOWS_PORTABLE_GUIDE.md", app_stage / "README.md")
