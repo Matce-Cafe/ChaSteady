@@ -1,12 +1,15 @@
 """CI packaging/identity tests; executable-shaped fixture bytes are never run."""
 import ast
 import copy
+from contextlib import redirect_stderr, redirect_stdout
 import hashlib
+import io
 import json
 from pathlib import Path
 import re
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -22,6 +25,73 @@ class CiBuildWindowsTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="ci-build-helper-tests-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+
+    def test_safe_failure_diagnostic_uses_exact_author_message_codes(self):
+        message = "Pinned Flutter SDK did not return its machine-readable version"
+        diagnostic = ci.ci_failure_diagnostic(ci.ValidationError(message), "flutter_version")
+        self.assertIn("code=CI_FLUTTER_VERSION_JSON", diagnostic)
+        self.assertIn("stage=flutter_version", diagnostic)
+        self.assertIn(message, diagnostic)
+        exit_message = "Flutter version exited unsuccessfully; raw runner-local logs are not uploaded"
+        self.assertIn("code=CI_FLUTTER_VERSION_EXIT",
+                      ci.ci_failure_diagnostic(ci.ValidationError(exit_message), "flutter_version"))
+        # Prefix matching would leak an appended private path or credential.
+        augmented = message + r" D:\PRIVATE\profile.json bearer=do-not-print"
+        diagnostic = ci.ci_failure_diagnostic(ci.ValidationError(augmented), "flutter_version")
+        self.assertIn("code=CI_VALIDATION_FAILED", diagnostic)
+        self.assertNotIn("D:\\PRIVATE", diagnostic)
+        self.assertNotIn("do-not-print", diagnostic)
+
+    def test_unknown_failure_and_stage_never_echo_paths_or_credentials(self):
+        private = r"D:\PRIVATE\profile.json bearer=not-for-logs"
+        for error in (ci.ValidationError(private), RuntimeError(private), ValueError(private)):
+            with self.subTest(error_type=type(error).__name__):
+                diagnostic = ci.ci_failure_diagnostic(error, private)
+                self.assertIn("stage=unknown", diagnostic)
+                self.assertNotIn(private, diagnostic)
+                self.assertNotIn("not-for-logs", diagnostic)
+        output = io.StringIO()
+        with redirect_stdout(output), self.assertRaises(ValueError):
+            ci.mark_ci_stage(SimpleNamespace(), private)
+        self.assertEqual(output.getvalue(), "")
+
+    def test_main_reports_fixed_stage_and_code_not_raw_exception(self):
+        def rejected(args):
+            ci.mark_ci_stage(args, "flutter_version")
+            raise ci.ValidationError(r"D:\PRIVATE\runtime.log bearer=not-for-logs")
+
+        argv = []
+        for flag in ("--toolchain-report", "--flutter-result", "--flutter-scratch", "--font-result",
+                     "--font-scratch", "--worker-manifest", "--math-sidecar", "--artifact-dir"):
+            argv.extend([flag, str(self.root / "private-fixture")])
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(ci, "run_build", side_effect=rejected), \
+                redirect_stdout(stdout), redirect_stderr(stderr):
+            code = ci.main(argv)
+        self.assertEqual(code, 1)
+        self.assertIn("stage=flutter_version started", stdout.getvalue())
+        self.assertIn("code=CI_VALIDATION_FAILED stage=flutter_version", stderr.getvalue())
+        self.assertNotIn("not-for-logs", stdout.getvalue() + stderr.getvalue())
+        self.assertNotIn(str(self.root), stdout.getvalue() + stderr.getvalue())
+
+    def test_run_build_identifies_toolchain_schema_failure_before_any_build(self):
+        (self.root / ".git").mkdir()
+        report = self.root / "toolchain.json"
+        report.write_text("{}", encoding="utf-8")
+        args = SimpleNamespace(root=self.root, toolchain_report=report)
+        output = io.StringIO()
+        with mock.patch.object(ci, "ROOT", self.root), \
+                mock.patch.object(ci, "validate_flutter_result") as flutter_validation, \
+                redirect_stdout(output), self.assertRaises(ci.ValidationError) as failure:
+            ci.run_build(args)
+        flutter_validation.assert_not_called()
+        self.assertEqual(args._ci_stage, "toolchain_report")
+        self.assertEqual(output.getvalue().splitlines(), [
+            "ChaSteady CI stage=checkout started", "ChaSteady CI stage=toolchain_report started",
+        ])
+        diagnostic = ci.ci_failure_diagnostic(failure.exception, args._ci_stage)
+        self.assertIn("code=CI_TOOLCHAIN_SCHEMA stage=toolchain_report", diagnostic)
+        self.assertNotIn(str(self.root), diagnostic)
 
     @staticmethod
     def fake_wheels():
@@ -438,6 +508,57 @@ class CiBuildWindowsTests(unittest.TestCase):
                                          "--pwa-strategy=none"])
         self.assertFalse(any(args[0] in ("analyze", "test", "run", "drive") for _, args in commands))
 
+    def test_flutter_machine_version_accepts_only_the_expected_json_identity(self):
+        info = {"frameworkVersion": "3.47.7", "channel": "stable", "dartSdkVersion": "3.13.5",
+                "frameworkRevision": "abaf9c523780a608bd46686fd5e53740a07077f8",
+                "flutterRoot": r"D:\fixture-private-sdk\flutter"}
+        raw = (json.dumps(info, indent=2) + "\n").encode("utf-8")
+        with mock.patch.object(ci, "run_flutter", return_value=raw):
+            summary = ci.flutter_version_check(self.root, self.root, {}, self.root)
+        self.assertEqual(summary, {"flutter_version": "3.47.7", "dart_version": "3.13.5",
+                                   "framework_revision": info["frameworkRevision"]})
+        self.assertNotIn(info["flutterRoot"], str(summary))
+        info["channel"] = "beta"
+        with mock.patch.object(ci, "run_flutter", return_value=json.dumps(info).encode("utf-8")), \
+                self.assertRaises(ci.ValidationError) as failure:
+            ci.flutter_version_check(self.root, self.root, {}, self.root)
+        self.assertIn("CI_FLUTTER_VERSION_IDENTITY", ci.ci_failure_diagnostic(failure.exception, "flutter_version"))
+
+    def test_flutter_machine_version_rejects_exact_notice_multiple_json_and_private_tail(self):
+        info = {"frameworkVersion": "3.47.7", "channel": "stable", "dartSdkVersion": "3.13.5",
+                "frameworkRevision": "abaf9c523780a608bd46686fd5e53740a07077f8",
+                "flutterRoot": r"D:\fixture-private-sdk\flutter"}
+        # The SDK 3.47.7 first-run notice reproduced in the private version-only
+        # probes remains rejected. The official child-only NoOp switch prevents
+        # it instead of loosening JSON parsing or accepting arbitrary trailers.
+        notice = """The Flutter CLI developer tool uses Google Analytics to report usage and diagnostic
+data along with package dependencies, and crash reporting to send basic crash
+reports. This data is used to help improve the Dart platform, Flutter framework,
+and related tools.
+
+Telemetry is not sent on the very first run. To disable reporting of telemetry,
+run this terminal command:
+
+    flutter --disable-analytics
+
+If you opt out of telemetry, an opt-out event will be sent, and then no further
+information will be sent. This data is collected in accordance with the Google
+Privacy Policy (https://policies.google.com/privacy).
+
+"""
+        private_tail = r"D:\fixture-private-sdk\profile.json bearer=not-for-logs"
+        trailers = ("\n" + notice, "\r\n" + notice.replace("\n", "\r\n"),
+                    "\n{}", "\n" + json.dumps(info), "\n" + private_tail)
+        for trailer in trailers:
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with self.subTest(trailer_kind=trailer[:16]), \
+                    mock.patch.object(ci, "run_flutter", return_value=(json.dumps(info) + trailer).encode("utf-8")), \
+                    redirect_stdout(stdout), redirect_stderr(stderr), self.assertRaises(ci.ValidationError) as failure:
+                ci.flutter_version_check(self.root, self.root, {}, self.root)
+            self.assertIn("CI_FLUTTER_VERSION_JSON", ci.ci_failure_diagnostic(failure.exception, "flutter_version"))
+            self.assertNotIn(info["flutterRoot"], stdout.getvalue() + stderr.getvalue())
+            self.assertNotIn("not-for-logs", stdout.getvalue() + stderr.getvalue())
+
     def test_flutter_child_environment_isolated_and_git_shim_narrow(self):
         stage = self.root / "stage"
         stage.mkdir()
@@ -449,6 +570,9 @@ class CiBuildWindowsTests(unittest.TestCase):
         self.assertEqual(__import__("os").environ.get("APPDATA"), before.get("APPDATA"))
         self.assertNotEqual(env["APPDATA"], "real-profile")
         self.assertTrue(env["GIT_CONFIG_NOSYSTEM"] == "1")
+        self.assertEqual(env["FLUTTER_SUPPRESS_ANALYTICS"], "true")
+        self.assertEqual(__import__("os").environ.get("FLUTTER_SUPPRESS_ANALYTICS"),
+                         before.get("FLUTTER_SUPPRESS_ANALYTICS"))
         shim = Path(env["PATH"].split(__import__("os").pathsep, 1)[0]) / "$git.cmd"
         text = shim.read_text(encoding="ascii")
         self.assertIn('"%CHA_STEADY_GIT_EXE%" rev-parse HEAD', text)

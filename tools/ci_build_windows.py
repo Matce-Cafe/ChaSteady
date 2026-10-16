@@ -87,6 +87,67 @@ class ValidationError(RuntimeError):
     pass
 
 
+CI_STAGES = frozenset({
+    "checkout", "toolchain_report", "flutter_report", "font_report", "worker_report",
+    "stage_ui", "flutter_environment", "flutter_version", "flutter_pub", "flutter_l10n",
+    "flutter_windows", "native_toolchain", "flutter_web", "native_outputs", "worker_runtime",
+    "local_math_identity", "stage_app", "worker_build_and_smoke", "worker_inventory",
+    "bundle_metadata", "public_inventory", "artifact_zip", "artifact_manifest",
+})
+# Exact messages authored in this file only. Never print arbitrary exception
+# strings, a prefix-matched vendor log line, argv, paths, or protocol output.
+SAFE_VALIDATION_CODES = {
+    "Build root differs from the repository containing this trusted CI helper": "CI_CHECKOUT_ROOT",
+    "A complete Git checkout is required for the trusted runner build": "CI_CHECKOUT_MISSING",
+    "A required regular JSON file is missing or outside its size bound": "CI_INPUT_JSON_FILE",
+    "A required JSON file is not valid UTF-8 JSON": "CI_INPUT_JSON_FORMAT",
+    "JSON contains a duplicate object key": "CI_INPUT_JSON_DUPLICATE",
+    "JSON contains a non-finite numeric value": "CI_INPUT_JSON_NONFINITE",
+    "Runner toolchain report has missing or unknown fields": "CI_TOOLCHAIN_SCHEMA",
+    "Runner label or preflight schema is not approved": "CI_RUNNER_IDENTITY",
+    "Windows SDK installer version is not a stable numeric version": "CI_SDK_INSTALLER_VERSION_FORMAT",
+    "Windows SDK official installer evidence does not meet the audited target contract": "CI_SDK_INSTALLER_IDENTITY",
+    "CMake executable raw version differs from the runner preflight report": "CI_CMAKE_EXECUTABLE_IDENTITY",
+    "Flutter provisioning report has missing or unknown fields": "CI_FLUTTER_REPORT_SCHEMA",
+    "Flutter provisioning report differs from the pinned official stable archive": "CI_FLUTTER_ARCHIVE_IDENTITY",
+    "Flutter SDK paths escaped their isolated download/extraction roots": "CI_FLUTTER_REPORT_PATHS",
+    "Pinned font acquisition report has missing or unknown fields": "CI_FONT_REPORT_SCHEMA",
+    "Pinned font content changed after acquisition": "CI_FONT_CONTENT_IDENTITY",
+    "Noto Sans SC provenance or OFL license failed its pinned identity": "CI_FONT_LICENSE_IDENTITY",
+    "The binary Noto font must not be committed in the public source checkout": "CI_FONT_IN_SOURCE",
+    "Locked Flutter UI dependency graph is required": "CI_UI_LOCKFILE_MISSING",
+    "A runner-provided Git executable is required for the audited Flutter shim": "CI_FLUTTER_GIT_MISSING",
+    "Pinned Flutter SDK did not return its machine-readable version": "CI_FLUTTER_VERSION_JSON",
+    "Executed Flutter/Dart versions differ from the pinned stable SDK": "CI_FLUTTER_VERSION_IDENTITY",
+    "Math sidecar worker/math source hashes differ from the current checkout": "CI_MATH_SOURCE_IDENTITY",
+}
+for _flutter_stage in ("version", "pub", "l10n", "windows", "web"):
+    SAFE_VALIDATION_CODES[
+        "Flutter {} exited unsuccessfully; raw runner-local logs are not uploaded".format(_flutter_stage)
+    ] = "CI_FLUTTER_{}_EXIT".format(_flutter_stage.upper())
+
+
+def mark_ci_stage(args, stage: str) -> None:
+    if stage not in CI_STAGES:
+        raise ValueError("Unknown internal CI stage")
+    args._ci_stage = stage
+    print("ChaSteady CI stage=" + stage + " started", flush=True)
+
+
+def ci_failure_diagnostic(error: Exception, stage) -> str:
+    safe_stage = stage if type(stage) is str and stage in CI_STAGES else "unknown"
+    message = error.args[0] if type(error) is ValidationError and len(error.args) == 1 else None
+    code = SAFE_VALIDATION_CODES.get(message) if type(message) is str else None
+    if code is not None:
+        detail = message
+    elif isinstance(error, ValidationError):
+        code, detail = "CI_VALIDATION_FAILED", "A validation guard rejected this stage."
+    else:
+        code, detail = "CI_INTERNAL_FAILED", "An internal operation failed in this stage."
+    return ("ChaSteady CI build failed code=" + code + " stage=" + safe_stage + ": " + detail
+            + " Raw runner-local diagnostics were not uploaded.")
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -546,6 +607,9 @@ def create_flutter_environment(base_env: dict, stage: Path) -> dict:
         "CHA_STEADY_GIT_EXE": str(git_path),
         "PUB_HOSTED_URL": "https://pub.dev",
         "FLUTTER_STORAGE_BASE_URL": "https://storage.googleapis.com",
+        # Official SDK switch: choose NoOpAnalytics, including no first-run notice.
+        # Unlike --suppress-analytics, this avoids telemetry-profile initialization.
+        "FLUTTER_SUPPRESS_ANALYTICS": "true",
         "PATH": str(folders["git-bin"]) + os.pathsep + base_env.get("PATH", ""),
     })
     for name in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV", "CONDA_PREFIX", "FLUTTER_ROOT"):
@@ -875,17 +939,23 @@ def write_zip(app_root: Path, archive_path: Path) -> None:
 
 
 def run_build(args) -> dict:
+    mark_ci_stage(args, "checkout")
     root = args.root.resolve(strict=True)
     if root != ROOT.resolve(strict=True):
         raise ValidationError("Build root differs from the repository containing this trusted CI helper")
     if not (root / ".git").exists():
         raise ValidationError("A complete Git checkout is required for the trusted runner build")
+    mark_ci_stage(args, "toolchain_report")
     toolchain_report = validate_toolchain_report(read_json(args.toolchain_report, max_bytes=64 * 1024))
+    mark_ci_stage(args, "flutter_report")
     flutter_result = validate_flutter_result(args.flutter_result, args.flutter_scratch)
+    mark_ci_stage(args, "font_report")
     font_summary = validate_font_result(args.font_result.resolve(strict=True), args.font_scratch, root)
     font_path = font_summary.pop("font_path_for_ephemeral_build_only")
+    mark_ci_stage(args, "worker_report")
     runtime_report_path = args.worker_manifest.resolve(strict=True)
     runtime_report = read_json(runtime_report_path, max_bytes=16 * 1024 * 1024)
+    mark_ci_stage(args, "stage_ui")
     # Keep all build state under the ignored ephemeral private tree. Only the
     # explicit app ZIP, digest and sanitized manifest are exported by the workflow.
     private_root = root / "private"
@@ -915,20 +985,25 @@ def run_build(args) -> dict:
     if not (flutter_source / "pubspec.lock").is_file():
         raise ValidationError("Locked Flutter UI dependency graph is required")
 
+    mark_ci_stage(args, "flutter_environment")
     flutter_env = create_flutter_environment(os.environ, stage)
     flutter_env["CHASTEADY_WINDOWS_SDK_VERSION"] = toolchain_report["windows_sdk_version"]
     sdk_root = Path(flutter_result["sdk_root"])
+    mark_ci_stage(args, "flutter_version")
     version_info = flutter_version_check(sdk_root, flutter_source, flutter_env, stage)
     actual_windows_toolchain = None
     for label, command in build_windows.flutter_commands(build_only=True):
+        mark_ci_stage(args, "flutter_" + label)
         run_flutter(label, sdk_root, command, flutter_source, flutter_env, stage,
                     timeout=3600 if label in ("windows", "web") else 1200)
         if label == "windows":
+            mark_ci_stage(args, "native_toolchain")
             actual_windows_toolchain = validate_flutter_windows_toolchain(
                 flutter_source / "build" / "windows" / "x64", toolchain_report)
     if actual_windows_toolchain is None:
         raise ValidationError("Flutter did not execute the required Windows release build")
 
+    mark_ci_stage(args, "native_outputs")
     web_root = flutter_source / "build" / "web"
     if not (web_root / "index.html").is_file() or not (web_root / "flutter_bootstrap.js").is_file():
         raise ValidationError("Real Flutter web build did not produce its offline entry points")
@@ -938,15 +1013,20 @@ def run_build(args) -> dict:
             or not (compiled / "data").is_dir()):
         raise ValidationError("Real Flutter Windows Release output lacks the native executable, engine DLL or data")
 
+    mark_ci_stage(args, "worker_runtime")
     runtime_toolchain_root, runtime_root, python_exe, runtime_env, _ = \
         freeze_worker.validate_manifest(root, runtime_report)
+    mark_ci_stage(args, "local_math_identity")
     sidecar_summary = validate_math_sidecar(args.math_sidecar.resolve(strict=True), root, runtime_report)
+    mark_ci_stage(args, "stage_app")
     build_windows.copy_directory(compiled, app_stage, omit_debug=True)
     build_windows.copy_directory(web_root, app_stage / "web")
+    mark_ci_stage(args, "worker_build_and_smoke")
     worker_bundle, backend_summary, worker_summary, worker_inventory = build_worker(
         root, runtime_report, runtime_root, python_exe, runtime_env, app_stage, stage,
         runtime_manifest_path=runtime_report_path,
     )
+    mark_ci_stage(args, "worker_inventory")
     worker_target = app_stage / "Worker"
     build_windows.copy_directory(worker_bundle, worker_target, omit_debug=True)
     worker_inventory_evidence = build_windows.verify_worker_inventory(worker_target, {
@@ -955,6 +1035,7 @@ def run_build(args) -> dict:
                                            "inventory": {"files": worker_inventory["files"]}}},
     })
 
+    mark_ci_stage(args, "bundle_metadata")
     copied_license_texts = copy_license_texts(root / "docs" / "licenses", app_stage / "licenses", root)
     build_status = {
         "schema_version": 1,
@@ -985,9 +1066,11 @@ def run_build(args) -> dict:
     _copy_file(root / "THIRD_PARTY_NOTICES.md", app_stage / "THIRD_PARTY_NOTICES.md")
     _copy_file(root / "docs" / "WINDOWS_PORTABLE_GUIDE.md", app_stage / "README.md")
 
+    mark_ci_stage(args, "public_inventory")
     files = assert_public_bundle(app_stage, root)
     # This helper intentionally creates its output directory only after all builds,
     # tests, sidecar identities and source-to-output checks have passed.
+    mark_ci_stage(args, "artifact_zip")
     artifact_dir = make_new_directory(args.artifact_dir.resolve())
     zip_path = artifact_dir / "ChaSteady-Windows-x64.zip"
     write_zip(app_stage, zip_path)
@@ -995,6 +1078,7 @@ def run_build(args) -> dict:
     with (artifact_dir / "ChaSteady-Windows-x64.zip.sha256").open("x", encoding="ascii", newline="\n") as stream:
         stream.write(zip_hash + "  ChaSteady-Windows-x64.zip\n")
 
+    mark_ci_stage(args, "artifact_manifest")
     runtime_python = runtime_report["python"]
     manifest = {
         "schema_version": 1,
@@ -1064,10 +1148,9 @@ def main(argv=None) -> int:
     try:
         run_build(args)
     except Exception as error:
-        # Actions logs are public in a public repository. Keep exception strings,
-        # runner-local paths, protocol output, and raw logs out of stdout/stderr.
-        print("ChaSteady CI build failed: {}. Detailed runner-local diagnostics were not uploaded.".format(
-            type(error).__name__), file=sys.stderr)
+        # Print only fixed stages/codes and exact allowlisted author messages.
+        # Unknown exception strings and all raw child/process logs stay private.
+        print(ci_failure_diagnostic(error, getattr(args, "_ci_stage", None)), file=sys.stderr, flush=True)
         return 1
     return 0
 
