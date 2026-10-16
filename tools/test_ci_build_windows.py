@@ -450,6 +450,13 @@ class CiBuildWindowsTests(unittest.TestCase):
                  and node.id == "copied_license_texts" and isinstance(node.ctx, ast.Load)]
         self.assertTrue(loads)
         self.assertTrue(all(node.lineno > assignment.lineno for node in loads))
+        stages = {node.value.args[1].value: node.lineno for node in run_build.body
+                  if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+                  and isinstance(node.value.func, ast.Name) and node.value.func.id == "mark_ci_stage"}
+        self.assertLess(stages["bundle_license_texts"], assignment.lineno)
+        self.assertLess(assignment.lineno, stages["bundle_metadata"])
+        self.assertLess(stages["bundle_metadata"], stages["bundle_legal_notices"])
+        self.assertLess(stages["bundle_legal_notices"], stages["public_inventory"])
 
     def test_windows_cmake_selects_sdk_before_project_and_records_actual_project_facts(self):
         source = (Path(ci.ROOT) / "ui" / "windows" / "CMakeLists.txt").read_text(encoding="utf-8")
@@ -562,6 +569,8 @@ class CiBuildWindowsTests(unittest.TestCase):
         (source / "python").mkdir()
         (source / "fonts" / "noto-sans-sc" / "OFL.txt").write_text("OFL text", encoding="utf-8")
         (source / "python" / "LICENSE.txt").write_text("license text", encoding="utf-8")
+        dop_notice = b"SciPy DOP redistribution notice\n"
+        (source / "python" / "LICENSE_DOP").write_bytes(dop_notice)
         (source / "collection-manifest.json").write_text(
             json.dumps({"local_path": r"D:\\PRIVATE\\audit.json"}), encoding="utf-8")
         (source / "haarcascade_license_plate.xml").write_bytes(b"model fixture, not a license")
@@ -570,20 +579,80 @@ class CiBuildWindowsTests(unittest.TestCase):
         destination.parent.mkdir()
         rows = ci.copy_license_texts(source, destination, self.root)
         names = {row["path"] for row in rows}
-        self.assertEqual(names, {"fonts/noto-sans-sc/OFL.txt", "python/LICENSE.txt"})
+        self.assertEqual(names, {"fonts/noto-sans-sc/OFL.txt", "python/LICENSE.txt", "python/LICENSE_DOP"})
+        self.assertEqual((destination / "python" / "LICENSE_DOP").read_bytes(), dop_notice)
         self.assertFalse((destination / "collection-manifest.json").exists())
         self.assertFalse((destination / "haarcascade_license_plate.xml").exists())
 
+    def test_license_urls_are_copied_unchanged_and_reach_public_required_file_guard(self):
+        source = self.root / "licenses"
+        (source / "fonts" / "noto-sans-sc").mkdir(parents=True)
+        (source / "fonts" / "noto-sans-sc" / "OFL.txt").write_bytes(b"OFL fixture text")
+        # The first URL is the real public sky_engine notice's false-positive
+        # context. Scheme suffixes must not be recognized as drive tokens.
+        payload = (b"http://www.apache.org/licenses/\n"
+                   b"https://example.invalid/license\n"
+                   b"ftp://ftp.sgi.com/graphics/tiff/TIFF6.ps.gz\n")
+        (source / "NOTICE.txt").write_bytes(payload)
+        app = self.root / "app"
+        app.mkdir()
+        rows = ci.copy_license_texts(source, app / "licenses", self.root)
+        self.assertEqual({row["path"] for row in rows}, {"NOTICE.txt", "fonts/noto-sans-sc/OFL.txt"})
+        for row in rows:
+            copied = (app / "licenses" / row["path"]).read_bytes()
+            self.assertEqual(copied, (source / row["path"]).read_bytes())
+            self.assertEqual(row["bytes"], len(copied))
+            self.assertEqual(row["sha256"], hashlib.sha256(copied).hexdigest())
+        ci._write_json_new(app / "BUILD_STATUS.json", {
+            "scope": "license-helper-fixture-only", "native_compiled": False,
+            "copied_license_text_count": len(rows), "runtime_acceptance_verified": False,
+        })
+        # Exercise the unmodified final scanner, not a bypass or a fake app.
+        # Missing native files are expected after the text/privacy scan finishes.
+        with self.assertRaises(ci.ValidationError) as failure:
+            ci.assert_public_bundle(app, self.root)
+        self.assertIn("code=CI_BUNDLE_REQUIRED_FILES stage=public_inventory",
+                      ci.ci_failure_diagnostic(failure.exception, "public_inventory"))
+        for label, marker in (("repo", str(self.root)), ("home", str(Path.home()))):
+            with self.subTest(marker=label):
+                (app / "licenses" / "NOTICE.txt").write_bytes(payload + marker.encode("utf-8"))
+                with self.assertRaises(ci.ValidationError) as failure:
+                    ci.assert_public_bundle(app, self.root)
+                diagnostic = ci.ci_failure_diagnostic(failure.exception, "public_inventory")
+                self.assertIn("code=CI_BUNDLE_PATH_PRIVACY stage=public_inventory", diagnostic)
+                self.assertNotIn(marker, diagnostic)
+
     def test_license_text_with_absolute_local_path_is_rejected(self):
         source = self.root / "licenses"
-        source.mkdir()
-        (source / "OFL.txt").write_text("Local path D:\\PROJECT\\PRIVATE", encoding="utf-8")
-        (source / "fonts").mkdir()
-        (source / "fonts" / "noto-sans-sc").mkdir()
+        (source / "fonts" / "noto-sans-sc").mkdir(parents=True)
         (source / "fonts" / "noto-sans-sc" / "OFL.txt").write_text("OFL", encoding="utf-8")
-        destination = self.root / "out"
-        with self.assertRaises(ci.ValidationError):
-            ci.copy_license_texts(source, destination, self.root)
+        cases = {
+            "drive_backslash": r"Local path D:\PROJECT\PRIVATE",
+            "drive_forward_slash": "Local path d:/project/private",
+            "drive_at_start": r"R:\private\profile",
+            "quoted_drive": r'Local path "Z:\private\profile"',
+            "punctuated_drive": "Local path=(Q:/private)",
+            "unc_backslash": r"Local path \\private-host\share\profile",
+            "unc_forward_slash": r"Local path \\private-host/share/profile",
+            "url_does_not_exempt_drive": "https://example.invalid/files/D:/private",
+            "url_does_not_exempt_unc": r"https://example.invalid/#\\private-host\share",
+            "nul": "License text\x00hidden content",
+            # A preceding ASCII token defeats drive detection on Windows, so
+            # the separate exact repo/home marker guards must still reject it.
+            "repo_marker": "prefix" + str(self.root),
+            "home_marker": "prefix" + str(Path.home()),
+        }
+        for label, text in cases.items():
+            with self.subTest(case=label):
+                (source / "OFL.txt").write_text(text, encoding="utf-8")
+                destination = self.root / ("out-" + label)
+                with self.assertRaises(ci.ValidationError) as failure:
+                    ci.copy_license_texts(source, destination, self.root)
+                diagnostic = ci.ci_failure_diagnostic(failure.exception, "bundle_license_texts")
+                self.assertIn("code=CI_LICENSE_PATH_PRIVACY stage=bundle_license_texts", diagnostic)
+                self.assertNotIn("D:\\PROJECT", diagnostic)
+                self.assertNotIn(str(self.root), diagnostic)
+                self.assertNotIn(str(Path.home()), diagnostic)
 
     def test_zip_contains_only_explicit_application_stage_and_never_runs_fixture_exes(self):
         app = self.root / "app-stage"
