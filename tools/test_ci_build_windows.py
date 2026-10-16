@@ -72,7 +72,8 @@ class CiBuildWindowsTests(unittest.TestCase):
                 mock.patch.object(ci, "build_worker") as worker, redirect_stdout(io.StringIO()):
             result = ci.run_flutter_preflight(args)
             validated.assert_called_once_with(args.flutter_result, args.flutter_scratch)
-            version.assert_called_once_with(sdk, self.root, {}, args.preflight_stage)
+            version.assert_called_once_with(sdk, self.root.resolve(strict=True), {},
+                                            args.preflight_stage.resolve(strict=True))
             worker.assert_not_called()
             self.assertFalse(result["native_build_executed"])
             self.assertFalse(result["worker_tests_or_math_executed"])
