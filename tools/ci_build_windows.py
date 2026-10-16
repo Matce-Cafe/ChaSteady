@@ -69,6 +69,24 @@ FORBIDDEN_BUNDLE_SUFFIXES = {
     ".npz", ".npy", ".prof", ".pstats", ".log", ".pickle", ".pkl",
 }
 FORBIDDEN_BUNDLE_COMPONENTS = {"private", ".git", ".dart_tool", ".cache", "profiles", "profile"}
+BUNDLE_FONT_PATHS = frozenset({
+    "data/flutter_assets/assets/fonts/NotoSansSC-wght.ttf",
+    "web/assets/assets/fonts/NotoSansSC-wght.ttf",
+})
+# Reviewed dependency data, not an alternative runtime lock. Its exact source
+# identity must still match the canonical provisioner and the validated runtime
+# manifest. Any SciPy wheel update requires a fresh audit of this single entry.
+SCIPY_SOBOL_RESOURCE = {
+    "bundle_path": "Worker/scipy/stats/_sobol_direction_numbers.npz",
+    "wheel_entry": "scipy/stats/_sobol_direction_numbers.npz",
+    "wheel": {
+        "name": "scipy", "version": "1.18.1",
+        "filename": "scipy-1.18.1-cp315-cp315-win_amd64.whl",
+        "sha256": "92c14f5bdbfb6216315ce33e78080474082de8b3830122ba97809bfbe65f75c0",
+    },
+    "bytes": 589334,
+    "sha256": "4859931147d42ce465b8605cb277f957d98b839d03194fdf06579357906d193b",
+}
 GIT_SHIM_TEXT = (
     "@echo off\r\n"
     "setlocal EnableExtensions DisableDelayedExpansion\r\n"
@@ -131,8 +149,17 @@ SAFE_VALIDATION_CODES = {
     "License copy target is not a new regular file": "CI_LICENSE_COPY_TARGET",
     "Selected license texts omit the exact Noto Sans SC OFL notice": "CI_LICENSE_NOTO_NOTICE",
     "Application metadata source or target is not a new regular file": "CI_METADATA_FILE",
+    "Staged app bundle is not a regular directory": "CI_BUNDLE_ROOT",
+    "Staged public bundle contains a reparse point": "CI_BUNDLE_REPARSE",
+    "Staged public bundle contains a private/profile/cache path": "CI_BUNDLE_PRIVATE_COMPONENT",
+    "Staged public bundle contains a prohibited media/cache/log file": "CI_BUNDLE_FORBIDDEN_SUFFIX",
+    "Audited vendor runtime resource failed its exact source or content identity": "CI_BUNDLE_VENDOR_RESOURCE_IDENTITY",
     "A staged file contains a local build-root or profile path": "CI_BUNDLE_PATH_PRIVACY",
     "Staged app bundle is missing a required native, Worker, web, README or license file": "CI_BUNDLE_REQUIRED_FILES",
+    "Staged app bundle lacks Flutter data assets": "CI_BUNDLE_FLUTTER_DATA",
+    "Staged app bundle lacks copied third-party license notices": "CI_BUNDLE_LICENSES",
+    "Public app bundle font or corresponding OFL license differs from its pinned identity": "CI_BUNDLE_FONT_IDENTITY",
+    "Staged app bundle has duplicate relative file names": "CI_BUNDLE_DUPLICATE_PATH",
 }
 for _flutter_stage in ("bootstrap", "version", "pub", "l10n", "windows", "web"):
     SAFE_VALIDATION_CODES[
@@ -157,7 +184,15 @@ def ci_failure_diagnostic(error: Exception, stage) -> str:
         code, detail = "CI_VALIDATION_FAILED", "A validation guard rejected this stage."
     else:
         code, detail = "CI_INTERNAL_FAILED", "An internal operation failed in this stage."
-    return ("ChaSteady CI build failed code=" + code + " stage=" + safe_stage + ": " + detail
+    context_text = ""
+    context = getattr(error, "_ci_bundle_context", None) if type(error) is ValidationError else None
+    if (safe_stage == "public_inventory" and code.startswith("CI_BUNDLE_")
+            and type(context) is tuple and len(context) == 2
+            and type(context[0]) is str and context[0] in {
+                "worker", "web", "flutter_data", "licenses", "metadata", "native", "other"}
+            and type(context[1]) is str and re.fullmatch(r"[0-9a-f]{64}", context[1])):
+        context_text = " category=" + context[0] + " relative_path_sha256=" + context[1]
+    return ("ChaSteady CI build failed code=" + code + " stage=" + safe_stage + context_text + ": " + detail
             + " Raw runner-local diagnostics were not uploaded.")
 
 
@@ -928,23 +963,59 @@ def _write_json_new(path: Path, value: dict) -> None:
         stream.write("\n")
 
 
-def assert_public_bundle(app_root: Path, repo_root: Path) -> list[dict]:
+def _public_bundle_failure(message: str, relative: str) -> ValidationError:
+    # Only an allowlisted class and a hash of the complete relative path may
+    # reach public diagnostics. Never attach a raw path or vendor exception.
+    category = {
+        "worker": "worker", "web": "web", "data": "flutter_data", "licenses": "licenses",
+        "chasteady.exe": "native", "flutter_windows.dll": "native",
+        "readme.md": "metadata", "build_status.json": "metadata", "license": "metadata",
+        "third_party_notices.md": "metadata",
+    }.get(relative.split("/", 1)[0].casefold(), "other")
+    error = ValidationError(message)
+    error._ci_bundle_context = (category, hashlib.sha256(relative.encode("utf-8")).hexdigest())
+    return error
+
+
+def _is_audited_scipy_sobol(path: Path, relative: str, runtime_report: dict | None) -> bool:
+    resource = SCIPY_SOBOL_RESOURCE
+    if (relative != resource["bundle_path"]
+            or relative != "Worker/" + resource["wheel_entry"]
+            or path.stat().st_size != resource["bytes"]
+            or sha256_file(path) != resource["sha256"] or not isinstance(runtime_report, dict)):
+        return False
+    identity = resource["wheel"]
+    canonical = [pin for pin in provision_worker_runtime.WHEELS if pin["name"] == identity["name"]]
+    if len(canonical) != 1 or any(canonical[0].get(key) != value for key, value in identity.items()):
+        return False
+    try:
+        wheels = _worker_pins(runtime_report)
+    except ValidationError:
+        return False
+    return any(all(wheel.get(key) == value for key, value in identity.items()) for wheel in wheels)
+
+
+def assert_public_bundle(app_root: Path, repo_root: Path, *, runtime_report: dict | None = None) -> list[dict]:
     if not app_root.is_dir() or is_reparse(app_root):
         raise ValidationError("Staged app bundle is not a regular directory")
     root_texts = {str(repo_root.resolve(strict=True)).encode("utf-8", "ignore"),
                   str(Path.home()).encode("utf-8", "ignore")}
     rows = []
     for path in sorted(app_root.rglob("*")):
+        relative = path.relative_to(app_root).as_posix()
         if is_reparse(path):
-            raise ValidationError("Staged public bundle contains a reparse point")
+            raise _public_bundle_failure("Staged public bundle contains a reparse point", relative)
         if not path.is_file():
             continue
-        relative = path.relative_to(app_root).as_posix()
         pure = PurePosixPath(relative)
         if any(part.casefold() in FORBIDDEN_BUNDLE_COMPONENTS for part in pure.parts):
-            raise ValidationError("Staged public bundle contains a private/profile/cache path")
+            raise _public_bundle_failure("Staged public bundle contains a private/profile/cache path", relative)
         if path.suffix.casefold() in FORBIDDEN_BUNDLE_SUFFIXES:
-            raise ValidationError("Staged public bundle contains a prohibited media/cache/log file")
+            if relative != SCIPY_SOBOL_RESOURCE["bundle_path"]:
+                raise _public_bundle_failure("Staged public bundle contains a prohibited media/cache/log file", relative)
+            if not _is_audited_scipy_sobol(path, relative, runtime_report):
+                raise _public_bundle_failure(
+                    "Audited vendor runtime resource failed its exact source or content identity", relative)
         if path.suffix.casefold() in (".exe", ".dll", ".pyd", ".dat", ".json", ".js", ".html", ".css", ".txt"):
             # Only runner/repository root and current user-home markers are tested;
             # arbitrary private input data is never opened by the packaging step.
@@ -953,14 +1024,13 @@ def assert_public_bundle(app_root: Path, repo_root: Path) -> list[dict]:
                 for block in iter(lambda: stream.read(1024 * 1024), b""):
                     sample = carry + block
                     if any(marker and marker.lower() in sample.lower() for marker in root_texts):
-                        raise ValidationError("A staged file contains a local build-root or profile path")
+                        raise _public_bundle_failure("A staged file contains a local build-root or profile path", relative)
                     carry = sample[-512:]
         rows.append({"path": relative, "bytes": path.stat().st_size, "sha256": sha256_file(path)})
     relative_names = {row["path"] for row in rows}
     required = {"ChaSteady.exe", "flutter_windows.dll", "README.md", "BUILD_STATUS.json",
                 "LICENSE", "THIRD_PARTY_NOTICES.md", "web/index.html", "web/flutter_bootstrap.js",
-                "web/assets/fonts/NotoSansSC-wght.ttf", "licenses/fonts/noto-sans-sc/OFL.txt",
-                "Worker/Worker.exe"}
+                "licenses/fonts/noto-sans-sc/OFL.txt", "Worker/Worker.exe", *BUNDLE_FONT_PATHS}
     if not required.issubset(relative_names):
         raise ValidationError("Staged app bundle is missing a required native, Worker, web, README or license file")
     if not any(name.startswith("data/") for name in relative_names):
@@ -968,11 +1038,14 @@ def assert_public_bundle(app_root: Path, repo_root: Path) -> list[dict]:
     if not any(name.startswith("licenses/") for name in relative_names):
         raise ValidationError("Staged app bundle lacks copied third-party license notices")
     font_rows = [row for row in rows if row["path"].endswith("/NotoSansSC-wght.ttf")]
-    if (not font_rows or any(row["sha256"] != ci_prepare_assets.FONT_SHA256 for row in font_rows)
-            or next((row["sha256"] for row in rows
-                     if row["path"] == "licenses/fonts/noto-sans-sc/OFL.txt"), None)
+    bad_font = next((row for row in font_rows if row["sha256"] != ci_prepare_assets.FONT_SHA256), None)
+    ofl_path = "licenses/fonts/noto-sans-sc/OFL.txt"
+    if (not font_rows or bad_font is not None
+            or next((row["sha256"] for row in rows if row["path"] == ofl_path), None)
             != ci_prepare_assets.FONT_LICENSE_SHA256):
-        raise ValidationError("Public app bundle font or corresponding OFL license differs from its pinned identity")
+        raise _public_bundle_failure(
+            "Public app bundle font or corresponding OFL license differs from its pinned identity",
+            bad_font["path"] if bad_font is not None else ofl_path)
     if len(rows) != len(relative_names):
         raise ValidationError("Staged app bundle has duplicate relative file names")
     return rows
@@ -1151,7 +1224,7 @@ def run_build(args) -> dict:
     _copy_file(root / "docs" / "WINDOWS_PORTABLE_GUIDE.md", app_stage / "README.md")
 
     mark_ci_stage(args, "public_inventory")
-    files = assert_public_bundle(app_stage, root)
+    files = assert_public_bundle(app_stage, root, runtime_report=runtime_report)
     # This helper intentionally creates its output directory only after all builds,
     # tests, sidecar identities and source-to-output checks have passed.
     mark_ci_stage(args, "artifact_zip")
