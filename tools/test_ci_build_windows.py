@@ -613,7 +613,7 @@ class CiBuildWindowsTests(unittest.TestCase):
             ci.assert_public_bundle(app, self.root)
         self.assertIn("code=CI_BUNDLE_REQUIRED_FILES stage=public_inventory",
                       ci.ci_failure_diagnostic(failure.exception, "public_inventory"))
-        for label, marker in (("repo", str(self.root)), ("home", str(Path.home()))):
+        for label, marker in (("repo", str(self.root.resolve(strict=True))), ("home", str(Path.home()))):
             with self.subTest(marker=label):
                 (app / "licenses" / "NOTICE.txt").write_bytes(payload + marker.encode("utf-8"))
                 with self.assertRaises(ci.ValidationError) as failure:
@@ -639,7 +639,7 @@ class CiBuildWindowsTests(unittest.TestCase):
             "nul": "License text\x00hidden content",
             # A preceding ASCII token defeats drive detection on Windows, so
             # the separate exact repo/home marker guards must still reject it.
-            "repo_marker": "prefix" + str(self.root),
+            "repo_marker": "prefix" + str(self.root.resolve(strict=True)),
             "home_marker": "prefix" + str(Path.home()),
         }
         for label, text in cases.items():
