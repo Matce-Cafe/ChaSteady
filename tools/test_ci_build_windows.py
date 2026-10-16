@@ -26,6 +26,106 @@ class CiBuildWindowsTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
+    def test_flutter_only_cli_routes_without_full_build_inputs(self):
+        argv = ["--preflight-flutter-only", "--flutter-result", str(self.root / "flutter-result.json"),
+                "--flutter-scratch", str(self.root / "scratch"), "--preflight-stage", str(self.root / "new-stage")]
+        with mock.patch.object(ci, "run_flutter_preflight", return_value={}) as preflight, \
+                mock.patch.object(ci, "run_build") as full:
+            self.assertEqual(ci.main(argv), 0)
+        full.assert_not_called()
+        supplied = preflight.call_args.args[0]
+        self.assertIsNone(supplied.toolchain_report)
+        self.assertIsNone(supplied.worker_manifest)
+        self.assertIsNone(supplied.font_result)
+        self.assertIsNone(supplied.artifact_dir)
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as failure:
+            ci.main(["--flutter-result", str(self.root / "flutter-result.json"),
+                     "--flutter-scratch", str(self.root / "scratch")])
+        self.assertEqual(failure.exception.code, 2)
+
+    def test_flutter_only_cli_rejects_full_build_inputs_or_artifact_output(self):
+        base = ["--preflight-flutter-only", "--flutter-result", str(self.root / "result.json"),
+                "--flutter-scratch", str(self.root / "scratch"), "--preflight-stage", str(self.root / "stage")]
+        for forbidden in ("--toolchain-report", "--artifact-dir", "--worker-manifest", "--font-result"):
+            with self.subTest(forbidden=forbidden), redirect_stderr(io.StringIO()), \
+                    mock.patch.object(ci, "run_flutter_preflight") as preflight, self.assertRaises(SystemExit) as failure:
+                ci.main(base + [forbidden, str(self.root / "private-input")])
+            self.assertEqual(failure.exception.code, 2)
+            preflight.assert_not_called()
+
+    def test_flutter_only_gate_reuses_same_identity_function_in_a_new_isolated_stage(self):
+        extraction = self.root / "extracted-sdk"
+        sdk = extraction / "flutter"
+        sdk.mkdir(parents=True)
+        downloads = self.root / "downloaded-archive"
+        downloads.mkdir()
+        identity = {"flutter_version": "3.47.7", "dart_version": "3.13.5",
+                    "framework_revision": "abaf9c523780a608bd46686fd5e53740a07077f8"}
+        receipt = {"sdk_root": str(sdk), "extraction_directory": str(extraction),
+                   "download_directory": str(downloads), "archive_sha256": ci.ci_provision_flutter.FLUTTER_SHA256}
+        args = SimpleNamespace(root=self.root, flutter_result=self.root / "result.json",
+                               flutter_scratch=self.root / "scratch", preflight_stage=self.root / "state" / "fresh")
+        with mock.patch.object(ci, "ROOT", self.root), \
+                mock.patch.object(ci, "validate_flutter_result", return_value=receipt) as validated, \
+                mock.patch.object(ci, "create_flutter_environment", return_value={}), \
+                mock.patch.object(ci, "flutter_version_check", return_value=identity) as version, \
+                mock.patch.object(ci, "build_worker") as worker, redirect_stdout(io.StringIO()):
+            result = ci.run_flutter_preflight(args)
+            validated.assert_called_once_with(args.flutter_result, args.flutter_scratch)
+            version.assert_called_once_with(sdk, self.root, {}, args.preflight_stage)
+            worker.assert_not_called()
+            self.assertFalse(result["native_build_executed"])
+            self.assertFalse(result["worker_tests_or_math_executed"])
+            self.assertEqual(ci.read_json(args.preflight_stage / "flutter-preflight.json"), result)
+            self.assertFalse(list(args.preflight_stage.rglob("*.zip")))
+            with self.assertRaises(ci.ValidationError):
+                ci.run_flutter_preflight(args)
+            args.preflight_stage = sdk / "must-not-write-here"
+            with self.assertRaises(ci.ValidationError):
+                ci.run_flutter_preflight(args)
+            self.assertFalse(args.preflight_stage.exists())
+            self.assertEqual(version.call_count, 1)
+
+    def test_workflow_verifies_flutter_identity_before_long_vs_sdk_update(self):
+        workflow = (Path(ci.ROOT) / ".github/workflows/build-windows.yml").read_text(encoding="utf-8")
+        early = workflow.index("- name: Verify Flutter executable identity before long toolchain updates")
+        update = workflow.index("- name: Update official stable Visual Studio and Windows SDK")
+        full = workflow.index("- name: Build, rerun backend tests, validate local math identity")
+        self.assertLess(early, update)
+        self.assertLess(update, full)
+        for prerequisite in ("- name: Create fresh Worker runtime", "- name: Fetch and verify the pinned Noto font",
+                             "- name: Download and verify the pinned official Flutter SDK"):
+            self.assertLess(workflow.index(prerequisite), early)
+        early_step = workflow[early:update]
+        self.assertIn("--preflight-flutter-only", early_step)
+        self.assertIn("--preflight-stage", early_step)
+        self.assertNotIn("--toolchain-report", early_step)
+        self.assertNotIn("--artifact-dir", early_step)
+        module = ast.parse(Path(ci.__file__).read_text(encoding="utf-8"))
+        for function_name in ("run_flutter_preflight", "run_build"):
+            function = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == function_name)
+            self.assertTrue(any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                                and node.func.id == "flutter_version_check" for node in ast.walk(function)))
+
+    def test_flutter_json_shape_diagnostic_never_prints_vendor_text_paths_or_credentials(self):
+        private = b"D:\\private-fixture\\profile.json bearer=not-for-public-logs"
+        raw = b"\xef\xbb\xbf" + private
+        stderr = self.root / "stderr.log"
+        stderr.write_bytes(b"Building flutter tool...\nRunning pub upgrade...\n" + private)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            ci.flutter_json_shape_diagnostic(raw, stderr, json.JSONDecodeError("fixture-only", "", 0))
+        text = output.getvalue()
+        self.assertNotIn(private.decode("ascii"), text)
+        self.assertNotIn("Building flutter tool...", text)
+        self.assertNotIn("not-for-public-logs", text)
+        payload = json.loads(text.removeprefix("ChaSteady Flutter JSON diagnostic "))
+        self.assertEqual(payload["stdout_bytes"], len(raw))
+        self.assertTrue(payload["stdout_utf8_bom"])
+        self.assertTrue(payload["stderr_tool_build"])
+        self.assertTrue(payload["stderr_pub_upgrade"])
+        self.assertEqual(payload["json_error_pos"], 0)
+
     def test_safe_failure_diagnostic_uses_exact_author_message_codes(self):
         message = "Pinned Flutter SDK did not return its machine-readable version"
         diagnostic = ci.ci_failure_diagnostic(ci.ValidationError(message), "flutter_version")
@@ -508,6 +608,27 @@ class CiBuildWindowsTests(unittest.TestCase):
                                          "--pwa-strategy=none"])
         self.assertFalse(any(args[0] in ("analyze", "test", "run", "drive") for _, args in commands))
 
+    def test_flutter_version_warms_with_plain_version_then_requires_strict_machine_identity(self):
+        bootstrap = b"Resolving dependencies...\nDownloading packages...\nGot dependencies.\nFlutter version fixture\n"
+        identity = {"frameworkVersion": "3.47.7", "channel": "stable", "dartSdkVersion": "3.13.5",
+                    "frameworkRevision": "abaf9c523780a608bd46686fd5e53740a07077f8"}
+        output = io.StringIO()
+        with mock.patch.object(ci, "run_flutter", side_effect=[bootstrap, json.dumps(identity).encode("utf-8")]) as commands, \
+                redirect_stdout(output):
+            result = ci.flutter_version_check(self.root, self.root, {}, self.root)
+        self.assertEqual(commands.call_args_list, [
+            mock.call("bootstrap", self.root, ["--version"], self.root, {}, self.root, timeout=300),
+            mock.call("version", self.root, ["--version", "--machine"], self.root, {}, self.root, timeout=300),
+        ])
+        self.assertEqual(result["flutter_version"], "3.47.7")
+        self.assertNotIn("Resolving dependencies...", output.getvalue())
+        with mock.patch.object(ci, "run_flutter", side_effect=ci.ValidationError(
+                "Flutter bootstrap exited unsuccessfully; raw runner-local logs are not uploaded")) as commands, \
+                redirect_stdout(io.StringIO()), self.assertRaises(ci.ValidationError) as failure:
+            ci.flutter_version_check(self.root, self.root, {}, self.root)
+        self.assertEqual(commands.call_count, 1)
+        self.assertIn("CI_FLUTTER_BOOTSTRAP_EXIT", ci.ci_failure_diagnostic(failure.exception, "flutter_version"))
+
     def test_flutter_machine_version_accepts_only_the_expected_json_identity(self):
         info = {"frameworkVersion": "3.47.7", "channel": "stable", "dartSdkVersion": "3.13.5",
                 "frameworkRevision": "abaf9c523780a608bd46686fd5e53740a07077f8",
@@ -549,10 +670,14 @@ Privacy Policy (https://policies.google.com/privacy).
         private_tail = r"D:\fixture-private-sdk\profile.json bearer=not-for-logs"
         trailers = ("\n" + notice, "\r\n" + notice.replace("\n", "\r\n"),
                     "\n{}", "\n" + json.dumps(info), "\n" + private_tail)
-        for trailer in trailers:
+        raw_json = json.dumps(info)
+        outputs = [raw_json + trailer for trailer in trailers]
+        outputs.extend(["Resolving dependencies...\nDownloading packages...\nGot dependencies.\n" + raw_json,
+                        chr(0xFEFF) + raw_json])
+        for output in outputs:
             stdout, stderr = io.StringIO(), io.StringIO()
-            with self.subTest(trailer_kind=trailer[:16]), \
-                    mock.patch.object(ci, "run_flutter", return_value=(json.dumps(info) + trailer).encode("utf-8")), \
+            with self.subTest(output_kind=output[:16]), \
+                    mock.patch.object(ci, "run_flutter", return_value=output.encode("utf-8")), \
                     redirect_stdout(stdout), redirect_stderr(stderr), self.assertRaises(ci.ValidationError) as failure:
                 ci.flutter_version_check(self.root, self.root, {}, self.root)
             self.assertIn("CI_FLUTTER_VERSION_JSON", ci.ci_failure_diagnostic(failure.exception, "flutter_version"))
