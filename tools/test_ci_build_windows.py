@@ -266,6 +266,22 @@ class CiBuildWindowsTests(unittest.TestCase):
         for private in ("sdk-private", "ui-private", "private-child", "PathNotFoundException:"):
             self.assertNotIn(private, text)
 
+    def test_workflow_keeps_sdk_container_short_without_omitting_sdk_directories(self):
+        workflow = (Path(ci.ROOT) / ".github/workflows/build-windows.yml").read_text(encoding="utf-8")
+        allocation = workflow[workflow.index("- name: Allocate a new runner-local job directory"):
+                              workflow.index("- name: Select the single approved")]
+        self.assertIn("('cs-' + [Guid]::NewGuid().ToString('N'))", allocation)
+        self.assertNotIn("$env:GITHUB_RUN_ID", allocation)
+        self.assertIn("The newly allocated runner-local job directory was not empty", allocation)
+        flutter = workflow[workflow.index("- name: Download and verify the pinned official Flutter SDK"):
+                           workflow.index("- name: Verify Flutter executable identity")]
+        self.assertIn("$scratch = Join-Path $ciRoot 'f'", flutter)
+        guid = "a" * 32
+        sdk = ci.ntpath.join("D:/a/_temp", "cs-" + guid, "f", "extractions", "flutter-3.47.7-" + guid, "flutter")
+        self.assertEqual(len(sdk), 116)
+        # The observed failing SDK-dev path was 113 characters below its SDK root.
+        self.assertLess(len(sdk) + 113, 260)
+
     def test_flutter_json_shape_diagnostic_never_prints_vendor_text_paths_or_credentials(self):
         private = b"D:\\private-fixture\\profile.json bearer=not-for-public-logs"
         raw = b"\xef\xbb\xbf" + private

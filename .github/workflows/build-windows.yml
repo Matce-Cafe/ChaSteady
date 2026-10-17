@@ -30,8 +30,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $runRoot = Join-Path $env:RUNNER_TEMP ("cha-steady-ci-{0}-{1}-{2}" -f `
-            $env:GITHUB_RUN_ID, $env:GITHUB_RUN_ATTEMPT, [Guid]::NewGuid().ToString('N'))
+          $runRoot = Join-Path $env:RUNNER_TEMP ('cs-' + [Guid]::NewGuid().ToString('N'))
           if (Test-Path -LiteralPath $runRoot) {
             throw 'The new runner-local job directory already exists.'
           }
@@ -145,7 +144,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $repo = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
           $ciRoot = '${{ steps.run-root.outputs.ci_root }}'
-          $scratch = Join-Path $ciRoot 'flutter-scratch'
+          $scratch = Join-Path $ciRoot 'f'
           $result = Join-Path $ciRoot 'flutter-result.json'
           & '${{ steps.host-python.outputs.path }}' -I (Join-Path $repo 'tools/ci_provision_flutter.py') `
             --scratch-root $scratch --result-json $result
