@@ -277,6 +277,22 @@ def extract_checked(archive_path: Path, extraction_root: Path,
         raise RuntimeError("Authenticated archive did not produce a complete Flutter/Dart SDK")
 
 
+def analyzer_path_budget(extraction_root: Path, rows: list) -> dict:
+    maxima = {"dev": 0, "examples": 0, "packages": 0}
+    for _info, relative, is_directory in rows:
+        directory = relative if is_directory else relative.parent
+        parts = directory.parts
+        if len(parts) >= 2 and parts[0] == "flutter" and parts[1] in maxima:
+            suffix = "/" + "/".join(parts[1:])
+            maxima[parts[1]] = max(maxima[parts[1]], len(suffix.encode("utf-16-le")) // 2)
+    sdk_units = len(str(extraction_root.absolute() / "flutter").encode("utf-16-le")) // 2
+    if any(sdk_units + suffix >= 240 for suffix in maxima.values()):
+        raise ValueError("Flutter SDK layout exceeds the bounded analyzer directory-path budget")
+    return {"sdk_root_utf16_units": sdk_units, "subtree_directory_suffix_utf16_max": maxima,
+            "longest_combined_directory_utf16_units": sdk_units + max(maxima.values()),
+            "limit_exclusive": 240}
+
+
 def provision(scratch_root: Path) -> dict:
     if scratch_root.exists() and (is_reparse(scratch_root) or not scratch_root.is_dir()):
         raise ValueError("CI scratch root must be a regular directory")
@@ -284,14 +300,15 @@ def provision(scratch_root: Path) -> dict:
     if is_reparse(scratch_root):
         raise ValueError("CI scratch root must not be a reparse point")
     downloads = scratch_root / "downloads"
-    extractions = scratch_root / "extractions"
+    extractions = scratch_root / "e"
     downloads.mkdir(exist_ok=True)
     extractions.mkdir(exist_ok=True)
     download_dir = new_empty_uuid_dir(downloads, "flutter-" + FLUTTER_VERSION + "-")
     archive_path = download_dir / FLUTTER_ARCHIVE
     archive_info = download_archive(FLUTTER_URL, archive_path)
     rows, audit = inspect_archive(archive_path)
-    extraction_dir = new_empty_uuid_dir(extractions, "flutter-" + FLUTTER_VERSION + "-")
+    extraction_dir = new_empty_uuid_dir(extractions, "f-")
+    audit["analyzer_path_budget"] = analyzer_path_budget(extraction_dir, rows)
     extract_checked(archive_path, extraction_dir, rows)
     return {"schema_version": 1, "version": FLUTTER_VERSION, "channel": "stable",
             "archive": FLUTTER_ARCHIVE, "archive_url": FLUTTER_URL,

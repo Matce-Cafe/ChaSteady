@@ -1,7 +1,7 @@
 """Unit tests for the CI Flutter archive guard; no archive is executed/downloaded."""
 import hashlib
 import io
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import stat
 import sys
 import tempfile
@@ -193,6 +193,40 @@ class FlutterProvisionTests(unittest.TestCase):
                 mock.patch.object(ci, "FLUTTER_SHA256", "0" * 64):
             with self.assertRaisesRegex(RuntimeError, "SHA-256"):
                 ci.download_archive(ci.FLUTTER_URL, self.root / "bad-hash.zip")
+
+    def test_analyzer_path_budget_counts_implicit_directories_in_utf16(self):
+        rows = [(None, PurePosixPath("flutter/dev/one/two/fixture.txt"), False),
+                (None, PurePosixPath("flutter/examples/emoji-\U0001f600"), True),
+                (None, PurePosixPath("flutter/packages/pkg/pubspec.yaml"), False),
+                (None, PurePosixPath("flutter/bin/cache/not-in-repo-scan/file"), False)]
+        result = ci.analyzer_path_budget(Path("D:/short-sdk"), rows)
+        lengths = result["subtree_directory_suffix_utf16_max"]
+        self.assertEqual(lengths["dev"], len("/dev/one/two"))
+        self.assertEqual(lengths["examples"], len("/examples/emoji-\U0001f600".encode("utf-16-le")) // 2)
+        self.assertEqual(lengths["packages"], len("/packages/pkg"))
+        self.assertLess(result["longest_combined_directory_utf16_units"], result["limit_exclusive"])
+        with self.assertRaisesRegex(ValueError, "directory-path budget"):
+            ci.analyzer_path_budget(Path("D:/" + "x" * 230), rows)
+
+    def test_provision_compacts_extraction_container_without_skipping_archive_members(self):
+        archive_path, payload = self.make_archive()
+        scratch = self.root / "scratch"
+        def copy_download(_url, destination):
+            destination.write_bytes(payload)
+            return {"sha256": hashlib.sha256(payload).hexdigest(), "bytes": len(payload)}
+        with self.pin_fixture(archive_path, payload), mock.patch.object(ci, "download_archive", side_effect=copy_download):
+            result = ci.provision(scratch)
+        extracted = Path(result["extraction_directory"])
+        self.assertEqual(extracted.parent, scratch / "e")
+        self.assertRegex(extracted.name, r"^f-[0-9a-f]{32}$")
+        self.assertNotEqual(Path(result["download_directory"]), extracted)
+        sdk = Path(result["sdk_root"])
+        self.assertEqual(sdk, extracted / "flutter")
+        self.assertEqual((sdk / "README.txt").read_bytes(), b"notice")
+        self.assertEqual((sdk / "bin/flutter.bat").read_bytes(), b"fixture only; never executed")
+        budget = result["archive_audit"]["analyzer_path_budget"]
+        self.assertEqual(budget["sdk_root_utf16_units"], len(str(sdk).encode("utf-16-le")) // 2)
+        self.assertLess(budget["longest_combined_directory_utf16_units"], 240)
 
     def test_download_and_extraction_allocations_are_separate_unique_empty_dirs(self):
         downloads = self.root / "downloads"
