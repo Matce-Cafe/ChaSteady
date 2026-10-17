@@ -111,6 +111,8 @@ CI_STAGES = frozenset({
     "stage_ui", "flutter_environment", "flutter_version", "flutter_pub", "flutter_l10n",
     "flutter_analyze", "flutter_test", "flutter_windows", "native_toolchain", "flutter_web",
     "native_outputs", "native_fixture_configure", "native_fixture_build", "native_fixture_run",
+    "native_fixture_probe_report", "native_fixture_probe_source", "native_fixture_probe_toolchain",
+    "native_fixture_probe_result",
     "worker_runtime",
     "local_math_identity", "stage_app", "worker_build_and_smoke", "worker_inventory",
     "bundle_license_texts", "bundle_metadata", "bundle_legal_notices", "public_inventory",
@@ -143,6 +145,9 @@ SAFE_VALIDATION_CODES = {
     "Locked Flutter UI dependency graph is required": "CI_UI_LOCKFILE_MISSING",
     "Required Flutter UI analysis or tests did not execute": "CI_UI_CHECKS_MISSING",
     "Windows fixture output is missing or is not a regular file": "CI_WINDOW_FIXTURE_OUTPUT",
+    "Preinstalled window fixture probe report is invalid": "CI_WINDOW_PROBE_REPORT",
+    "Preinstalled window fixture probe selected a different toolchain": "CI_WINDOW_PROBE_TOOLCHAIN",
+    "Preinstalled window fixture probe stage overlaps an input": "CI_WINDOW_PROBE_STAGE",
     "A runner-provided Git executable is required for the audited Flutter shim": "CI_FLUTTER_GIT_MISSING",
     "Pinned Flutter SDK did not return its machine-readable version": "CI_FLUTTER_VERSION_JSON",
     "Executed Flutter/Dart versions differ from the pinned stable SDK": "CI_FLUTTER_VERSION_IDENTITY",
@@ -175,6 +180,10 @@ for _fixture_stage in ("configure", "build", "run"):
     SAFE_VALIDATION_CODES[
         "Windows fixture {} exited unsuccessfully; raw runner-local logs are not uploaded".format(_fixture_stage)
     ] = "CI_WINDOW_FIXTURE_{}_EXIT".format(_fixture_stage.upper())
+    for _outcome, _suffix in (("timed out", "TIMEOUT"), ("could not start", "START")):
+        SAFE_VALIDATION_CODES[
+            "Windows fixture {} {}; raw runner-local logs are not uploaded".format(_fixture_stage, _outcome)
+        ] = "CI_WINDOW_FIXTURE_{}_{}".format(_fixture_stage.upper(), _suffix)
 
 
 def mark_ci_stage(args, stage: str) -> None:
@@ -1236,6 +1245,61 @@ def run_flutter_preflight(args) -> dict:
     return receipt
 
 
+WINDOW_FIXTURE_SOURCE_SHA256 = "940e62ebc436f3d143128d139cd0ddb4cf041fc978ca7b6df101132a9c78104f"
+WINDOW_FIXTURE_PASS = ("PASS: geometry, startup stock frame, owned hit testing, signed coordinates, "
+                       "min/max/restore, topmost, work area, deduplicated state, child resize, teardown.\n")
+
+
+def window_fixture_check_ids() -> dict:
+    source = ROOT / "ui/windows/runner/tests/window_chrome_smoke.cpp"
+    if not source.is_file() or is_reparse(source) or source.stat().st_size > 128 * 1024:
+        return {}
+    raw = source.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != WINDOW_FIXTURE_SOURCE_SHA256:
+        return {}
+    messages = []
+    for match in re.finditer(r'Check\([^;]+?,\s*"((?:[^"\\]|\\.)*)"\s*\)', raw.decode("utf-8"), re.DOTALL):
+        message = json.loads('"' + match[1] + '"')
+        if message not in messages:
+            messages.append(message)
+    if len(messages) != 73 or any(not message.isascii() for message in messages):
+        return {}
+    return {message: "WF{:03d}".format(index + 1) for index, message in enumerate(messages)}
+
+
+def window_fixture_diagnostic(exit_code, stdout_path: Path, stderr_path: Path,
+                               outcome: str = "exited") -> None:
+    """Publish only the actual exit value and IDs from the pinned authored fixture."""
+    if outcome not in {"exited", "timeout", "spawn_failed"}:
+        raise ValueError("Unknown internal fixture outcome")
+    buffers, sizes = [], []
+    for path in (stdout_path, stderr_path):
+        try:
+            size = path.stat().st_size if path.is_file() and not is_reparse(path) else None
+            data = path.read_bytes() if size is not None and size <= 4096 else b""
+        except OSError:
+            size, data = None, b""
+        buffers.append(data)
+        sizes.append(size)
+    mapping = window_fixture_check_ids()
+    check_id, win32_error = "unknown", None
+    try:
+        line = buffers[1].decode("ascii")
+        match = re.fullmatch(r"FAIL: (.+) \(Win32 error ([0-9]{1,10})\)\r?\n", line)
+        if match and match[1] in mapping and int(match[2]) <= 0xffffffff:
+            check_id, win32_error = mapping[match[1]], int(match[2])
+    except UnicodeError:
+        pass
+    code = exit_code & 0xffffffff if type(exit_code) is int else None
+    result = {"schema_version": 1, "step": "run", "outcome": outcome,
+              "exit_code_u32": code, "exit_hex": "0x{:08X}".format(code) if code is not None else None,
+              "check_id": check_id, "win32_last_error": win32_error,
+              "source_mapping_bound": bool(mapping),
+              "pass_marker": buffers[0].replace(b"\r\n", b"\n") == WINDOW_FIXTURE_PASS.encode("ascii"),
+              "stdout_bytes": sizes[0], "stderr_bytes": sizes[1]}
+    print("ChaSteady window fixture diagnostic " + json.dumps(result, sort_keys=True), flush=True)
+
+
 def run_window_fixture_step(label: str, command: list[str], source: Path,
                             environment: dict, stage: Path, timeout: int) -> None:
     if label not in {"configure", "build", "run"}:
@@ -1243,6 +1307,7 @@ def run_window_fixture_step(label: str, command: list[str], source: Path,
     registry = OwnedProcessRegistry(threading.Event())
     stdout_path = stage / ("window-fixture-" + label + ".stdout.log")
     stderr_path = stage / ("window-fixture-" + label + ".stderr.log")
+    code, outcome = None, "exited"
     try:
         with registry_scope(registry):
             with stdout_path.open("xb") as stdout, stderr_path.open("xb") as stderr:
@@ -1250,12 +1315,232 @@ def run_window_fixture_step(label: str, command: list[str], source: Path,
                                               stdout=stdout, stderr=stderr, stdin=subprocess.DEVNULL)
                 code = process.wait(timeout=timeout)
                 registry.discard(process)
+    except subprocess.TimeoutExpired:
+        outcome = "timeout"
+    except OSError:
+        outcome = "spawn_failed"
     finally:
         if registry.snapshot():
             registry.terminate_all()
+    if label == "run":
+        try:
+            window_fixture_diagnostic(code, stdout_path, stderr_path, outcome)
+        except Exception:
+            # Even the fallback stream can fail; preserve the real process result.
+            try:
+                print('ChaSteady window fixture diagnostic {"schema_version":1,"available":false}', flush=True)
+            except Exception:
+                pass
+    if outcome != "exited":
+        raise ValidationError("Windows fixture {} {}; raw runner-local logs are not uploaded".format(
+            label, "timed out" if outcome == "timeout" else "could not start"))
     if code != 0:
         raise ValidationError(
             "Windows fixture {} exited unsuccessfully; raw runner-local logs are not uploaded".format(label))
+
+
+def validate_window_probe_report(report: dict) -> dict:
+    expected = {"schema_version", "scope", "production_toolchain_validated", "downloads_or_updates_executed",
+                "runner_label", "architecture", "visual_studio_path", "visual_studio_version",
+                "msvc_toolset_path", "msvc_toolset_version", "cmake_path", "cmake_version",
+                "windows_sdk_root", "windows_sdk_version", "rc_path", "mt_path"}
+    invalid = "Preinstalled window fixture probe report is invalid"
+    if (type(report) is not dict or set(report) != expected or type(report["schema_version"]) is not int
+            or report["schema_version"] != 1
+            or report["scope"] != "supplementary_diagnostics_only_preinstalled_toolchain"
+            or report["production_toolchain_validated"] is not False
+            or report["downloads_or_updates_executed"] is not False
+            or report["runner_label"] != EXPECTED_RUNNER_LABEL or report["architecture"] != "x64"):
+        raise ValidationError(invalid)
+    if (_parse_version(report["visual_studio_version"], "Probe Visual Studio version")[0] != 18
+            or _parse_version(report["windows_sdk_version"], "Probe SDK version", 4)[:2] != (10, 0)):
+        raise ValidationError(invalid)
+    _parse_version(report["msvc_toolset_version"], "Probe MSVC version", 3)
+    _parse_cmake_version(report["cmake_version"], "Probe CMake version")
+    paths = {}
+    for key in ("visual_studio_path", "msvc_toolset_path", "cmake_path", "windows_sdk_root", "rc_path", "mt_path"):
+        if type(report[key]) is not str:
+            raise ValidationError(invalid)
+        path = Path(report[key])
+        if not path.is_absolute() or is_reparse(path):
+            raise ValidationError(invalid)
+        paths[key] = path.resolve(strict=True)
+    vs, msvc, sdk = (paths[key] for key in ("visual_studio_path", "msvc_toolset_path", "windows_sdk_root"))
+    if (not vs.is_dir() or not msvc.is_dir() or not sdk.is_dir()
+            or msvc != vs / "VC" / "Tools" / "MSVC" / report["msvc_toolset_version"]
+            or paths["cmake_path"] != vs / "Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe"
+            or paths["rc_path"] != sdk / "bin" / report["windows_sdk_version"] / "x64" / "rc.exe"
+            or paths["mt_path"] != sdk / "bin" / report["windows_sdk_version"] / "x64" / "mt.exe"):
+        raise ValidationError(invalid)
+    for key, path in paths.items():
+        if key in {"cmake_path", "rc_path", "mt_path"} and not path.is_file():
+            raise ValidationError(invalid)
+        for parent in path.parents:
+            if is_reparse(parent):
+                raise ValidationError(invalid)
+    return report
+
+
+def prepare_window_probe_source(root: Path, project: Path) -> list[dict]:
+    project.mkdir(exist_ok=False)
+    inputs = ("window_chrome.cpp", "window_chrome.h", "tests/window_chrome_smoke.cpp", "runner.exe.manifest")
+    rows = []
+    for name in inputs:
+        original = root / "ui/windows/runner" / name
+        destination = project / "source" / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if not original.is_file() or is_reparse(original) or original.stat().st_size > 256 * 1024:
+            raise ValidationError("Preinstalled window fixture probe stage overlaps an input")
+        _copy_file(original, destination)
+        source_hash = sha256_file(original)
+        if sha256_file(destination) != source_hash:
+            raise ValidationError("Preinstalled window fixture probe selected a different toolchain")
+        rows.append({"path": name, "sha256": source_hash})
+    cmake_source = '''cmake_minimum_required(VERSION 3.21)
+project(chasteady_owned_window_probe LANGUAGES CXX)
+add_executable(chasteady_window_chrome_smoke
+  "source/tests/window_chrome_smoke.cpp"
+  "source/window_chrome.cpp"
+  "source/runner.exe.manifest"
+)
+target_compile_features(chasteady_window_chrome_smoke PUBLIC cxx_std_17)
+target_compile_options(chasteady_window_chrome_smoke PRIVATE /W4 /WX /wd4100 /EHsc)
+target_compile_definitions(chasteady_window_chrome_smoke PRIVATE UNICODE _UNICODE NOMINMAX "$<$<CONFIG:Debug>:_DEBUG>")
+target_include_directories(chasteady_window_chrome_smoke PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/source")
+target_link_libraries(chasteady_window_chrome_smoke PRIVATE dwmapi comctl32)
+set_target_properties(chasteady_window_chrome_smoke PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/native_smoke/$<CONFIG>"
+  PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/native_smoke/$<CONFIG>"
+)
+set(CHASTEADY_PROBE_CMAKE "${CMAKE_COMMAND}" CACHE INTERNAL "Probe CMake" FORCE)
+set(CHASTEADY_PROBE_GENERATOR "${CMAKE_GENERATOR}" CACHE INTERNAL "Probe generator" FORCE)
+set(CHASTEADY_PROBE_INSTANCE "${CMAKE_GENERATOR_INSTANCE}" CACHE INTERNAL "Probe VS" FORCE)
+set(CHASTEADY_PROBE_PLATFORM "${CMAKE_GENERATOR_PLATFORM}" CACHE INTERNAL "Probe architecture" FORCE)
+set(CHASTEADY_PROBE_COMPILER "${CMAKE_CXX_COMPILER}" CACHE INTERNAL "Probe compiler" FORCE)
+set(CHASTEADY_PROBE_COMPILER_VERSION "${CMAKE_CXX_COMPILER_VERSION}" CACHE INTERNAL "Probe compiler version" FORCE)
+set(CHASTEADY_PROBE_SDK "${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}" CACHE INTERNAL "Probe SDK" FORCE)
+'''
+    with (project / "CMakeLists.txt").open("x", encoding="utf-8", newline="\n") as stream:
+        stream.write(cmake_source)
+    return rows
+
+
+def validate_window_probe_cache(build_root: Path, report: dict) -> dict:
+    failure = "Preinstalled window fixture probe selected a different toolchain"
+    cache = build_root / "CMakeCache.txt"
+    if not cache.is_file() or is_reparse(cache) or cache.stat().st_size > 8 * 1024 * 1024:
+        raise ValidationError(failure)
+    values = {}
+    for line in cache.read_text(encoding="utf-8-sig").splitlines():
+        if line.startswith("CHASTEADY_PROBE_") and "=" in line:
+            key, value = line.split("=", 1)
+            key = key.split(":", 1)[0]
+            if key in values:
+                raise ValidationError(failure)
+            values[key] = value
+    prefix = "CHASTEADY_PROBE_"
+    required = {prefix + name for name in ("CMAKE", "GENERATOR", "INSTANCE", "PLATFORM", "COMPILER", "COMPILER_VERSION", "SDK")}
+    if set(values) != required or values[prefix + "GENERATOR"] != "Visual Studio 18 2026" or values[prefix + "PLATFORM"] != "x64":
+        raise ValidationError(failure)
+    for key, expected in (("CMAKE", report["cmake_path"]), ("INSTANCE", report["visual_studio_path"])):
+        if Path(values[prefix + key]).resolve(strict=True) != Path(expected).resolve(strict=True):
+            raise ValidationError(failure)
+    compiler = Path(values[prefix + "COMPILER"])
+    if (not compiler.is_absolute() or not compiler.is_file() or is_reparse(compiler)
+            or not compiler.resolve(strict=True).is_relative_to(Path(report["msvc_toolset_path"]).resolve(strict=True))
+            or values[prefix + "SDK"] != report["windows_sdk_version"]):
+        raise ValidationError(failure)
+    _parse_version(values[prefix + "COMPILER_VERSION"], "Probe actual C++ compiler version", 3)
+    return {"generator": values[prefix + "GENERATOR"], "architecture": values[prefix + "PLATFORM"],
+            "cxx_compiler_version": values[prefix + "COMPILER_VERSION"], "windows_sdk_version": values[prefix + "SDK"]}
+
+
+def window_probe_toolchain_diagnostic(report: dict, actual: dict | None = None) -> None:
+    versions = {}
+    for key in ("visual_studio_version", "msvc_toolset_version", "cmake_version", "windows_sdk_version"):
+        value = report[key]
+        pattern = r"[0-9]+\.[0-9]+\.[0-9]+(?:-msvc[0-9]+)?" if key == "cmake_version" else r"[0-9]+(?:\.[0-9]+){1,3}"
+        if type(value) is not str or len(value) > 64 or not re.fullmatch(pattern, value):
+            raise ValidationError("Preinstalled window fixture probe report is invalid")
+        versions[key] = value
+    result = {"schema_version": 1, "scope": "supplementary_diagnostics_only_preinstalled_toolchain",
+              "phase": "selected" if actual is None else "configured",
+              "production_toolchain_validated": False, "downloads_or_updates_executed": False,
+              "toolchain_versions": versions}
+    if actual is not None:
+        if (set(actual) != {"generator", "architecture", "cxx_compiler_version", "windows_sdk_version"}
+                or actual["generator"] != "Visual Studio 18 2026" or actual["architecture"] != "x64"):
+            raise ValidationError("Preinstalled window fixture probe selected a different toolchain")
+        for key in ("cxx_compiler_version", "windows_sdk_version"):
+            value = actual[key]
+            if type(value) is not str or len(value) > 64 or not re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,3}", value):
+                raise ValidationError("Preinstalled window fixture probe selected a different toolchain")
+        result["actual"] = dict(actual)
+    print("ChaSteady window probe toolchain " + json.dumps(result, sort_keys=True), flush=True)
+
+
+def run_window_fixture_probe(args) -> dict:
+    mark_ci_stage(args, "checkout")
+    root = args.root.resolve(strict=True)
+    if root != ROOT.resolve(strict=True):
+        raise ValidationError("Build root differs from the repository containing this trusted CI helper")
+    if not (root / ".git").exists():
+        raise ValidationError("A complete Git checkout is required for the trusted runner build")
+    mark_ci_stage(args, "native_fixture_probe_report")
+    report = validate_window_probe_report(read_json(args.toolchain_report, max_bytes=64 * 1024))
+    window_probe_toolchain_diagnostic(report)
+    stage_path = args.preflight_stage.resolve()
+    excluded = [root / "ui", root / "worker", root / "tools", args.toolchain_report,
+                Path(report["visual_studio_path"]), Path(report["windows_sdk_root"])]
+    if any(stage_path.is_relative_to(path.resolve()) or path.resolve().is_relative_to(stage_path) for path in excluded):
+        raise ValidationError("Preinstalled window fixture probe stage overlaps an input")
+    stage = make_new_directory(stage_path)
+    mark_ci_stage(args, "native_fixture_probe_source")
+    project, build = stage / "project", stage / "build"
+    inputs = prepare_window_probe_source(root, project)
+    environment = dict(os.environ)
+    temporary = stage / "temp"
+    temporary.mkdir()
+    environment.update({"TEMP": str(temporary), "TMP": str(temporary)})
+    for key in ("CMAKE_GENERATOR", "CMAKE_GENERATOR_INSTANCE", "CMAKE_GENERATOR_PLATFORM", "CMAKE_GENERATOR_TOOLSET",
+                "CMAKE_TOOLCHAIN_FILE", "CMAKE_PREFIX_PATH", "CMAKE_MODULE_PATH", "CMAKE_PROJECT_INCLUDE", "CC", "CXX"):
+        environment.pop(key, None)
+    cmake = report["cmake_path"]
+    version = subprocess.run([cmake, "--version"], capture_output=True, timeout=30, check=False)
+    help_result = subprocess.run([cmake, "--help"], capture_output=True, timeout=30, check=False)
+    if (version.returncode != 0 or _cmake_version_from_output(version.stdout) != report["cmake_version"]
+            or help_result.returncode != 0 or b"Visual Studio 18 2026" not in help_result.stdout):
+        raise ValidationError("Preinstalled window fixture probe selected a different toolchain")
+    mark_ci_stage(args, "native_fixture_configure")
+    command = [cmake, "-S", str(project), "-B", str(build), "-G", "Visual Studio 18 2026", "-A", "x64",
+               "-T", "version=" + report["msvc_toolset_version"] + ",host=x64",
+               "-DCMAKE_GENERATOR_INSTANCE=" + report["visual_studio_path"],
+               "-DCMAKE_SYSTEM_VERSION=" + report["windows_sdk_version"]]
+    run_window_fixture_step("configure", command, project, environment, stage, timeout=180)
+    mark_ci_stage(args, "native_fixture_probe_toolchain")
+    actual = validate_window_probe_cache(build, report)
+    window_probe_toolchain_diagnostic(report, actual)
+    mark_ci_stage(args, "native_fixture_build")
+    run_window_fixture_step("build", [cmake, "--build", str(build), "--config", "Release", "--target",
+                            "chasteady_window_chrome_smoke"], project, environment, stage, timeout=300)
+    executable = build / "native_smoke/Release/chasteady_window_chrome_smoke.exe"
+    if (not executable.is_file() or is_reparse(executable)
+            or not executable.resolve(strict=True).is_relative_to(build.resolve(strict=True))):
+        raise ValidationError("Windows fixture output is missing or is not a regular file")
+    mark_ci_stage(args, "native_fixture_run")
+    run_window_fixture_step("run", [str(executable)], project, environment, stage, timeout=60)
+    mark_ci_stage(args, "native_fixture_probe_result")
+    receipt = {"schema_version": 1, "scope": "supplementary_diagnostics_only_preinstalled_toolchain",
+               "passed": True, "production_toolchain_validated": False, "production_app_runtime_verified": False,
+               "snap_flyout_verified": False, "multi_monitor_dpi_verified": False,
+               "downloads_or_updates_executed": False, "native_or_web_app_built": False,
+               "worker_or_math_executed": False, "artifacts_created": False,
+               "source_inputs": inputs, "actual": actual,
+               "toolchain_versions": {key: report[key] for key in
+                                      ("visual_studio_version", "msvc_toolset_version", "cmake_version", "windows_sdk_version")}}
+    _write_json_new(stage / "window-fixture-probe.json", receipt)
+    print("Preinstalled owned-window fixture probe passed; production toolchain/application acceptance remains unverified.", flush=True)
+    return receipt
 
 
 def run_native_window_fixture(args, source: Path, environment: dict,
@@ -1505,10 +1790,12 @@ def main(argv=None) -> int:
                                  help="Verify only the pinned Flutter executable identity; never build native/Worker outputs")
     preflight_modes.add_argument("--preflight-ui-only", action="store_true",
                                  help="Verify identity, locked UI analysis and tests; never build native/Worker outputs")
+    preflight_modes.add_argument("--window-fixture-only", action="store_true",
+                                 help="Run only the owned fixture with explicitly reported preinstalled tools; not a production build")
     parser.add_argument("--preflight-stage", type=Path, help="New isolated stage for preflight logs/receipt")
     parser.add_argument("--toolchain-report", type=Path)
-    parser.add_argument("--flutter-result", type=Path, required=True)
-    parser.add_argument("--flutter-scratch", type=Path, required=True)
+    parser.add_argument("--flutter-result", type=Path)
+    parser.add_argument("--flutter-scratch", type=Path)
     parser.add_argument("--font-result", type=Path)
     parser.add_argument("--font-scratch", type=Path)
     parser.add_argument("--worker-manifest", type=Path)
@@ -1516,6 +1803,19 @@ def main(argv=None) -> int:
     parser.add_argument("--artifact-dir", type=Path)
     args = parser.parse_args(argv)
     full_fields = ("toolchain_report", "font_result", "font_scratch", "worker_manifest", "math_sidecar", "artifact_dir")
+    if args.window_fixture_only:
+        missing = ["--" + field.replace("_", "-") for field in ("preflight_stage", "toolchain_report")
+                   if getattr(args, field) is None]
+        if missing:
+            parser.error("--window-fixture-only requires " + ", ".join(missing))
+        forbidden = ("flutter_result", "flutter_scratch", "font_result", "font_scratch", "worker_manifest", "math_sidecar", "artifact_dir")
+        if any(getattr(args, field) is not None for field in forbidden):
+            parser.error("--window-fixture-only cannot accept Flutter/Worker/math inputs or an artifact directory")
+    else:
+        missing = ["--" + field.replace("_", "-") for field in ("flutter_result", "flutter_scratch")
+                   if getattr(args, field) is None]
+        if missing:
+            parser.error("Flutter modes and full builds require " + ", ".join(missing))
     if args.preflight_flutter_only:
         if args.preflight_stage is None:
             parser.error("--preflight-flutter-only requires --preflight-stage")
@@ -1529,14 +1829,16 @@ def main(argv=None) -> int:
         if any(getattr(args, field) is not None for field in
                ("toolchain_report", "worker_manifest", "math_sidecar", "artifact_dir")):
             parser.error("--preflight-ui-only cannot accept native/Worker inputs or an artifact directory")
-    else:
+    elif not args.window_fixture_only:
         if args.preflight_stage is not None:
             parser.error("--preflight-stage requires a preflight-only mode")
         missing = ["--" + field.replace("_", "-") for field in full_fields if getattr(args, field) is None]
         if missing:
             parser.error("Full build requires " + ", ".join(missing))
     try:
-        if args.preflight_flutter_only or args.preflight_ui_only:
+        if args.window_fixture_only:
+            run_window_fixture_probe(args)
+        elif args.preflight_flutter_only or args.preflight_ui_only:
             run_flutter_preflight(args)
         else:
             run_build(args)

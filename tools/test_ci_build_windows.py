@@ -193,9 +193,9 @@ class CiBuildWindowsTests(unittest.TestCase):
         for name in ("Create fresh Worker runtime", "Update official stable Visual Studio and Windows SDK",
                      "Build, rerun backend tests, validate local math identity"):
             step = workflow[workflow.index("- name: " + name):].split("      - name:", 1)[0]
-            self.assertIn("if: ${{ !inputs.ui_checks_only }}", step)
+            self.assertIn("if: ${{ !inputs.ui_checks_only && !inputs.window_fixture_only }}", step)
         upload = workflow[workflow.index("- name: Upload only the app ZIP"):]
-        self.assertIn("if: ${{ success() && !inputs.ui_checks_only }}", upload)
+        self.assertIn("if: ${{ success() && !inputs.ui_checks_only && !inputs.window_fixture_only }}", upload)
 
     def test_flutter_startup_diagnostic_reports_fixed_markers_and_explicit_known_codes_only(self):
         stderr = self.root / "stderr.log"
@@ -314,6 +314,297 @@ class CiBuildWindowsTests(unittest.TestCase):
             with self.subTest(budget=malformed), self.assertRaises(ci.ValidationError) as failure:
                 ci.validate_flutter_result(report, scratch)
             self.assertIn("CI_FLUTTER_PATH_BUDGET", ci.ci_failure_diagnostic(failure.exception, "flutter_report"))
+
+    def _window_probe_report(self):
+        base = self.root.resolve(strict=True) / "preinstalled"
+        vs = base / "VS2026"
+        msvc = vs / "VC/Tools/MSVC/14.50.12345"
+        sdk = base / "WindowsKits10"
+        cmake = vs / "Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe"
+        compiler = msvc / "bin/Hostx64/x64/cl.exe"
+        rc, mt = (sdk / "bin/10.0.26100.0/x64" / name for name in ("rc.exe", "mt.exe"))
+        for path in (cmake, compiler, rc, mt):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"metadata fixture only; never executed")
+        return {"schema_version": 1, "scope": "supplementary_diagnostics_only_preinstalled_toolchain",
+                "production_toolchain_validated": False, "downloads_or_updates_executed": False,
+                "runner_label": "windows-2025-vs2026", "architecture": "x64",
+                "visual_studio_path": str(vs), "visual_studio_version": "18.10.10000.1",
+                "msvc_toolset_path": str(msvc), "msvc_toolset_version": "14.50.12345",
+                "cmake_path": str(cmake), "cmake_version": "4.3.0-msvc1", "windows_sdk_root": str(sdk),
+                "windows_sdk_version": "10.0.26100.0", "rc_path": str(rc), "mt_path": str(mt)}
+
+    def test_window_probe_cli_is_restricted_and_mutually_exclusive(self):
+        base = ["--window-fixture-only", "--toolchain-report", str(self.root / "report.json"),
+                "--preflight-stage", str(self.root / "new-stage")]
+        with mock.patch.object(ci, "run_window_fixture_probe", return_value={}) as probe, \
+                mock.patch.object(ci, "run_flutter_preflight") as flutter, mock.patch.object(ci, "run_build") as full:
+            self.assertEqual(ci.main(base), 0)
+        self.assertTrue(probe.call_args.args[0].window_fixture_only)
+        flutter.assert_not_called()
+        full.assert_not_called()
+        for flag in ("--flutter-result", "--flutter-scratch", "--font-result", "--font-scratch",
+                     "--worker-manifest", "--math-sidecar", "--artifact-dir"):
+            with self.subTest(forbidden=flag), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                ci.main(base + [flag, str(self.root / "forbidden")])
+        for flag in ("--preflight-flutter-only", "--preflight-ui-only"):
+            with self.subTest(mode=flag), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                ci.main(base + [flag])
+        for flag in ("--toolchain-report", "--preflight-stage"):
+            incomplete = base.copy()
+            index = incomplete.index(flag)
+            del incomplete[index:index + 2]
+            with self.subTest(missing=flag), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                ci.main(incomplete)
+
+    def test_window_probe_report_never_substitutes_for_production_toolchain(self):
+        report = self._window_probe_report()
+        self.assertEqual(ci.validate_window_probe_report(report), report)
+        with self.assertRaises(ci.ValidationError):
+            ci.validate_toolchain_report(report)
+        for key, value in (("production_toolchain_validated", True), ("downloads_or_updates_executed", True),
+                           ("architecture", "arm64"), ("scope", "production"),
+                           ("visual_studio_version", "17.14.1"), ("cmake_path", report["rc_path"])):
+            invalid = {**report, key: value}
+            with self.subTest(key=key), self.assertRaises(ci.ValidationError):
+                ci.validate_window_probe_report(invalid)
+
+    def test_window_probe_source_keeps_four_exact_inputs_and_flags_without_flutter(self):
+        project = self.root / "project"
+        rows = ci.prepare_window_probe_source(Path(ci.ROOT), project)
+        self.assertEqual({row["path"] for row in rows}, {"window_chrome.cpp", "window_chrome.h",
+                         "tests/window_chrome_smoke.cpp", "runner.exe.manifest"})
+        for row in rows:
+            self.assertEqual(ci.sha256_file(project / "source" / row["path"]), row["sha256"])
+        source = (project / "CMakeLists.txt").read_text(encoding="utf-8")
+        for marker in ("cxx_std_17", "/W4 /WX /wd4100 /EHsc", "UNICODE _UNICODE NOMINMAX",
+                       '"source/runner.exe.manifest"', "PRIVATE dwmapi comctl32", "CHASTEADY_PROBE_COMPILER"):
+            self.assertIn(marker, source)
+        self.assertNotIn("add_subdirectory", source)
+        self.assertNotIn("flutter_assemble", source)
+        with self.assertRaises(FileExistsError):
+            ci.prepare_window_probe_source(Path(ci.ROOT), project)
+
+    def test_window_probe_cache_binds_actual_instance_compiler_and_sdk(self):
+        report = self._window_probe_report()
+        build = self.root / "build"
+        build.mkdir()
+        values = {"CMAKE": report["cmake_path"], "GENERATOR": "Visual Studio 18 2026",
+                  "INSTANCE": report["visual_studio_path"], "PLATFORM": "x64",
+                  "COMPILER": str(Path(report["msvc_toolset_path"]) / "bin/Hostx64/x64/cl.exe"),
+                  "COMPILER_VERSION": "19.50.12345.0", "SDK": report["windows_sdk_version"]}
+        def write(data):
+            (build / "CMakeCache.txt").write_text("\n".join(
+                "CHASTEADY_PROBE_" + key + ":INTERNAL=" + value for key, value in data.items()), encoding="utf-8")
+        write(values)
+        self.assertEqual(ci.validate_window_probe_cache(build, report)["architecture"], "x64")
+        for key, value in (("GENERATOR", "Visual Studio 17 2022"), ("PLATFORM", "arm64"),
+                           ("COMPILER", report["rc_path"]), ("SDK", "10.0.28000.0")):
+            write({**values, key: value})
+            with self.subTest(key=key), self.assertRaises(ci.ValidationError):
+                ci.validate_window_probe_cache(build, report)
+
+    def test_window_probe_executes_only_owned_fixture_and_writes_narrow_receipt(self):
+        report = self._window_probe_report()
+        root = self.root.resolve(strict=True)
+        (root / ".git").mkdir()
+        for name in ("window_chrome.cpp", "window_chrome.h", "tests/window_chrome_smoke.cpp", "runner.exe.manifest"):
+            file = root / "ui/windows/runner" / name
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_bytes(b"source fixture only; never compiled in this unit test")
+        args = SimpleNamespace(root=root, toolchain_report=root / "report.json", preflight_stage=root / "new-stage")
+        metadata = [SimpleNamespace(returncode=0, stdout=b"cmake version 4.3.0-msvc1\n"),
+                    SimpleNamespace(returncode=0, stdout=b"Visual Studio 18 2026")]
+        def fake_step(label, command, source, environment, stage, timeout):
+            if label == "build":
+                output = stage / "build/native_smoke/Release/chasteady_window_chrome_smoke.exe"
+                output.parent.mkdir(parents=True)
+                output.write_bytes(b"fake PE-shaped filename; never executed")
+        with mock.patch.object(ci, "ROOT", root), mock.patch.object(ci, "read_json", return_value=report), \
+                mock.patch.object(ci.subprocess, "run", side_effect=metadata), \
+                mock.patch.object(ci, "run_window_fixture_step", side_effect=fake_step) as run, \
+                mock.patch.object(ci, "validate_window_probe_cache", return_value={"architecture": "x64",
+                                  "generator": "Visual Studio 18 2026", "cxx_compiler_version": "19.50.12345.0",
+                                  "windows_sdk_version": report["windows_sdk_version"]}), \
+                mock.patch.object(ci, "run_flutter") as flutter, mock.patch.object(ci, "build_worker") as worker, \
+                redirect_stdout(io.StringIO()):
+            result = ci.run_window_fixture_probe(args)
+        self.assertEqual([call.args[0] for call in run.call_args_list], ["configure", "build", "run"])
+        self.assertIn("Visual Studio 18 2026", run.call_args_list[0].args[1])
+        self.assertFalse(result["production_toolchain_validated"])
+        self.assertFalse(result["artifacts_created"])
+        self.assertEqual(ci.read_json(args.preflight_stage / "window-fixture-probe.json"), result)
+        flutter.assert_not_called()
+        worker.assert_not_called()
+
+    def test_window_fixture_diagnostic_is_source_bound_and_never_reflects_raw_stderr(self):
+        mapping = ci.window_fixture_check_ids()
+        self.assertEqual(len(mapping), 73)
+        message = "post-layout frame opt-in may precede native Show callback"
+        self.assertEqual(mapping[message], "WF014")
+        stdout, stderr = self.root / "fixture.stdout", self.root / "fixture.stderr"
+        stdout.write_bytes(ci.WINDOW_FIXTURE_PASS.encode("ascii"))
+        valid = ("FAIL: " + message + " (Win32 error 5)\r\n").encode("ascii")
+        stderr.write_bytes(valid)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            ci.window_fixture_diagnostic(0xC0000139, stdout, stderr)
+        text = output.getvalue()
+        payload = json.loads(text.removeprefix("ChaSteady window fixture diagnostic "))
+        self.assertEqual(payload["exit_hex"], "0xC0000139")
+        self.assertEqual(payload["check_id"], "WF014")
+        self.assertEqual(payload["win32_last_error"], 5)
+        self.assertTrue(payload["pass_marker"])
+        self.assertNotIn(message, text)
+        for raw in (b"D:\\PRIVATE\\bearer=do-not-print\n" + valid, valid + b"secret-tail", valid + valid,
+                    b"\xff" + valid, b"x" * 4097, valid.replace(b"error 5", b"error 4294967296")):
+            stderr.write_bytes(raw)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                ci.window_fixture_diagnostic(1, stdout, stderr)
+            payload = json.loads(output.getvalue().removeprefix("ChaSteady window fixture diagnostic "))
+            self.assertEqual(payload["check_id"], "unknown")
+            self.assertIsNone(payload["win32_last_error"])
+            self.assertNotIn("do-not-print", output.getvalue())
+            self.assertNotIn("secret-tail", output.getvalue())
+
+    def test_window_fixture_timeout_and_spawn_failure_remain_fixed_failures(self):
+        for outcome in ("timeout", "spawn_failed"):
+            logs = self.root / outcome
+            logs.mkdir()
+            registry = mock.Mock()
+            registry.snapshot.return_value = []
+            process = mock.Mock()
+            process.wait.side_effect = ci.subprocess.TimeoutExpired("private-command", 60)
+            spawn_error = OSError("D:/PRIVATE/profile.json bearer=do-not-print")
+            output = io.StringIO()
+            with mock.patch.object(ci, "OwnedProcessRegistry", return_value=registry), \
+                    mock.patch.object(ci, "spawn_owned_process", return_value=process,
+                                      side_effect=spawn_error if outcome == "spawn_failed" else None), \
+                    mock.patch.object(ci, "window_fixture_diagnostic") as diagnostic, \
+                    redirect_stdout(output), self.assertRaises(ci.ValidationError) as failure:
+                ci.run_window_fixture_step("run", ["not-executed"], self.root, {}, logs, timeout=60)
+            self.assertEqual(diagnostic.call_args.args[3], outcome)
+            self.assertIsNone(diagnostic.call_args.args[0])
+            expected_code = "CI_WINDOW_FIXTURE_RUN_" + ("TIMEOUT" if outcome == "timeout" else "START")
+            self.assertIn(expected_code, ci.ci_failure_diagnostic(failure.exception, "native_fixture_run"))
+            self.assertNotIn("do-not-print", str(failure.exception) + output.getvalue())
+
+    def test_window_fixture_diagnostic_failure_cannot_mask_real_process_exit(self):
+        for code in (0, 1):
+            logs = self.root / ("exit-" + str(code))
+            logs.mkdir()
+            registry = mock.Mock()
+            registry.snapshot.return_value = []
+            process = mock.Mock()
+            process.wait.return_value = code
+            output = io.StringIO()
+            with mock.patch.object(ci, "OwnedProcessRegistry", return_value=registry), \
+                    mock.patch.object(ci, "spawn_owned_process", return_value=process), \
+                    mock.patch.object(ci, "window_fixture_diagnostic", side_effect=RuntimeError("private-secret")), \
+                    redirect_stdout(output):
+                if code:
+                    with self.assertRaises(ci.ValidationError):
+                        ci.run_window_fixture_step("run", ["not-executed"], self.root, {}, logs, timeout=60)
+                else:
+                    ci.run_window_fixture_step("run", ["not-executed"], self.root, {}, logs, timeout=60)
+            self.assertNotIn("private-secret", output.getvalue())
+            self.assertIn('"available":false', output.getvalue())
+
+    def test_window_fixture_broken_diagnostic_output_preserves_real_result(self):
+        class BrokenOutput:
+            def __init__(self, fail_flush):
+                self.fail_flush = fail_flush
+
+            def write(self, text):
+                if not self.fail_flush:
+                    raise BrokenPipeError("private output write failure")
+                return len(text)
+
+            def flush(self):
+                raise OSError("private output flush failure")
+
+        for code in (0, 1):
+            for fail_flush in (False, True):
+                logs = self.root / ("broken-output-{}-{}".format(code, fail_flush))
+                logs.mkdir()
+                registry = mock.Mock()
+                registry.snapshot.return_value = []
+                process = mock.Mock()
+                process.wait.return_value = code
+                with mock.patch.object(ci, "OwnedProcessRegistry", return_value=registry), \
+                        mock.patch.object(ci, "spawn_owned_process", return_value=process), \
+                        redirect_stdout(BrokenOutput(fail_flush)):
+                    if code:
+                        with self.assertRaises(ci.ValidationError) as failure:
+                            ci.run_window_fixture_step("run", ["not-executed"], self.root, {}, logs, timeout=60)
+                        self.assertIn("CI_WINDOW_FIXTURE_RUN_EXIT", ci.ci_failure_diagnostic(
+                            failure.exception, "native_fixture_run"))
+                    else:
+                        ci.run_window_fixture_step("run", ["not-executed"], self.root, {}, logs, timeout=60)
+
+    def test_window_probe_versions_are_public_before_later_fixture_failure(self):
+        report = self._window_probe_report()
+        root = self.root.resolve(strict=True)
+        (root / ".git").mkdir()
+        args = SimpleNamespace(root=root, toolchain_report=root / "report.json", preflight_stage=root / "new-stage")
+        actual = {"generator": "Visual Studio 18 2026", "architecture": "x64",
+                  "cxx_compiler_version": "19.50.12345.0", "windows_sdk_version": report["windows_sdk_version"]}
+        metadata = [SimpleNamespace(returncode=0, stdout=b"cmake version 4.3.0-msvc1\n"),
+                    SimpleNamespace(returncode=0, stdout=b"Visual Studio 18 2026")]
+        output = io.StringIO()
+
+        def fake_step(label, command, source, environment, stage, timeout):
+            if label == "build":
+                executable = stage / "build/native_smoke/Release/chasteady_window_chrome_smoke.exe"
+                executable.parent.mkdir(parents=True)
+                executable.write_bytes(b"never executed")
+            elif label == "run":
+                raise ci.ValidationError("Windows fixture run exited unsuccessfully; raw runner-local logs are not uploaded")
+
+        with mock.patch.object(ci, "ROOT", root), mock.patch.object(ci, "read_json", return_value=report), \
+                mock.patch.object(ci, "prepare_window_probe_source", return_value=[]), \
+                mock.patch.object(ci.subprocess, "run", side_effect=metadata), \
+                mock.patch.object(ci, "validate_window_probe_cache", return_value=actual), \
+                mock.patch.object(ci, "run_window_fixture_step", side_effect=fake_step), \
+                redirect_stdout(output), self.assertRaises(ci.ValidationError):
+            ci.run_window_fixture_probe(args)
+        text = output.getvalue()
+        prefix = "ChaSteady window probe toolchain "
+        facts = [json.loads(line.removeprefix(prefix)) for line in text.splitlines() if line.startswith(prefix)]
+        self.assertEqual([fact["phase"] for fact in facts], ["selected", "configured"])
+        self.assertEqual(facts[1]["actual"], actual)
+        self.assertEqual(facts[0]["toolchain_versions"]["visual_studio_version"], report["visual_studio_version"])
+        self.assertFalse(facts[1]["production_toolchain_validated"])
+        self.assertNotIn(str(root), text)
+        self.assertNotIn("visual_studio_path", text)
+        self.assertFalse((args.preflight_stage / "window-fixture-probe.json").exists())
+        for malicious in ("18.10.1\nD:/private/bearer=secret", "18.10.secret", "1." + "1" * 65):
+            rejected = io.StringIO()
+            with redirect_stdout(rejected), self.assertRaises(ci.ValidationError):
+                ci.window_probe_toolchain_diagnostic({**report, "visual_studio_version": malicious})
+            self.assertEqual(rejected.getvalue(), "")
+
+    def test_workflow_window_probe_is_download_free_and_never_uploads_artifacts(self):
+        workflow = (Path(ci.ROOT) / ".github/workflows/build-windows.yml").read_text(encoding="utf-8")
+        conflict = workflow.index("- name: Reject conflicting diagnostic modes before any provisioning")
+        probe = workflow.index("- name: Diagnose owned window fixture with preinstalled tools only")
+        self.assertLess(conflict, probe)
+        block = workflow[probe:workflow.index("- name: Create fresh Worker runtime")]
+        self.assertIn("if: ${{ inputs.window_fixture_only }}", block)
+        self.assertIn("-FixtureProbeOnly", block)
+        self.assertIn("--window-fixture-only", block)
+        for name in ("Fetch and verify the pinned Noto font", "Download and verify the pinned official Flutter SDK",
+                     "Verify Flutter executable identity", "Analyze and test isolated UI"):
+            step = workflow[workflow.index("- name: " + name):].split("      - name:", 1)[0]
+            self.assertIn("if: ${{ !inputs.window_fixture_only }}", step)
+        self.assertIn("(inputs.ui_checks_only || inputs.window_fixture_only) && 15 || 240", workflow)
+        for ui_only, window_only in ((False, False), (True, False), (False, True), (True, True)):
+            conflict_mode = ui_only and window_only
+            full_enabled = not ui_only and not window_only
+            self.assertEqual(full_enabled, not (ui_only or window_only))
+            if conflict_mode:
+                self.assertFalse(full_enabled)
 
     def test_flutter_json_shape_diagnostic_never_prints_vendor_text_paths_or_credentials(self):
         private = b"D:\\private-fixture\\profile.json bearer=not-for-public-logs"

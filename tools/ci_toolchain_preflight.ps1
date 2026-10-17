@@ -6,11 +6,17 @@ param(
     [ValidateSet('windows-2025-vs2026')]
     [string]$RunnerLabel,
     [switch]$UpdateStableVisualStudio,
-    [switch]$InstallLatestWindowsSdk
+    [switch]$InstallLatestWindowsSdk,
+    [switch]$FixtureProbeOnly
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+# Reject this combination before discovery, downloads, or installer execution.
+if ($FixtureProbeOnly -and ($UpdateStableVisualStudio -or $InstallLatestWindowsSdk)) {
+    throw 'CI_FIXTURE_PROBE_CONFLICTS_WITH_INSTALLERS'
+}
 
 $targetVisualStudio = [Version]'18.11.0.0'
 $targetMsvc = [Version]'14.50.0'
@@ -46,7 +52,7 @@ function Assert-MicrosoftSignature([string]$Path) {
     }
 }
 
-function Get-FlutterStableVisualStudioInstance {
+function Get-FlutterStableVisualStudioInstance([switch]$FixtureVs2026Only) {
     # Flutter 3.47.7 first queries a stable NativeDesktop IDE, then stable VCTools,
     # with these exact component requirements. It does not pick from PATH or
     # independently sort every installed product. Preview fallback is not allowed
@@ -59,6 +65,10 @@ function Get-FlutterStableVisualStudioInstance {
             'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
             'Microsoft.VisualStudio.Component.VC.CMake.Project'
         )
+        if ($FixtureVs2026Only) {
+            $versionIndex = [Array]::IndexOf($arguments, '-version')
+            $arguments[$versionIndex + 1] = '[18.0,19.0)'
+        }
         $json = & $vswhere @arguments
         if ($LASTEXITCODE -ne 0) { throw 'Flutter-compatible official Visual Studio discovery failed.' }
         $matches = @($json | ConvertFrom-Json)
@@ -221,6 +231,183 @@ function Install-OfficialWindowsSdk {
         installed_product_version = [string]$installedVersion
         include_version = '10.0.28000.0'
     }
+}
+
+function Test-FixturePathWithin([string]$Path, [string]$Root) {
+    $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $base = [IO.Path]::GetFullPath($Root).TrimEnd('\')
+    return ($full.Equals($base, [StringComparison]::OrdinalIgnoreCase) -or
+        $full.StartsWith($base + '\', [StringComparison]::OrdinalIgnoreCase))
+}
+
+function Get-FixtureCanonicalPath([string]$Path, [ValidateSet('File', 'Directory')][string]$Kind) {
+    if (-not [IO.Path]::IsPathRooted($Path) -or $Path.IndexOfAny([char[]]@('"', "`r", "`n", [char]0)) -ge 0) {
+        throw 'CI_FIXTURE_PATH_INVALID'
+    }
+    $full = [IO.Path]::GetFullPath($Path)
+    $anchor = [IO.Path]::GetPathRoot($full)
+    if ($anchor -cnotmatch '^[A-Za-z]:\\$') { throw 'CI_FIXTURE_PATH_INVALID' }
+    $cursor = $anchor
+    $parts = @($full.Substring($anchor.Length).Split('\', [StringSplitOptions]::RemoveEmptyEntries))
+    $all = @($anchor)
+    foreach ($part in $parts) { $cursor = Join-Path $cursor $part; $all += $cursor }
+    foreach ($component in $all) {
+        try { $item = Get-Item -LiteralPath $component -Force -ErrorAction Stop }
+        catch { throw 'CI_FIXTURE_PATH_MISSING' }
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'CI_FIXTURE_REPARSE_REJECTED'
+        }
+        if ($component -ne $full -and (-not $item.PSIsContainer -or $item -isnot [IO.DirectoryInfo])) {
+            throw 'CI_FIXTURE_PATH_INVALID'
+        }
+    }
+    if (($Kind -eq 'Directory' -and (-not $item.PSIsContainer -or $item -isnot [IO.DirectoryInfo])) -or
+        ($Kind -eq 'File' -and ($item.PSIsContainer -or $item -isnot [IO.FileInfo]))) {
+        throw 'CI_FIXTURE_PATH_KIND'
+    }
+    return [IO.Path]::GetFullPath($item.FullName)
+}
+
+function Assert-FixtureMicrosoftTool([string]$Path) {
+    [void](Get-FixtureCanonicalPath $Path 'File')
+    try { Assert-MicrosoftSignature $Path }
+    catch { throw 'CI_FIXTURE_TOOL_SIGNATURE' }
+}
+
+function Select-FixtureSdkVersion([object[]]$Candidates) {
+    # Pure data selection: a numeric name alone never certifies completeness.
+    $eligible = @()
+    foreach ($candidate in $Candidates) {
+        $version = $null
+        if ($candidate.Version -cmatch '^10\.0\.\d+\.\d+$' -and
+            [Version]::TryParse([string]$candidate.Version, [ref]$version) -and
+            $candidate.Complete -is [bool] -and $candidate.Complete) {
+            $eligible += $candidate
+        }
+    }
+    $selected = @($eligible | Sort-Object { [Version]$_.Version } -Descending | Select-Object -First 1)
+    if ($selected.Count -ne 1) { throw 'CI_FIXTURE_COMPLETE_SDK_MISSING' }
+    return [string]$selected[0].Version
+}
+
+function Get-FixtureInstalledSdk {
+    $kitsRoot = Get-FixtureCanonicalPath (Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10') 'Directory'
+    $includeRoot = Get-FixtureCanonicalPath (Join-Path $kitsRoot 'Include') 'Directory'
+    $candidates = @()
+    foreach ($entry in Get-ChildItem -LiteralPath $includeRoot -Directory) {
+        if ($entry.Name -cnotmatch '^10\.0\.\d+\.\d+$') { continue }
+        $version = $entry.Name
+        $required = @(
+            "Include\$version\um\Windows.h", "Include\$version\shared\sdkddkver.h",
+            "Include\$version\ucrt\stdio.h", "Lib\$version\um\x64\kernel32.lib",
+            "Lib\$version\um\x64\user32.lib", "Lib\$version\ucrt\x64\ucrt.lib",
+            "bin\$version\x64\rc.exe", "bin\$version\x64\mt.exe"
+        )
+        $complete = $true
+        foreach ($relative in $required) {
+            try { [void](Get-FixtureCanonicalPath (Join-Path $kitsRoot $relative) 'File') }
+            catch { $complete = $false; break }
+        }
+        $candidates += [pscustomobject]@{ Version = $version; Complete = $complete }
+    }
+    $version = Select-FixtureSdkVersion $candidates
+    $rc = Get-FixtureCanonicalPath (Join-Path $kitsRoot "bin\$version\x64\rc.exe") 'File'
+    $mt = Get-FixtureCanonicalPath (Join-Path $kitsRoot "bin\$version\x64\mt.exe") 'File'
+    Assert-FixtureMicrosoftTool $rc
+    Assert-FixtureMicrosoftTool $mt
+    return [pscustomobject]@{ Root = $kitsRoot; Version = $version; Rc = $rc; Mt = $mt }
+}
+
+function Get-FixtureProbeToolchain {
+    [void](Get-FixtureCanonicalPath $vswhere 'File')
+    $instance = Get-FlutterStableVisualStudioInstance -FixtureVs2026Only
+    foreach ($property in @('installationPath', 'installationVersion', 'isPrerelease', 'isComplete', 'isLaunchable')) {
+        if (-not $instance.PSObject.Properties[$property]) { throw 'CI_FIXTURE_VS_DESCRIPTOR_INVALID' }
+    }
+    $vsVersion = $null
+    if ($instance.isPrerelease -ne $false -or $instance.isComplete -ne $true -or
+        $instance.isLaunchable -ne $true -or
+        -not [Version]::TryParse([string]$instance.installationVersion, [ref]$vsVersion) -or
+        $vsVersion.Major -ne 18) {
+        throw 'CI_FIXTURE_STABLE_VS2026_MISSING'
+    }
+    $vsPath = Get-FixtureCanonicalPath ([string]$instance.installationPath) 'Directory'
+    $defaultFile = Get-FixtureCanonicalPath (Join-Path $vsPath 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt') 'File'
+    if ((Get-Item -LiteralPath $defaultFile).Length -gt 128) { throw 'CI_FIXTURE_MSVC_DEFAULT_INVALID' }
+    $defaultVersion = [IO.File]::ReadAllText($defaultFile).Trim()
+    $parsedMsvc = $null
+    if ($defaultVersion -cnotmatch '^\d+\.\d+\.\d+(\.\d+)?$' -or
+        -not [Version]::TryParse($defaultVersion, [ref]$parsedMsvc) -or $parsedMsvc.Major -ne 14) {
+        throw 'CI_FIXTURE_MSVC_DEFAULT_INVALID'
+    }
+    $msvcPath = Get-FixtureCanonicalPath (Join-Path $vsPath "VC\Tools\MSVC\$defaultVersion") 'Directory'
+    $cl = Get-FixtureCanonicalPath (Join-Path $msvcPath 'bin\Hostx64\x64\cl.exe') 'File'
+    Assert-FixtureMicrosoftTool $cl
+    # As in the full preflight, query this VS instance's bundled CMake, not PATH.
+    $cmake = Get-FixtureCanonicalPath (Join-Path $vsPath 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe') 'File'
+    $versionOutput = @(& $cmake --version 2>&1)
+    $versionExit = $LASTEXITCODE
+    $versionText = ($versionOutput | ForEach-Object { [string]$_ }) -join "`n"
+    $matches = [regex]::Matches($versionText, '(?m)^cmake version ([^\r\n]+)\r?$')
+    if ($versionExit -ne 0 -or $matches.Count -ne 1) { throw 'CI_FIXTURE_CMAKE_VERSION_INVALID' }
+    $rawCmakeVersion = $matches[0].Groups[1].Value.Trim()
+    try { [void](ConvertFrom-StableCmakeVersion $rawCmakeVersion) }
+    catch { throw 'CI_FIXTURE_CMAKE_VERSION_INVALID' }
+    $helpOutput = @(& $cmake --help 2>&1)
+    $helpExit = $LASTEXITCODE
+    $helpText = ($helpOutput | ForEach-Object { [string]$_ }) -join "`n"
+    if ($helpExit -ne 0 -or $helpText -cnotmatch '(?m)^[ \t]*(?:\*[ \t]*)?Visual Studio 18 2026[ \t]*=') {
+        throw 'CI_FIXTURE_CMAKE_VS2026_GENERATOR_MISSING'
+    }
+    $sdk = Get-FixtureInstalledSdk
+    return [ordered]@{
+        schema_version = 1
+        scope = 'supplementary_diagnostics_only_preinstalled_toolchain'
+        production_toolchain_validated = $false
+        downloads_or_updates_executed = $false
+        runner_label = $RunnerLabel
+        architecture = 'x64'
+        visual_studio_path = $vsPath
+        visual_studio_version = [string]$instance.installationVersion
+        msvc_toolset_path = $msvcPath
+        msvc_toolset_version = $defaultVersion
+        cmake_path = $cmake
+        cmake_version = $rawCmakeVersion
+        windows_sdk_root = $sdk.Root
+        windows_sdk_version = $sdk.Version
+        rc_path = $sdk.Rc
+        mt_path = $sdk.Mt
+    }
+}
+
+if ($FixtureProbeOnly) {
+    # Supplementary descriptor only: return before every production floor/update.
+    $fixtureOutput = [IO.Path]::GetFullPath($OutputPath)
+    if ($fixtureOutput -cnotmatch '^[A-Za-z]:\\' -or $fixtureOutput.Contains('"')) {
+        throw 'CI_FIXTURE_OUTPUT_INVALID'
+    }
+    if (Test-Path -LiteralPath $fixtureOutput) { throw 'Toolchain preflight result must be a new file.' }
+    $sourceRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+    if (Test-FixturePathWithin $fixtureOutput $sourceRoot) { throw 'CI_FIXTURE_OUTPUT_OVERLAPS_SOURCE' }
+    $fixtureRecord = Get-FixtureProbeToolchain
+    foreach ($toolRoot in @($fixtureRecord.visual_studio_path, $fixtureRecord.windows_sdk_root)) {
+        if (Test-FixturePathWithin $fixtureOutput $toolRoot) { throw 'CI_FIXTURE_OUTPUT_OVERLAPS_TOOLCHAIN' }
+    }
+    $outputParent = [IO.Path]::GetDirectoryName($fixtureOutput)
+    $existingParent = $outputParent
+    while (-not [IO.Directory]::Exists($existingParent)) {
+        $existingParent = [IO.Path]::GetDirectoryName($existingParent)
+        if (-not $existingParent) { throw 'CI_FIXTURE_OUTPUT_INVALID' }
+    }
+    [void](Get-FixtureCanonicalPath $existingParent 'Directory')
+    [void][IO.Directory]::CreateDirectory($outputParent)
+    [void](Get-FixtureCanonicalPath $outputParent 'Directory')
+    $fixtureJson = ConvertTo-Json -InputObject $fixtureRecord -Depth 4
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($fixtureJson + "`n")
+    $stream = [IO.File]::Open($fixtureOutput, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
+    Write-Output 'Supplementary fixture descriptor only; production toolchain validation was not performed.'
+    return
 }
 
 if ($UpdateStableVisualStudio) {
