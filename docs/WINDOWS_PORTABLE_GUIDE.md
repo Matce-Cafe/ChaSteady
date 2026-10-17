@@ -27,9 +27,10 @@ ChaSteady 是暂用名称。本工具在本机处理视频，不上传素材。�
 
 ### 网页版与语言
 
-- 从“文件 → 打开 Web 会话”进入保留的网页版。两端连接同一个桌面 Worker，共享任务队列和设置，不另起处理服务。
+- 左侧导航支持仅图标／图标加本地化文字切换，“设置”入口固定在侧栏底部；原“文件／视图／帮助”菜单功能已移入设置。
+- 从“设置 → 打开 Web 会话”进入保留的网页版。两端连接同一个桌面 Worker，共享任务队列和设置，不另起处理服务。
 - 关闭桌面程序会停止其拥有的本机服务，网页端也会断开。活动任务会先提示确认并等待清理。
-- “视图 → 语言”提供“跟随系统 / 简体中文 / English”。显式选择在两端共享；“跟随系统”分别使用 Windows 或浏览器语言，其他语言回退 English。
+- 在设置的语言选项中选择“跟随系统 / 简体中文 / English”，切换即时保存，不必先保存工具路径。显式选择在两端共享；“跟随系统”分别使用 Windows 或浏览器语言，其他语言回退 English。
 - 外部工具的原始诊断保留原文，不自动翻译或改写技术证据。
 
 ## English
@@ -42,6 +43,6 @@ The home workspace has no floating job-activity panel. Open **Jobs** to inspect 
 
 The embedded player targets verified H.264 8-bit/AAC previews, starts muted, and does not autoplay. Media/PTS/audio/current-input-corner verification is not certification of original FOV, a 4K/10-bit master, or perceptual superiority. Upstream cropping and bit-depth loss cannot be reversed.
 
-Use **File → Open Web session** for the retained Web interface. It shares the desktop-owned worker, queue, and preferences. Closing the desktop app disconnects the Web interface. **View → Language** offers **System default / 简体中文 / English**; explicit choices are shared, while system mode resolves separately on Windows and in the browser. Unsupported system languages fall back to English. Original external diagnostics remain untranslated.
+The left sidebar can show icons only or icons with localized labels; **Settings** stays at its bottom. Former File/View/Help actions now live in Settings. Use **Settings → Open Web session** for the retained Web interface, which shares the desktop-owned worker, queue, and preferences. Closing the desktop app disconnects it. Settings offers **System default / 简体中文 / English**, with language changes saved immediately and independently of tool-path edits. Explicit choices are shared, while system mode resolves separately on Windows and in the browser. Unsupported system languages fall back to English. Original external diagnostics remain untranslated.
 
 Local candidates are unsigned. Check their provenance and hashes rather than disabling Windows protection. See `LICENSE`, `THIRD_PARTY_NOTICES.md`, and the accompanying `licenses` directory for copied notices and outstanding distribution-review limits. Successful local execution is not public-release or legal clearance.
