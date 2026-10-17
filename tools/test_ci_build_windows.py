@@ -224,6 +224,48 @@ class CiBuildWindowsTests(unittest.TestCase):
         self.assertEqual(payload["known_os_error_codes"], [])
         self.assertIsNone(payload["process_exit_code"])
 
+    def test_flutter_path_diagnostics_are_lexical_bounded_and_never_echo_paths(self):
+        sample = (b'Flutter failed to list directory at "D:\\reviewed-sdk\\dev\\private-name"\n'
+                  b'Directory listing failed, path = \'D:\\reviewed-sdk\\examples\\private-name\'\n'
+                  b'PathNotFoundException: "D:\\source-root\\.dart_tool\\package_config.json"\n'
+                  b'"D:\\reviewed-sdk-other\\bearer-not-public" "D:\\extra\\not-reported"')
+        roots = {"sdk": "D:/reviewed-sdk", "source": "D:/source-root", "temp": "D:/temp-root",
+                 "secret-key-must-not-print": "D:/private-value"}
+        with mock.patch.object(ci.Path, "stat", side_effect=AssertionError("No FS access to vendor paths")), \
+                mock.patch.object(ci.Path, "resolve", side_effect=AssertionError("No path resolution")):
+            shapes = ci.flutter_quoted_path_shapes(sample, roots)
+        self.assertEqual(len(shapes), 4)
+        self.assertEqual([(row["scope"], row["sdk_subtree"]) for row in shapes],
+                         [("sdk", "dev"), ("sdk", "examples"), ("source", None), ("other", None)])
+        self.assertEqual(shapes[2]["known_leaf"], "package_config.json")
+        encoded = json.dumps(shapes)
+        for private in ("reviewed-sdk", "source-root", "private-name", "bearer", "secret-key", "private-value"):
+            self.assertNotIn(private, encoded)
+        self.assertEqual(ci.flutter_quoted_path_shapes(b"no quoted Windows path", roots), [])
+        extended_path = '"' + chr(92) * 2 + '?' + chr(92) + 'D:/reviewed-sdk/dev/private"'
+        extended = ci.flutter_quoted_path_shapes(extended_path.encode("ascii"), roots)
+        self.assertEqual(extended[0]["scope"], "sdk")
+        self.assertTrue(extended[0]["extended_prefix"])
+
+    def test_flutter_missing_directory_diagnostic_uses_fixed_markers_and_path_scope_only(self):
+        stderr = self.root / "stderr.log"
+        stderr.write_bytes(b'Flutter failed to list directory at "D:\\sdk-private\\dev\\private-child"\n'
+                           b'PathNotFoundException: Directory listing failed (errno = 3)\n')
+        output = io.StringIO()
+        with redirect_stdout(output):
+            ci.flutter_json_shape_diagnostic(b"", stderr, RuntimeError(), exit_code=1,
+                                              path_roots={"sdk": "D:/sdk-private", "source": "D:/ui-private"})
+        text = output.getvalue()
+        payload = json.loads(text.removeprefix("ChaSteady Flutter JSON diagnostic "))
+        self.assertTrue(payload["startup_path_not_found_exception"])
+        self.assertTrue(payload["startup_directory_listing_failed"])
+        self.assertTrue(payload["startup_flutter_failed_list_directory"])
+        self.assertEqual(payload["known_os_error_codes"], [3])
+        self.assertEqual(payload["quoted_windows_path_shapes"][0]["sdk_subtree"], "dev")
+        self.assertEqual(payload["input_path_characters"], {"sdk": 14, "source": 13})
+        for private in ("sdk-private", "ui-private", "private-child", "PathNotFoundException:"):
+            self.assertNotIn(private, text)
+
     def test_flutter_json_shape_diagnostic_never_prints_vendor_text_paths_or_credentials(self):
         private = b"D:\\private-fixture\\profile.json bearer=not-for-public-logs"
         raw = b"\xef\xbb\xbf" + private

@@ -15,7 +15,7 @@ jobs:
   build-windows-x64:
     name: Build-only Windows x64 with UI checks
     runs-on: windows-2025-vs2026
-    timeout-minutes: 240
+    timeout-minutes: ${{ inputs.ui_checks_only && 15 || 240 }}
 
     steps:
       - name: Checkout reviewed source without persisted credentials
