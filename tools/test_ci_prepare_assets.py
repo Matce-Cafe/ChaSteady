@@ -162,8 +162,22 @@ class CiFontAssetTests(unittest.TestCase):
         self.assertIsNone(ci.NoRedirect().redirect_request(request, None, 302, "redirect", {}, "https://example.invalid/"))
         opener.open.assert_called_once()
 
+    def test_standard_bearer_syntax_does_not_assume_a_github_token_encoding(self):
+        for index, token in enumerate(("opaque-token.with~plus+and/slash==", "jwt.header-signature.payload", "x" * 1024)):
+            payload = make_ttf_fixture()
+            opener = mock.Mock()
+            opener.open.return_value = FakeResponse(payload)
+            with mock.patch.dict(ci.os.environ, {"CHASTEADY_CI_FONT_GITHUB_TOKEN": token}), \
+                    mock.patch.object(ci, "build_opener", return_value=opener), \
+                    mock.patch.object(ci, "FONT_BYTES", len(payload)), \
+                    mock.patch.object(ci, "FONT_BLOB_SHA1", ci.git_blob_sha1(payload)), \
+                    mock.patch.object(ci, "FONT_SHA256", hashlib.sha256(payload).hexdigest()):
+                result = ci.download_font(self.root / ("bearer-{}.ttf".format(index)))
+            self.assertEqual(opener.open.call_args.args[0].get_header("Authorization"), "Bearer " + token)
+            self.assertNotIn(token, str(result))
+
     def test_invalid_credential_is_rejected_without_echo_or_network(self):
-        for value in ("ghs_" + "a" * 36 + "\r\nX-Injected: private", "x" * 513, "short", "private secret value"):
+        for value in ("ghs_" + "a" * 36 + "\r\nX-Injected: private", "x" * 8193, "colon:private", "private secret value", "nonascii-秘密"):
             with mock.patch.dict(ci.os.environ, {"CHASTEADY_CI_FONT_GITHUB_TOKEN": value}), \
                     mock.patch.object(ci, "build_opener") as build, self.assertRaises(ValueError) as failure:
                 ci.download_font(self.root / "never-created.ttf")

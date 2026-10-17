@@ -210,7 +210,7 @@ def download_font(destination: Path) -> dict:
     # Only the explicit step-scoped CI credential is used, never a local PAT.
     token = os.environ.get("CHASTEADY_CI_FONT_GITHUB_TOKEN", "")
     if token:
-        if not re.fullmatch(r"[A-Za-z0-9_]{20,512}", token):
+        if len(token) > 8192 or not re.fullmatch(r"[A-Za-z0-9._~+/-]+=*", token):
             raise ValueError("CI font credential has an invalid header format")
         headers["Authorization"] = "Bearer " + token
     opener = build_opener(HTTPSHandler(context=ssl.create_default_context()), NoRedirect())
