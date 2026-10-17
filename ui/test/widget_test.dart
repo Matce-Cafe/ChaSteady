@@ -3,6 +3,7 @@ import 'package:cha_stabilizer_ui/src/controller.dart';
 import 'package:cha_stabilizer_ui/src/localization.dart';
 import 'package:cha_stabilizer_ui/src/models.dart';
 import 'package:cha_stabilizer_ui/src/path_rules.dart';
+import 'package:cha_stabilizer_ui/src/widgets/desktop_sidebar.dart';
 import 'package:cha_stabilizer_ui/src/widgets/job_activity_sheet.dart';
 import 'package:cha_stabilizer_ui/src/widgets/job_detail.dart';
 import 'package:cha_stabilizer_ui/src/widgets/job_widgets.dart';
@@ -331,7 +332,7 @@ void main() {
   );
 
   testWidgets(
-    'M3 navigation adapts from phone to rail without a home activity overlay',
+    'Web navigation adapts from phone to sidebar without a home activity overlay',
     (tester) async {
       tester.view.devicePixelRatio = 1;
       tester.view.physicalSize = const Size(390, 844);
@@ -351,7 +352,7 @@ void main() {
       await tester.pump(const Duration(milliseconds: 80));
 
       expect(find.byType(NavigationBar), findsOneWidget);
-      expect(find.byType(NavigationRail), findsNothing);
+      expect(find.byType(DesktopSidebar), findsNothing);
       expect(
         tester
             .widget<MaterialApp>(find.byType(MaterialApp))
@@ -382,11 +383,11 @@ void main() {
 
       tester.view.physicalSize = const Size(900, 900);
       await tester.pump();
-      expect(find.byType(NavigationRail), findsOneWidget);
+      expect(find.byType(DesktopSidebar), findsOneWidget);
       expect(find.byType(NavigationBar), findsNothing);
       await tester.tap(
         find.descendant(
-          of: find.byType(NavigationRail),
+          of: find.byType(DesktopSidebar),
           matching: find.byIcon(Icons.video_library_outlined),
         ),
       );
@@ -394,7 +395,7 @@ void main() {
 
       tester.view.physicalSize = const Size(1600, 1000);
       await tester.pump();
-      expect(find.byType(NavigationRail), findsOneWidget);
+      expect(find.byType(DesktopSidebar), findsOneWidget);
       expect(find.byType(JobActivitySheet), findsNothing);
       expect(find.byType(DraggableScrollableSheet), findsNothing);
       expect(find.text('Job activity'), findsNothing);
@@ -444,7 +445,7 @@ void main() {
 
       await tester.tap(
         find.descendant(
-          of: find.byType(NavigationRail),
+          of: find.byType(DesktopSidebar),
           matching: find.text('Jobs'),
         ),
       );

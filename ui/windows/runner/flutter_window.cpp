@@ -36,9 +36,11 @@ bool FlutterWindow::OnCreate() {
   auto* registrar = flutter::PluginRegistrarManager::GetInstance()
                         ->GetRegistrar<flutter::PluginRegistrarWindows>(
                             core_registrar);
+  const HWND flutter_child = flutter_controller_->view()->GetNativeWindow();
+  SetChildContent(flutter_child);
   native_bridge_ = std::make_unique<chasteady::NativeBridge>(
-      GetHandle(), registrar->messenger(), registrar->texture_registrar());
-  SetChildContent(flutter_controller_->view()->GetNativeWindow());
+      GetHandle(), flutter_child, registrar->messenger(),
+      registrar->texture_registrar());
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
     this->Show();
@@ -75,7 +77,9 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
     std::optional<LRESULT> result =
         flutter_controller_->HandleTopLevelWindowProc(hwnd, message, wparam,
                                                       lparam);
-    if (result) {
+    // Even if a plugin observes these messages, preserve the runner's child
+    // resize and application of the suggested per-monitor DPI rectangle.
+    if (result && message != WM_SIZE && message != WM_DPICHANGED) {
       return *result;
     }
   }

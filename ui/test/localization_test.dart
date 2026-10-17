@@ -5,6 +5,7 @@ import 'package:cha_stabilizer_ui/src/app.dart';
 import 'package:cha_stabilizer_ui/src/controller.dart';
 import 'package:cha_stabilizer_ui/src/localization.dart';
 import 'package:cha_stabilizer_ui/src/models.dart';
+import 'package:cha_stabilizer_ui/src/widgets/desktop_sidebar.dart';
 import 'package:cha_stabilizer_ui/src/widgets/job_activity_sheet.dart';
 import 'package:cha_stabilizer_ui/src/widgets/job_widgets.dart';
 import 'package:flutter/material.dart';
@@ -104,8 +105,8 @@ void main() {
     await _pumpApp(tester, _testPreferences());
 
     expect(tester.widget<MaterialApp>(find.byType(MaterialApp)).locale, isNull);
-    expect(find.text('工作台'), findsOneWidget);
-    expect(find.text('任务'), findsOneWidget);
+    expect(find.byTooltip('工作台'), findsOneWidget);
+    expect(find.byTooltip('任务'), findsOneWidget);
   });
 
   testWidgets(
@@ -119,7 +120,7 @@ void main() {
         tester,
         _testPreferences(languageMode: AppLanguageMode.zh),
       );
-      expect(find.text('工作台'), findsOneWidget);
+      expect(find.byTooltip('工作台'), findsOneWidget);
 
       await tester.pumpWidget(const SizedBox.shrink());
       await tester.pump();
@@ -130,12 +131,12 @@ void main() {
         tester,
         _testPreferences(languageMode: AppLanguageMode.en),
       );
-      expect(find.text('Workbench'), findsOneWidget);
+      expect(find.byTooltip('Workbench'), findsOneWidget);
     },
   );
 
   testWidgets(
-    'File, View and Help menus route native actions and confirm close',
+    'Settings replaces File, View and Help menus and confirms native close',
     (tester) async {
       tester.binding.platformDispatcher.localesTestValue = const <Locale>[
         Locale('en', 'US'),
@@ -157,6 +158,8 @@ void main() {
       final platform = TestPlatformAdapter(
         nativePicker: true,
         webAvailable: true,
+        nativeDesktop: true,
+        managedShutdown: true,
       );
       await tester.pumpWidget(
         ChaSteadyApp(
@@ -167,7 +170,7 @@ void main() {
       );
       await _settleInitial(tester);
 
-      expect(find.byType(MenuBar), findsOneWidget);
+      expect(find.byType(MenuBar), findsNothing);
       expect(find.byType(JobActivitySheet), findsNothing);
       expect(find.text('Job activity'), findsNothing);
       await tester.tap(find.byIcon(Icons.view_list_outlined));
@@ -186,12 +189,23 @@ void main() {
       );
       expect(find.text('Cancel job'), findsOneWidget);
       for (final menu in <String>['File', 'View', 'Help']) {
-        expect(find.text(menu), findsOneWidget);
+        expect(find.text(menu), findsNothing);
       }
-      await tester.tap(find.text('File'));
-      await tester.pump(const Duration(milliseconds: 250));
-      expect(find.text('Open Web session'), findsOneWidget);
-      await tester.tap(find.text('Open Web session'));
+      expect(platform.openWebCount, 0);
+      await tester.tap(
+        find.byKey(const ValueKey<String>('sidebar-destination-2')),
+      );
+      await tester.pump();
+      final openWeb = find.byKey(const ValueKey<String>('settings-open-web'));
+      await tester.scrollUntilVisible(
+        openWeb,
+        300,
+        scrollable: _settingsScrollable(),
+      );
+      await _settleInitial(tester);
+      await tester.ensureVisible(openWeb);
+      await _settleInitial(tester);
+      await tester.tap(openWeb);
       await tester.pump();
       expect(platform.openWebCount, 1);
 
@@ -214,7 +228,9 @@ void main() {
 
       final confirmedClose = closeHandler();
       await tester.pump(const Duration(milliseconds: 250));
-      await tester.tap(find.text('Stop work and close'));
+      await tester.tap(
+        find.widgetWithText(FilledButton, 'Stop work and close'),
+      );
       await tester.pump(const Duration(milliseconds: 250));
       expect(await confirmedClose, isTrue);
       expect(platform.shutdownRequested, isTrue);
@@ -235,6 +251,8 @@ void main() {
       final platform = TestPlatformAdapter(
         nativePicker: true,
         webAvailable: true,
+        nativeDesktop: true,
+        managedShutdown: true,
       )..simulateShutdownWarning = true;
       await tester.pumpWidget(
         ChaSteadyApp(
@@ -252,7 +270,9 @@ void main() {
       final closeResult = closeHandler!();
       await tester.pump(const Duration(milliseconds: 250));
       expect(find.text('Close ChaSteady?'), findsOneWidget);
-      await tester.tap(find.text('Stop work and close'));
+      await tester.tap(
+        find.widgetWithText(FilledButton, 'Stop work and close'),
+      );
       await tester.pump(const Duration(milliseconds: 250));
       expect(find.textContaining('Stopping processing.'), findsOneWidget);
 
@@ -302,9 +322,18 @@ void main() {
         await tester.pumpWidget(app);
         await _settleInitial(tester);
         expect(tester.takeException(), isNull);
-        expect(find.byType(MenuBar), findsOneWidget);
-        expect(find.text('工作台'), findsOneWidget);
-        expect(find.text('设置'), findsOneWidget);
+        expect(find.byType(MenuBar), findsNothing);
+        if (size.width < 800) {
+          expect(find.text('工作台'), findsOneWidget);
+          expect(find.text('设置'), findsOneWidget);
+        } else {
+          expect(find.byTooltip('工作台'), findsOneWidget);
+          expect(find.byTooltip('设置'), findsOneWidget);
+          expect(
+            tester.widget<DesktopSidebar>(find.byType(DesktopSidebar)).expanded,
+            size.width >= 1100,
+          );
+        }
         expect(find.byType(JobActivitySheet), findsNothing);
         expect(find.byType(DraggableScrollableSheet), findsNothing);
         expect(find.text('任务活动'), findsNothing);
@@ -341,7 +370,11 @@ void main() {
         await tester.pump(const Duration(milliseconds: 60));
         expect(tester.takeException(), isNull);
         expect(find.byType(JobActivitySheet), findsNothing);
-        expect(find.text('工作台'), findsOneWidget);
+        if (size.width < 800) {
+          expect(find.text('工作台'), findsOneWidget);
+        } else {
+          expect(find.byTooltip('工作台'), findsOneWidget);
+        }
       }
     },
   );
@@ -484,6 +517,13 @@ Future<void> _pumpApp(WidgetTester tester, AppPreferences preferences) async {
   );
   await _settleInitial(tester);
 }
+
+Finder _settingsScrollable() => find
+    .descendant(
+      of: find.byKey(const ValueKey<String>('settings-list')),
+      matching: find.byType(Scrollable),
+    )
+    .first;
 
 Future<void> _settleInitial(WidgetTester tester) async {
   await tester.pump();

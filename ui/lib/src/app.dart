@@ -7,13 +7,14 @@ import 'api/api_service.dart';
 import 'brand.dart';
 import 'controller.dart';
 import 'localization.dart';
-import 'models.dart';
 import 'platform/media_platform.dart';
 import 'screens/jobs_screen.dart';
 import 'screens/settings_screen.dart';
 import 'screens/workbench_screen.dart';
 import 'theme/app_theme.dart';
 import 'widgets/common_widgets.dart';
+import 'widgets/desktop_sidebar.dart';
+import 'widgets/desktop_window_chrome.dart';
 
 class ChaSteadyApp extends StatefulWidget {
   const ChaSteadyApp({
@@ -33,6 +34,20 @@ class ChaSteadyApp extends StatefulWidget {
 
 class _ChaSteadyAppState extends State<ChaSteadyApp> {
   late final AppController _controller;
+  final _shellKey = GlobalKey<_AppShellState>();
+  final _closing = ValueNotifier(false);
+
+  Future<bool> _requestClose() =>
+      _shellKey.currentState?._requestClose() ?? Future<bool>.value(false);
+
+  void _selectPage(int index) {
+    final shell = _shellKey.currentState;
+    // Caption focus belongs outside the Navigator. Keep main-shell shortcuts
+    // global without navigating behind a dialog or a pushed page.
+    if (shell != null && ModalRoute.of(shell.context)?.isCurrent == true) {
+      shell._select(index);
+    }
+  }
 
   @override
   void initState() {
@@ -48,6 +63,7 @@ class _ChaSteadyAppState extends State<ChaSteadyApp> {
   @override
   void dispose() {
     _controller.dispose();
+    _closing.dispose();
     unawaited(widget.platform.dispose());
     super.dispose();
   }
@@ -68,7 +84,45 @@ class _ChaSteadyAppState extends State<ChaSteadyApp> {
             resolveSupportedLocale(locale),
         localizationsDelegates: AppLocalizations.localizationsDelegates,
         supportedLocales: AppLocalizations.supportedLocales,
-        home: AppShell(controller: _controller, platform: widget.platform),
+        builder: (context, navigator) => CallbackShortcuts(
+          bindings: <ShortcutActivator, VoidCallback>{
+            const SingleActivator(
+              LogicalKeyboardKey.digit1,
+              control: true,
+            ): () =>
+                _selectPage(0),
+            const SingleActivator(
+              LogicalKeyboardKey.digit2,
+              control: true,
+            ): () =>
+                _selectPage(1),
+            const SingleActivator(
+              LogicalKeyboardKey.digit3,
+              control: true,
+            ): () =>
+                _selectPage(2),
+          },
+          child: ValueListenableBuilder<bool>(
+            valueListenable: _closing,
+            child: navigator,
+            // Caption tooltips are outside the Navigator's overlay, so provide
+            // one stable outer overlay without recreating chrome per route.
+            builder: (context, closing, child) => Overlay.wrap(
+              child: DesktopWindowChrome(
+                platform: widget.platform,
+                onClose: _requestClose,
+                busy: closing,
+                child: child ?? const SizedBox.shrink(),
+              ),
+            ),
+          ),
+        ),
+        home: AppShell(
+          key: _shellKey,
+          controller: _controller,
+          platform: widget.platform,
+          onClosingChanged: (closing) => _closing.value = closing,
+        ),
       );
     },
   );
@@ -127,10 +181,16 @@ class StartupFailureApp extends StatelessWidget {
 }
 
 class AppShell extends StatefulWidget {
-  const AppShell({required this.controller, required this.platform, super.key});
+  const AppShell({
+    required this.controller,
+    required this.platform,
+    this.onClosingChanged,
+    super.key,
+  });
 
   final AppController controller;
   final MediaPlatformAdapter platform;
+  final ValueChanged<bool>? onClosingChanged;
 
   @override
   State<AppShell> createState() => _AppShellState();
@@ -138,7 +198,9 @@ class AppShell extends StatefulWidget {
 
 class _AppShellState extends State<AppShell> {
   int _selectedIndex = 0;
+  bool _sidebarLabelsPreferred = true;
   bool _closing = false;
+  Future<bool>? _closeFuture;
 
   @override
   void initState() {
@@ -152,6 +214,12 @@ class _AppShellState extends State<AppShell> {
     widget.platform.setRequestCloseHandler(() async => false);
     widget.platform.setShutdownWarningHandler(() async {});
     super.dispose();
+  }
+
+  void _setClosing(bool value) {
+    if (_closing == value) return;
+    setState(() => _closing = value);
+    widget.onClosingChanged?.call(value);
   }
 
   void _select(int index) {
@@ -190,10 +258,6 @@ class _AppShellState extends State<AppShell> {
     );
   }
 
-  Future<void> _chooseLanguage(AppLanguageMode mode) async {
-    await widget.controller.saveLanguageMode(mode);
-  }
-
   void _showAbout() {
     final l10n = context.l10n;
     showAboutDialog(
@@ -205,6 +269,10 @@ class _AppShellState extends State<AppShell> {
       ),
       children: <Widget>[Text(l10n.helpAboutBody)],
     );
+  }
+
+  void _showLicenses() {
+    showLicensePage(context: context, applicationName: context.l10n.appTitle);
   }
 
   Future<void> _showQualityLimits() async {
@@ -224,8 +292,31 @@ class _AppShellState extends State<AppShell> {
     );
   }
 
-  Future<bool> _requestClose() async {
-    if (!mounted || _closing) return false;
+  Future<bool> _requestClose() {
+    final pending = _closeFuture;
+    if (pending != null) return pending;
+    if (!mounted || !widget.platform.managedShutdown) {
+      return Future<bool>.value(false);
+    }
+    final future = _confirmAndShutdown().catchError((Object error) {
+      if (mounted) {
+        _setClosing(false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(localizedError(context.l10n, error))),
+        );
+      }
+      return false;
+    });
+    _closeFuture = future;
+    unawaited(
+      future.then((closed) {
+        if (!closed && identical(_closeFuture, future)) _closeFuture = null;
+      }),
+    );
+    return future;
+  }
+
+  Future<bool> _confirmAndShutdown() async {
     final l10n = context.l10n;
     final activeJobs =
         widget.controller.jobs?.where((job) => job.isActive).length ?? 0;
@@ -258,7 +349,7 @@ class _AppShellState extends State<AppShell> {
       ),
     );
     if (accepted != true || !mounted) return false;
-    setState(() => _closing = true);
+    _setClosing(true);
     final messenger = ScaffoldMessenger.of(context);
     messenger.showSnackBar(
       SnackBar(
@@ -282,7 +373,7 @@ class _AppShellState extends State<AppShell> {
     } catch (error) {
       if (mounted) {
         messenger.hideCurrentSnackBar();
-        setState(() => _closing = false);
+        _setClosing(false);
         messenger.showSnackBar(
           SnackBar(content: Text(localizedError(context.l10n, error))),
         );
@@ -291,86 +382,13 @@ class _AppShellState extends State<AppShell> {
     }
   }
 
-  Widget _menuBar(BuildContext context) {
-    final l10n = context.l10n;
-    return MenuBar(
-      children: <Widget>[
-        SubmenuButton(
-          menuChildren: <Widget>[
-            if (widget.platform.canOpenWeb)
-              MenuItemButton(
-                onPressed: _closing ? null : _openWeb,
-                leadingIcon: const Icon(Icons.open_in_browser_outlined),
-                child: Text(l10n.menuOpenWeb),
-              ),
-            if (widget.platform.supportsNativePicker)
-              MenuItemButton(
-                onPressed: _closing ? null : () => unawaited(_requestClose()),
-                leadingIcon: const Icon(Icons.close),
-                child: Text(l10n.closeConfirmAction),
-              ),
-            if (!widget.platform.canOpenWeb &&
-                !widget.platform.supportsNativePicker)
-              MenuItemButton(
-                onPressed: null,
-                child: Text(l10n.desktopActionsUnavailable),
-              ),
-          ],
-          child: Text(l10n.menuFile),
-        ),
-        SubmenuButton(
-          menuChildren: <Widget>[
-            MenuItemButton(
-              onPressed: () => _select(0),
-              child: Text(l10n.navWorkbench),
-            ),
-            MenuItemButton(
-              onPressed: () => _select(1),
-              child: Text(l10n.navJobs),
-            ),
-            MenuItemButton(
-              onPressed: () => _select(2),
-              child: Text(l10n.navSettings),
-            ),
-            SubmenuButton(
-              menuChildren: <Widget>[
-                MenuItemButton(
-                  onPressed: () => _chooseLanguage(AppLanguageMode.system),
-                  child: Text(l10n.languageSystem),
-                ),
-                MenuItemButton(
-                  onPressed: () => _chooseLanguage(AppLanguageMode.zh),
-                  child: Text(l10n.languageZh),
-                ),
-                MenuItemButton(
-                  onPressed: () => _chooseLanguage(AppLanguageMode.en),
-                  child: Text(l10n.languageEn),
-                ),
-              ],
-              child: Text(l10n.menuLanguage),
-            ),
-          ],
-          child: Text(l10n.menuView),
-        ),
-        SubmenuButton(
-          menuChildren: <Widget>[
-            MenuItemButton(onPressed: _showAbout, child: Text(l10n.helpAbout)),
-            MenuItemButton(
-              onPressed: _showQualityLimits,
-              child: Text(l10n.helpQualityTitle),
-            ),
-          ],
-          child: Text(l10n.menuHelp),
-        ),
-      ],
-    );
-  }
-
   @override
   Widget build(BuildContext context) => LayoutBuilder(
     builder: (context, constraints) {
-      final compact = constraints.maxWidth < 800;
-      final extendedRail = constraints.maxWidth >= 1100;
+      final bottomNavigation =
+          !widget.platform.isNativeDesktop && constraints.maxWidth < 800;
+      final expandedSidebar =
+          _sidebarLabelsPreferred && constraints.maxWidth >= 1100;
       final pages = <Widget>[
         WorkbenchScreen(
           controller: widget.controller,
@@ -380,85 +398,55 @@ class _AppShellState extends State<AppShell> {
         SettingsScreen(
           controller: widget.controller,
           platform: widget.platform,
+          onNavigate: _select,
+          onOpenWeb: _openWeb,
+          onClose: _requestClose,
+          onAbout: _showAbout,
+          onLicenses: _showLicenses,
+          onQualityLimits: _showQualityLimits,
         ),
       ];
-      return CallbackShortcuts(
-        bindings: <ShortcutActivator, VoidCallback>{
-          const SingleActivator(LogicalKeyboardKey.digit1, control: true): () =>
-              _select(0),
-          const SingleActivator(LogicalKeyboardKey.digit2, control: true): () =>
-              _select(1),
-          const SingleActivator(LogicalKeyboardKey.digit3, control: true): () =>
-              _select(2),
-        },
+      return Focus(
+        autofocus: true,
         child: FocusTraversalGroup(
           child: PopScope<Object?>(
-            canPop: !widget.platform.supportsNativePicker,
+            canPop: !widget.platform.managedShutdown,
             onPopInvokedWithResult: (didPop, result) {
-              if (!didPop && widget.platform.supportsNativePicker) {
+              if (!didPop && widget.platform.managedShutdown) {
                 unawaited(_requestClose());
               }
             },
             child: AbsorbPointer(
               absorbing: _closing,
               child: Scaffold(
-                body: Column(
-                  children: <Widget>[
-                    _menuBar(context),
-                    Expanded(
-                      child: SafeArea(
-                        top: false,
-                        child: Row(
-                          children: <Widget>[
-                            if (!compact)
-                              NavigationRail(
-                                selectedIndex: _selectedIndex,
-                                extended: extendedRail,
-                                minWidth: 80,
-                                minExtendedWidth: 220,
-                                onDestinationSelected: _select,
-                                destinations: <NavigationRailDestination>[
-                                  NavigationRailDestination(
-                                    icon: const Icon(
-                                      Icons.video_library_outlined,
-                                    ),
-                                    selectedIcon: const Icon(
-                                      Icons.video_library,
-                                    ),
-                                    label: Text(context.l10n.navWorkbench),
-                                  ),
-                                  NavigationRailDestination(
-                                    icon: const Icon(Icons.view_list_outlined),
-                                    selectedIcon: const Icon(Icons.view_list),
-                                    label: Text(context.l10n.navJobs),
-                                  ),
-                                  NavigationRailDestination(
-                                    icon: const Icon(Icons.tune_outlined),
-                                    selectedIcon: const Icon(Icons.tune),
-                                    label: Text(context.l10n.navSettings),
-                                  ),
-                                ],
-                              ),
-                            if (!compact)
-                              VerticalDivider(
-                                width: 1,
-                                color: Theme.of(
-                                  context,
-                                ).colorScheme.outlineVariant,
-                              ),
-                            Expanded(
-                              child: IndexedStack(
-                                index: _selectedIndex,
-                                children: pages,
-                              ),
-                            ),
-                          ],
+                body: SafeArea(
+                  child: Row(
+                    children: <Widget>[
+                      if (!bottomNavigation) ...<Widget>[
+                        DesktopSidebar(
+                          selectedIndex: _selectedIndex,
+                          expanded: expandedSidebar,
+                          labelsPreferred: _sidebarLabelsPreferred,
+                          onSelected: _select,
+                          onToggleLabels: () => setState(() {
+                            _sidebarLabelsPreferred = !_sidebarLabelsPreferred;
+                          }),
+                        ),
+                        VerticalDivider(
+                          width: 1,
+                          color: Theme.of(context).colorScheme.outlineVariant,
+                        ),
+                      ],
+                      Expanded(
+                        child: IndexedStack(
+                          index: _selectedIndex,
+                          children: pages,
                         ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
-                bottomNavigationBar: compact
+                bottomNavigationBar: bottomNavigation
                     ? NavigationBar(
                         selectedIndex: _selectedIndex,
                         onDestinationSelected: _select,

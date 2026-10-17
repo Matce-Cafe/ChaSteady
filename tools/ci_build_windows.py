@@ -108,7 +108,9 @@ class ValidationError(RuntimeError):
 CI_STAGES = frozenset({
     "checkout", "toolchain_report", "flutter_report", "font_report", "worker_report",
     "stage_ui", "flutter_environment", "flutter_version", "flutter_pub", "flutter_l10n",
-    "flutter_windows", "native_toolchain", "flutter_web", "native_outputs", "worker_runtime",
+    "flutter_analyze", "flutter_test", "flutter_windows", "native_toolchain", "flutter_web",
+    "native_outputs", "native_fixture_configure", "native_fixture_build", "native_fixture_run",
+    "worker_runtime",
     "local_math_identity", "stage_app", "worker_build_and_smoke", "worker_inventory",
     "bundle_license_texts", "bundle_metadata", "bundle_legal_notices", "public_inventory",
     "artifact_zip", "artifact_manifest", "flutter_preflight_result",
@@ -137,6 +139,8 @@ SAFE_VALIDATION_CODES = {
     "Noto Sans SC provenance or OFL license failed its pinned identity": "CI_FONT_LICENSE_IDENTITY",
     "The binary Noto font must not be committed in the public source checkout": "CI_FONT_IN_SOURCE",
     "Locked Flutter UI dependency graph is required": "CI_UI_LOCKFILE_MISSING",
+    "Required Flutter UI analysis or tests did not execute": "CI_UI_CHECKS_MISSING",
+    "Windows fixture output is missing or is not a regular file": "CI_WINDOW_FIXTURE_OUTPUT",
     "A runner-provided Git executable is required for the audited Flutter shim": "CI_FLUTTER_GIT_MISSING",
     "Pinned Flutter SDK did not return its machine-readable version": "CI_FLUTTER_VERSION_JSON",
     "Executed Flutter/Dart versions differ from the pinned stable SDK": "CI_FLUTTER_VERSION_IDENTITY",
@@ -161,10 +165,14 @@ SAFE_VALIDATION_CODES = {
     "Public app bundle font or corresponding OFL license differs from its pinned identity": "CI_BUNDLE_FONT_IDENTITY",
     "Staged app bundle has duplicate relative file names": "CI_BUNDLE_DUPLICATE_PATH",
 }
-for _flutter_stage in ("bootstrap", "version", "pub", "l10n", "windows", "web"):
+for _flutter_stage in ("bootstrap", "version", "pub", "l10n", "analyze", "test", "windows", "web"):
     SAFE_VALIDATION_CODES[
         "Flutter {} exited unsuccessfully; raw runner-local logs are not uploaded".format(_flutter_stage)
     ] = "CI_FLUTTER_{}_EXIT".format(_flutter_stage.upper())
+for _fixture_stage in ("configure", "build", "run"):
+    SAFE_VALIDATION_CODES[
+        "Windows fixture {} exited unsuccessfully; raw runner-local logs are not uploaded".format(_fixture_stage)
+    ] = "CI_WINDOW_FIXTURE_{}_EXIT".format(_fixture_stage.upper())
 
 
 def mark_ci_stage(args, stage: str) -> None:
@@ -1093,6 +1101,76 @@ def run_flutter_preflight(args) -> dict:
     return receipt
 
 
+def run_window_fixture_step(label: str, command: list[str], source: Path,
+                            environment: dict, stage: Path, timeout: int) -> None:
+    if label not in {"configure", "build", "run"}:
+        raise ValueError("Unknown internal window fixture stage")
+    registry = OwnedProcessRegistry(threading.Event())
+    stdout_path = stage / ("window-fixture-" + label + ".stdout.log")
+    stderr_path = stage / ("window-fixture-" + label + ".stderr.log")
+    try:
+        with registry_scope(registry):
+            with stdout_path.open("xb") as stdout, stderr_path.open("xb") as stderr:
+                process = spawn_owned_process(command, cwd=str(source), env=environment,
+                                              stdout=stdout, stderr=stderr, stdin=subprocess.DEVNULL)
+                code = process.wait(timeout=timeout)
+                registry.discard(process)
+    finally:
+        if registry.snapshot():
+            registry.terminate_all()
+    if code != 0:
+        raise ValidationError(
+            "Windows fixture {} exited unsuccessfully; raw runner-local logs are not uploaded".format(label))
+
+
+def run_native_window_fixture(args, source: Path, environment: dict,
+                              stage: Path, toolchain_report: dict) -> dict:
+    build_root = source / "build" / "windows" / "x64"
+    cmake = str(Path(toolchain_report["cmake_path"]))
+    mark_ci_stage(args, "native_fixture_configure")
+    run_window_fixture_step("configure", [cmake, "-S", str(source / "windows"), "-B", str(build_root),
+                            "-DCHASTEADY_BUILD_WINDOW_CHROME_SMOKE=ON"],
+                            source, environment, stage, timeout=300)
+    # Reconfiguration must retain the same audited VS2026/MSVC/SDK combination.
+    validate_flutter_windows_toolchain(build_root, toolchain_report)
+    mark_ci_stage(args, "native_fixture_build")
+    run_window_fixture_step("build", [cmake, "--build", str(build_root), "--config", "Release",
+                            "--target", "chasteady_window_chrome_smoke"],
+                            source, environment, stage, timeout=600)
+    executable = build_root / "native_smoke" / "Release" / "chasteady_window_chrome_smoke.exe"
+    if (not executable.is_file() or is_reparse(executable)
+            or not executable.resolve(strict=True).is_relative_to(build_root.resolve(strict=True))):
+        raise ValidationError("Windows fixture output is missing or is not a regular file")
+    mark_ci_stage(args, "native_fixture_run")
+    run_window_fixture_step("run", [str(executable)], source, environment, stage, timeout=60)
+    return {"passed": True, "scope": "owned_win32_window_chrome_fixture_only",
+            "production_app_runtime_verified": False, "snap_flyout_verified": False,
+            "multi_monitor_dpi_verified": False}
+
+
+def run_flutter_ui_build(args, sdk_root: Path, source: Path, environment: dict,
+                         stage: Path, toolchain_report: dict) -> tuple[dict, dict]:
+    checks = {"flutter_analyze_passed": False, "flutter_tests_passed": False}
+    actual_windows_toolchain = None
+    for label, command in build_windows.flutter_commands(build_only=False):
+        mark_ci_stage(args, "flutter_" + label)
+        run_flutter(label, sdk_root, command, source, environment, stage,
+                    timeout=3600 if label in ("windows", "web") else 1200)
+        if label == "analyze":
+            checks["flutter_analyze_passed"] = True
+        elif label == "test":
+            checks["flutter_tests_passed"] = True
+        elif label == "windows":
+            mark_ci_stage(args, "native_toolchain")
+            actual_windows_toolchain = validate_flutter_windows_toolchain(
+                source / "build" / "windows" / "x64", toolchain_report)
+    if not all(checks.values()):
+        raise ValidationError("Required Flutter UI analysis or tests did not execute")
+    if actual_windows_toolchain is None:
+        raise ValidationError("Flutter did not execute the required Windows release build")
+    return actual_windows_toolchain, checks
+
+
 def run_build(args) -> dict:
     mark_ci_stage(args, "checkout")
     root = args.root.resolve(strict=True)
@@ -1146,17 +1224,10 @@ def run_build(args) -> dict:
     sdk_root = Path(flutter_result["sdk_root"])
     mark_ci_stage(args, "flutter_version")
     version_info = flutter_version_check(sdk_root, flutter_source, flutter_env, stage)
-    actual_windows_toolchain = None
-    for label, command in build_windows.flutter_commands(build_only=True):
-        mark_ci_stage(args, "flutter_" + label)
-        run_flutter(label, sdk_root, command, flutter_source, flutter_env, stage,
-                    timeout=3600 if label in ("windows", "web") else 1200)
-        if label == "windows":
-            mark_ci_stage(args, "native_toolchain")
-            actual_windows_toolchain = validate_flutter_windows_toolchain(
-                flutter_source / "build" / "windows" / "x64", toolchain_report)
-    if actual_windows_toolchain is None:
-        raise ValidationError("Flutter did not execute the required Windows release build")
+    actual_windows_toolchain, ui_checks = run_flutter_ui_build(
+        args, sdk_root, flutter_source, flutter_env, stage, toolchain_report)
+    native_window_fixture = run_native_window_fixture(
+        args, flutter_source, flutter_env, stage, toolchain_report)
 
     mark_ci_stage(args, "native_outputs")
     web_root = flutter_source / "build" / "web"
@@ -1199,7 +1270,9 @@ def run_build(args) -> dict:
         "worker_packaged": True,
         "web_assets_packaged": True,
         "build_only": True,
-        "prebuild_ui_analyze_or_tests_run": False,
+        "prebuild_ui_analyze_or_tests_run": all(ui_checks.values()),
+        "ui_checks": ui_checks,
+        "native_window_fixture": native_window_fixture,
         "backend_tests": backend_summary,
         "local_validation_origin": sidecar_summary["local_validation_origin"],
         "private_goldens_rerun_in_ci": False,
@@ -1275,7 +1348,9 @@ def run_build(args) -> dict:
             "worker_source_inventory_sha256": sidecar_summary["worker_source_inventory_sha256"],
             "copied_license_text_count": len(copied_license_texts),
             "private_goldens_rerun_in_ci": False,
-            "ui_analyze_or_tests_run": False,
+            "ui_analyze_or_tests_run": all(ui_checks.values()),
+            "ui_checks": ui_checks,
+            "native_window_fixture": native_window_fixture,
             "native_application_runtime_verified": False,
             "public_distribution_cleared": False,
             "signed": False,

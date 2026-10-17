@@ -16,11 +16,13 @@ class TextureRegistrar;
 namespace chasteady {
 
 // Windows MethodChannel bridge for chasteady/native. Construct it on the
-// Flutter/platform thread after the HWND, BinaryMessenger, and texture
-// registrar exist, and destroy it before those runner objects are destroyed.
+// Flutter/platform thread after the owned HWND, parented Flutter child,
+// BinaryMessenger, and texture registrar exist; destroy it before those runner
+// objects. Custom chrome is opt-in and independent of managed worker shutdown.
 class NativeBridge final {
  public:
   NativeBridge(HWND owner_window,
+               HWND flutter_child,
                flutter::BinaryMessenger* messenger,
                flutter::TextureRegistrar* texture_registrar);
   ~NativeBridge();

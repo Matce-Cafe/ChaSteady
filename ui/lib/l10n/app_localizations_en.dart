@@ -21,6 +21,46 @@ class AppLocalizationsEn extends AppLocalizations {
   String get navSettings => 'Settings';
 
   @override
+  String get sidebarShowLabels => 'Show navigation labels';
+
+  @override
+  String get sidebarHideLabels => 'Hide navigation labels';
+
+  @override
+  String get settingsApplication => 'Application';
+
+  @override
+  String get settingsNavigation => 'Pages · Ctrl+1 / Ctrl+2 / Ctrl+3';
+
+  @override
+  String get settingsLicenses => 'Open-source licenses';
+
+  @override
+  String get languageSavesImmediately =>
+      'Language changes save separately from tool paths.';
+
+  @override
+  String get windowDrag => 'Drag window';
+
+  @override
+  String get windowPin => 'Keep window on top';
+
+  @override
+  String get windowUnpin => 'Stop keeping window on top';
+
+  @override
+  String get windowMinimize => 'Minimize';
+
+  @override
+  String get windowMaximize => 'Maximize';
+
+  @override
+  String get windowRestore => 'Restore';
+
+  @override
+  String get windowClose => 'Close';
+
+  @override
   String get menuFile => 'File';
 
   @override

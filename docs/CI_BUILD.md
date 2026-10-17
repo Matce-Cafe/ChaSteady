@@ -27,14 +27,18 @@ Both that early check and the later full build use the same version preparation:
 
 The official child-only `FLUTTER_SUPPRESS_ANALYTICS=true` switch selects NoOp analytics, independently preventing the first-run telemetry notice. Normal version/bootstrap operations can still write SDK caches and isolated tool state; this is not a zero-cache-write claim or a patched SDK. Failed version checks expose only fixed stages/codes and numeric/boolean output shape (byte counts, UTF-8/BOM and JSON-error position, known launcher-marker flags), never arbitrary raw stdout, credentials, command arguments or vendor/private paths. The full build independently revalidates all original toolchain, source/runtime identity, Worker, packaging and inventory gates after the early check.
 
-The UI build pipeline then runs only:
+The UI build pipeline then runs, in order:
 
 1. `flutter pub get --enforce-lockfile`
 2. `flutter gen-l10n`
-3. `flutter build windows --release`
-4. `flutter build web --release --no-web-resources-cdn --pwa-strategy=none`
+3. `flutter analyze --no-pub`
+4. `flutter test --no-pub --reporter expanded`
+5. `flutter build windows --release`
+6. `flutter build web --release --no-web-resources-cdn --pwa-strategy=none`
 
-It does not run UI analysis, UI tests, a browser, GUI acceptance, or video export. Flutter/Dart state and the audited `$git` shim are child-process scoped; Git and pub caches live under the runner's temporary build tree.
+Analysis and all discovered Flutter tests must succeed before either release build. Their fixed `flutter_analyze` / `flutter_test` stages and `CI_FLUTTER_ANALYZE_EXIT` / `CI_FLUTTER_TEST_EXIT` failure codes do not expose raw runner-local logs. Omitting either check cannot yield a successful bundle. Only successful execution sets the separate `ui_checks` facts in the build status and manifest; these are not desktop-window, player, browser, or video-export runtime acceptance. The job remains build-only in that sense. Flutter/Dart state and the audited `$git` shim are child-process scoped; Git and pub caches live under the runner's temporary build tree.
+
+CI also enables the normally-off `CHASTEADY_BUILD_WINDOW_CHROME_SMOKE` target using the same audited CMake executable and existing VS2026 build cache, revalidates the configured toolchain, builds the standalone window-chrome fixture and runs it with a bounded owned process. It creates only its own Win32 owner/child windows; it does not enumerate, inject input into, or close an existing application. Its EXE/PDB stay under `native_smoke/Release`, outside the installed application output and ZIP. A separate `native_window_fixture` result explicitly means only this fixture passed: real Flutter app button interaction, Windows 11 Snap flyouts and multi-monitor DPI acceptance remain unverified. Configure/build/run failures expose only fixed stages and safe codes, not raw local logs.
 
 For the Worker, CI provisions the current pinned isolated CPython runtime from the repository root, reruns all discovered backend tests, builds a fresh PyInstaller one-folder Worker from source, and runs the existing bounded stdio/loopback HTTP smoke and file-inventory checks. It never uses a prebuilt local Worker.
 
