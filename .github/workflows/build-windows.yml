@@ -157,6 +157,8 @@ jobs:
       - name: Fetch and verify the pinned Noto font as ephemeral data
         if: ${{ !inputs.window_fixture_only }}
         id: font
+        env:
+          CHASTEADY_CI_FONT_GITHUB_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'

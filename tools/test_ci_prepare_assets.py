@@ -143,6 +143,49 @@ class CiFontAssetTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "identity"):
                 ci.download_font(self.root / "wrong-font.ttf")
 
+    def test_explicit_step_credential_is_bound_to_pinned_request_and_not_receipt(self):
+        payload = make_ttf_fixture()
+        token = "ghs_" + "a" * 36
+        opener = mock.Mock()
+        opener.open.return_value = FakeResponse(payload)
+        with mock.patch.dict(ci.os.environ, {"CHASTEADY_CI_FONT_GITHUB_TOKEN": token}), \
+                mock.patch.object(ci, "build_opener", return_value=opener) as build, \
+                mock.patch.object(ci, "FONT_BYTES", len(payload)), \
+                mock.patch.object(ci, "FONT_BLOB_SHA1", ci.git_blob_sha1(payload)), \
+                mock.patch.object(ci, "FONT_SHA256", hashlib.sha256(payload).hexdigest()):
+            result = ci.download_font(self.root / "authenticated-font.ttf")
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.full_url, ci.FONT_URL)
+        self.assertEqual(request.get_header("Authorization"), "Bearer " + token)
+        self.assertNotIn(token, str(result))
+        self.assertTrue(any(isinstance(handler, ci.NoRedirect) for handler in build.call_args.args))
+        self.assertIsNone(ci.NoRedirect().redirect_request(request, None, 302, "redirect", {}, "https://example.invalid/"))
+        opener.open.assert_called_once()
+
+    def test_invalid_credential_is_rejected_without_echo_or_network(self):
+        for value in ("ghs_" + "a" * 36 + "\r\nX-Injected: private", "x" * 513, "short", "private secret value"):
+            with mock.patch.dict(ci.os.environ, {"CHASTEADY_CI_FONT_GITHUB_TOKEN": value}), \
+                    mock.patch.object(ci, "build_opener") as build, self.assertRaises(ValueError) as failure:
+                ci.download_font(self.root / "never-created.ttf")
+            self.assertNotIn(value, str(failure.exception))
+            build.assert_not_called()
+        with mock.patch.dict(ci.os.environ, {"GH_TOKEN": "ghp_" + "b" * 36, "GITHUB_TOKEN": "ghs_" + "c" * 36}, clear=True), \
+                mock.patch.object(ci, "build_opener") as build:
+            build.return_value.open.side_effect = ci.HTTPError(ci.FONT_URL, 302, "redirect", {}, None)
+            with self.assertRaisesRegex(RuntimeError, "redirect"):
+                ci.download_font(self.root / "redirect-font.ttf")
+            self.assertIsNone(build.return_value.open.call_args.args[0].get_header("Authorization"))
+            build.return_value.open.assert_called_once()
+
+    def test_workflow_font_credential_is_step_scoped_with_read_only_permissions(self):
+        workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/build-windows.yml").read_text(encoding="utf-8")
+        font = workflow[workflow.index("      - name: Fetch and verify the pinned Noto font"):].split("\n      - name:", 1)[0]
+        self.assertIn("        env:\n          CHASTEADY_CI_FONT_GITHUB_TOKEN: ${{ github.token }}", font)
+        self.assertEqual(workflow.count("CHASTEADY_CI_FONT_GITHUB_TOKEN"), 1)
+        self.assertIn("permissions:\n  contents: read", workflow)
+        self.assertNotIn("contents: write", workflow)
+        self.assertNotIn("--token", font)
+
     def test_font_download_directory_is_new_unique_and_empty(self):
         first = ci.new_empty_uuid_dir(self.root / "font-cache", "font-")
         second = ci.new_empty_uuid_dir(self.root / "font-cache", "font-")
