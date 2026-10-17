@@ -277,10 +277,41 @@ class CiBuildWindowsTests(unittest.TestCase):
                            workflow.index("- name: Verify Flutter executable identity")]
         self.assertIn("$scratch = Join-Path $ciRoot 'f'", flutter)
         guid = "a" * 32
-        sdk = ci.ntpath.join("D:/a/_temp", "cs-" + guid, "f", "extractions", "flutter-3.47.7-" + guid, "flutter")
-        self.assertEqual(len(sdk), 116)
-        # The observed failing SDK-dev path was 113 characters below its SDK root.
-        self.assertLess(len(sdk) + 113, 260)
+        sdk = ci.ntpath.join("D:/a/_temp", "cs-" + guid, "f", "e", "f-" + guid, "flutter")
+        self.assertEqual(len(sdk), 93)
+        # Read-only full subtree metadata measured a 146-unit directory suffix.
+        self.assertLess(len(sdk) + 146, 240)
+
+    def test_flutter_result_binds_compact_extraction_root_and_numeric_path_budget(self):
+        scratch = self.root / "scratch"
+        extracted = scratch / "e" / ("f-" + "a" * 32)
+        sdk = extracted / "flutter"
+        download = scratch / "downloads" / ("flutter-3.47.7-" + "b" * 32)
+        download.mkdir(parents=True)
+        for name in ("bin/flutter.bat", "bin/cache/dart-sdk/bin/dart.exe"):
+            file = sdk / name
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_bytes(b"metadata fixture only; never executed")
+        result = {"schema_version": 1, "version": "3.47.7", "channel": "stable",
+                  "archive": ci.ci_provision_flutter.FLUTTER_ARCHIVE,
+                  "archive_url": ci.ci_provision_flutter.FLUTTER_URL,
+                  "archive_sha256": ci.ci_provision_flutter.FLUTTER_SHA256,
+                  "archive_bytes": ci.ci_provision_flutter.FLUTTER_ARCHIVE_BYTES,
+                  "sdk_root": str(sdk), "download_directory": str(download),
+                  "extraction_directory": str(extracted),
+                  "archive_audit": {"entry_count": 2,
+                                    "analyzer_path_budget": ci.ci_provision_flutter.analyzer_path_budget(extracted, [])}}
+        report = self.root / "result.json"
+        report.write_text(json.dumps(result), encoding="utf-8")
+        self.assertEqual(ci.validate_flutter_result(report, scratch), result)
+        for malformed in (None, {}, {**result["archive_audit"]["analyzer_path_budget"], "limit_exclusive": 260},
+                          {**result["archive_audit"]["analyzer_path_budget"], "sdk_root_utf16_units": 1}):
+            bad = copy.deepcopy(result)
+            bad["archive_audit"]["analyzer_path_budget"] = malformed
+            report.write_text(json.dumps(bad), encoding="utf-8")
+            with self.subTest(budget=malformed), self.assertRaises(ci.ValidationError) as failure:
+                ci.validate_flutter_result(report, scratch)
+            self.assertIn("CI_FLUTTER_PATH_BUDGET", ci.ci_failure_diagnostic(failure.exception, "flutter_report"))
 
     def test_flutter_json_shape_diagnostic_never_prints_vendor_text_paths_or_credentials(self):
         private = b"D:\\private-fixture\\profile.json bearer=not-for-public-logs"

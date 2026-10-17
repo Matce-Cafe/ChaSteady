@@ -133,6 +133,7 @@ SAFE_VALIDATION_CODES = {
     "Flutter provisioning report has missing or unknown fields": "CI_FLUTTER_REPORT_SCHEMA",
     "Flutter provisioning report differs from the pinned official stable archive": "CI_FLUTTER_ARCHIVE_IDENTITY",
     "Flutter SDK paths escaped their isolated download/extraction roots": "CI_FLUTTER_REPORT_PATHS",
+    "Flutter analyzer directory-path budget is missing or inconsistent": "CI_FLUTTER_PATH_BUDGET",
     "Flutter preflight stage overlaps SDK or source files": "CI_FLUTTER_PREFLIGHT_STAGE",
     "CI output directory must be new and non-reparse": "CI_STAGE_OUTPUT_NOT_NEW",
     "Pinned font acquisition report has missing or unknown fields": "CI_FONT_REPORT_SCHEMA",
@@ -557,7 +558,7 @@ def validate_flutter_result(path: Path, scratch_root: Path) -> dict:
     sdk_root = Path(result["sdk_root"]).resolve(strict=True)
     extraction = Path(result["extraction_directory"]).resolve(strict=True)
     downloads = Path(result["download_directory"]).resolve(strict=True)
-    if (not extraction.is_relative_to((scratch / "extractions").resolve(strict=True))
+    if (not extraction.is_relative_to((scratch / "e").resolve(strict=True))
             or not downloads.is_relative_to((scratch / "downloads").resolve(strict=True))
             or sdk_root != extraction / "flutter"):
         raise ValidationError("Flutter SDK paths escaped their isolated download/extraction roots")
@@ -567,6 +568,20 @@ def validate_flutter_result(path: Path, scratch_root: Path) -> dict:
     audit = result["archive_audit"]
     if not isinstance(audit, dict) or type(audit.get("entry_count")) is not int or audit["entry_count"] <= 0:
         raise ValidationError("Flutter ZIP audit summary is missing")
+    budget = audit.get("analyzer_path_budget")
+    maxima = budget.get("subtree_directory_suffix_utf16_max") if type(budget) is dict else None
+    if (type(budget) is not dict or set(budget) != {"sdk_root_utf16_units", "subtree_directory_suffix_utf16_max",
+                                                   "longest_combined_directory_utf16_units", "limit_exclusive"}
+            or type(maxima) is not dict or set(maxima) != {"dev", "examples", "packages"}
+            or any(type(value) is not int or value < 0 for value in maxima.values())
+            or type(budget.get("sdk_root_utf16_units")) is not int
+            or type(budget.get("limit_exclusive")) is not int
+            or budget.get("sdk_root_utf16_units") != len(str(sdk_root).encode("utf-16-le")) // 2
+            or budget.get("limit_exclusive") != 240
+            or type(budget.get("longest_combined_directory_utf16_units")) is not int
+            or budget["longest_combined_directory_utf16_units"] != budget["sdk_root_utf16_units"] + max(maxima.values())
+            or budget["longest_combined_directory_utf16_units"] >= 240):
+        raise ValidationError("Flutter analyzer directory-path budget is missing or inconsistent")
     return result
 
 
