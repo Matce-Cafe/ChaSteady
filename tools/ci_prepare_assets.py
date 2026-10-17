@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import ssl
 import struct
@@ -201,12 +202,19 @@ def download_font(destination: Path) -> dict:
     _assert_approved_url(FONT_URL)
     if destination.exists() or is_reparse(destination):
         raise FileExistsError("Pinned font download target must be a new regular file")
-    opener = build_opener(HTTPSHandler(context=ssl.create_default_context()), NoRedirect())
-    request = Request(FONT_URL, headers={
+    headers = {
         "User-Agent": "ChaSteady-Windows-CI/1.0",
         "Accept": "application/vnd.github.raw+json",
         "Accept-Encoding": "identity",
-    })
+    }
+    # Only the explicit step-scoped CI credential is used, never a local PAT.
+    token = os.environ.get("CHASTEADY_CI_FONT_GITHUB_TOKEN", "")
+    if token:
+        if not re.fullmatch(r"[A-Za-z0-9_]{20,512}", token):
+            raise ValueError("CI font credential has an invalid header format")
+        headers["Authorization"] = "Bearer " + token
+    opener = build_opener(HTTPSHandler(context=ssl.create_default_context()), NoRedirect())
+    request = Request(FONT_URL, headers=headers)
     sha256 = hashlib.sha256()
     total = 0
     try:
