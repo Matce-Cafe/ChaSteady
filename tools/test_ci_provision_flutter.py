@@ -217,7 +217,7 @@ class FlutterProvisionTests(unittest.TestCase):
         with self.pin_fixture(archive_path, payload), mock.patch.object(ci, "download_archive", side_effect=copy_download):
             result = ci.provision(scratch)
         extracted = Path(result["extraction_directory"])
-        self.assertEqual(extracted.parent, scratch / "e")
+        self.assertEqual(extracted.parent, scratch.resolve(strict=True) / "e")
         self.assertRegex(extracted.name, r"^f-[0-9a-f]{32}$")
         self.assertNotEqual(Path(result["download_directory"]), extracted)
         sdk = Path(result["sdk_root"])

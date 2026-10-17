@@ -284,6 +284,8 @@ class CiBuildWindowsTests(unittest.TestCase):
 
     def test_flutter_result_binds_compact_extraction_root_and_numeric_path_budget(self):
         scratch = self.root / "scratch"
+        scratch.mkdir()
+        scratch = scratch.resolve(strict=True)
         extracted = scratch / "e" / ("f-" + "a" * 32)
         sdk = extracted / "flutter"
         download = scratch / "downloads" / ("flutter-3.47.7-" + "b" * 32)
