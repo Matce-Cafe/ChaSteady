@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
+import ntpath
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -692,13 +693,52 @@ def run_flutter(label: str, sdk_root: Path, args: list[str], cwd: Path, env: dic
         if registry.snapshot():
             registry.terminate_all()
     if code != 0:
-        flutter_json_shape_diagnostic(stdout_path.read_bytes(), stderr_path, RuntimeError(), exit_code=code)
+        flutter_json_shape_diagnostic(stdout_path.read_bytes(), stderr_path, RuntimeError(), exit_code=code,
+                                      path_roots={"sdk": str(sdk_root), "source": str(cwd),
+                                                  "temp": env.get("TEMP", ""), "pub_cache": env.get("PUB_CACHE", ""),
+                                                  "userprofile": env.get("USERPROFILE", "")})
         raise ValidationError("Flutter {} exited unsuccessfully; raw runner-local logs are not uploaded".format(label))
     return stdout_path.read_bytes()
 
 
+def flutter_quoted_path_shapes(sample: bytes, roots: dict | None) -> list[dict]:
+    """Classify text lexically; never stat/open a vendor-controlled path."""
+    safe_scopes = {"sdk", "source", "temp", "pub_cache", "userprofile"}
+    normalized_roots = {key: ntpath.normcase(ntpath.normpath(value)) for key, value in (roots or {}).items()
+                        if key in safe_scopes and type(value) is str and ntpath.isabs(value)}
+    known_leaves = {"pubspec.yaml", "analysis_options.yaml", "package_config.json", "dart.exe",
+                    "dartaotruntime.exe", "analysis_server.dart.snapshot", "analysis_server_aot.dart.snapshot"}
+    text = sample.decode("utf-8", errors="replace")
+    seen, shapes = set(), []
+    for match in re.finditer(r"[\"']((?:\\\\\?\\)?[A-Za-z]:[\\/][^\"'\r\n]{0,4095})[\"']", text):
+        value = match[1]
+        if value in seen:
+            continue
+        seen.add(value)
+        extended = value.startswith("\\\\?\\")
+        normalized = ntpath.normcase(ntpath.normpath(value[4:] if extended else value))
+        scope = "other"
+        for name, root in sorted(normalized_roots.items(), key=lambda item: len(item[1]), reverse=True):
+            if normalized == root or normalized.startswith(root.rstrip("\\/") + "\\"):
+                scope = name
+                break
+        leaf = ntpath.basename(normalized)
+        subtree = None
+        if scope == "sdk":
+            first = ntpath.relpath(normalized, normalized_roots["sdk"]).split("\\", 1)[0]
+            subtree = first if first in {"dev", "examples", "packages", "bin"} else "other"
+        shapes.append({"scope": scope, "sdk_subtree": subtree,
+                       "characters": len(value), "over_260_characters": len(value) >= 260,
+                       "contains_spaces": " " in value, "ascii_only": value.isascii(),
+                       "extended_prefix": extended,
+                       "known_leaf": leaf if leaf in known_leaves else None})
+        if len(shapes) == 4:
+            break
+    return shapes
+
+
 def flutter_json_shape_diagnostic(raw: bytes, stderr_path: Path, error: Exception,
-                                  exit_code: int | None = None) -> None:
+                                  exit_code: int | None = None, path_roots: dict | None = None) -> None:
     """Print bounded shape and fixed startup markers, never child output or paths."""
     stderr_bytes, stderr_sample = None, b""
     try:
@@ -729,6 +769,16 @@ def flutter_json_shape_diagnostic(raw: bytes, stderr_path: Path, error: Exceptio
     startup_markers = {
         "process_exception": b"ProcessException:",
         "filesystem_exception": b"FileSystemException:",
+        "path_not_found_exception": b"PathNotFoundException:",
+        "directory_listing_failed": b"Directory listing failed",
+        "flutter_failed_list_directory": b"Flutter failed to list directory at",
+        "flutter_file_or_directory_missing": b"The file or directory could not be found.",
+        "temporary_directory_failed": b"Creation of temporary directory failed",
+        "flutter_failed_create_temporary": b"Flutter failed to create a temporary directory with prefix",
+        "system_temp_directory": b"Your system temp directory (",
+        "getting_cwd_failed": b"Getting current working directory failed",
+        "unable_read_cwd": b"Unable to read current working directory",
+        "flutter_failed_run": b'Flutter failed to run "',
         "socket_exception": b"SocketException:",
         "analysis_server_exception": b"AnalysisServerException:",
         "analysis_server_aot_snapshot": b"analysis_server_aot.dart.snapshot",
@@ -752,6 +802,10 @@ def flutter_json_shape_diagnostic(raw: bytes, stderr_path: Path, error: Exceptio
     reported_errors = {int(match[1]) for match in re.finditer(
         rb"\b(?:errno|errorCode)\s*[:=]\s*(-?[0-9]{1,10})(?![0-9])", stderr_sample)}
     shape["known_os_error_codes"] = sorted(reported_errors & known_errors)
+    shape["quoted_windows_path_shapes"] = flutter_quoted_path_shapes(stderr_sample, path_roots)
+    shape["input_path_characters"] = {key: len(value) for key, value in (path_roots or {}).items()
+                                      if key in {"sdk", "source", "temp", "pub_cache", "userprofile"}
+                                      and type(value) is str}
     print("ChaSteady Flutter JSON diagnostic " + json.dumps(shape, sort_keys=True), flush=True)
 
 
