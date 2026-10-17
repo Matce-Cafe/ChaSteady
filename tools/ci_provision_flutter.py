@@ -299,6 +299,8 @@ def provision(scratch_root: Path) -> dict:
     scratch_root.mkdir(parents=True, exist_ok=True)
     if is_reparse(scratch_root):
         raise ValueError("CI scratch root must not be a reparse point")
+    # Expand Win32 short aliases before measuring paths or writing the receipt.
+    scratch_root = scratch_root.resolve(strict=True)
     downloads = scratch_root / "downloads"
     extractions = scratch_root / "e"
     downloads.mkdir(exist_ok=True)
