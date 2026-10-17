@@ -437,6 +437,14 @@ class CiBuildWindowsTests(unittest.TestCase):
         flutter.assert_not_called()
         worker.assert_not_called()
 
+    def test_window_fixture_child_has_client_baseline_without_weakening_checks(self):
+        source = (Path(ci.ROOT) / "ui/windows/runner/tests/window_chrome_smoke.cpp").read_text(encoding="utf-8")
+        self.assertIn('CreateWindowEx(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_NOTIFY,', source)
+        self.assertIn('Check(Hit(fixture.child, pin) == HTCLIENT, "child retains Flutter control hits")', source)
+        mapping = ci.window_fixture_check_ids()
+        self.assertEqual(len(mapping), 73)
+        self.assertEqual(mapping["child retains Flutter control hits"], "WF026")
+
     def test_window_fixture_diagnostic_is_source_bound_and_never_reflects_raw_stderr(self):
         mapping = ci.window_fixture_check_ids()
         self.assertEqual(len(mapping), 73)

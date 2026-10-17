@@ -1245,7 +1245,7 @@ def run_flutter_preflight(args) -> dict:
     return receipt
 
 
-WINDOW_FIXTURE_SOURCE_SHA256 = "940e62ebc436f3d143128d139cd0ddb4cf041fc978ca7b6df101132a9c78104f"
+WINDOW_FIXTURE_SOURCE_SHA256 = "f1843c2aba3210a5c78e906c6e34ccf2218c2455c202b9aa13cbc5fe3260255f"
 WINDOW_FIXTURE_PASS = ("PASS: geometry, startup stock frame, owned hit testing, signed coordinates, "
                        "min/max/restore, topmost, work area, deduplicated state, child resize, teardown.\n")
 

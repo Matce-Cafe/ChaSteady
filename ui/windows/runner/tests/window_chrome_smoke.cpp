@@ -132,7 +132,9 @@ void OwnedWindowChecks() {
       WS_OVERLAPPEDWINDOW, 60, 60, 960, 640, nullptr, nullptr,
       GetModuleHandle(nullptr), &fixture);
   Check(fixture.owner != nullptr, "create owned fixture");
-  fixture.child = CreateWindowEx(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+  // STATIC defaults to HTTRANSPARENT without SS_NOTIFY. Use client hits so
+  // delegation checks exercise our subclass, not the base control's transparency.
+  fixture.child = CreateWindowEx(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_NOTIFY,
       0, 0, 1, 1, fixture.owner, nullptr, GetModuleHandle(nullptr), nullptr);
   Check(fixture.child != nullptr, "create same-thread fixture child");
   fixture.chrome = std::make_unique<chasteady::WindowChrome>(
