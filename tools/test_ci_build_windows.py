@@ -108,6 +108,122 @@ class CiBuildWindowsTests(unittest.TestCase):
             self.assertTrue(any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                                 and node.func.id == "flutter_version_check" for node in ast.walk(function)))
 
+    def test_ui_only_cli_requires_font_and_stage_and_rejects_build_inputs(self):
+        base = ["--preflight-ui-only", "--flutter-result", str(self.root / "result.json"),
+                "--flutter-scratch", str(self.root / "scratch")]
+        required = {"--preflight-stage": "new-stage", "--font-result": "font.json", "--font-scratch": "font-scratch"}
+        complete = base + [item for flag, value in required.items() for item in (flag, str(self.root / value))]
+        with mock.patch.object(ci, "run_flutter_preflight", return_value={}) as preflight, \
+                mock.patch.object(ci, "run_build") as full:
+            self.assertEqual(ci.main(complete), 0)
+        self.assertTrue(preflight.call_args.args[0].preflight_ui_only)
+        full.assert_not_called()
+        for missing in required:
+            incomplete = base + [item for flag, value in required.items() if flag != missing
+                                 for item in (flag, str(self.root / value))]
+            with self.subTest(missing=missing), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                ci.main(incomplete)
+        for forbidden in ("--toolchain-report", "--worker-manifest", "--math-sidecar", "--artifact-dir"):
+            with self.subTest(forbidden=forbidden), redirect_stderr(io.StringIO()), \
+                    mock.patch.object(ci, "run_flutter_preflight") as preflight, self.assertRaises(SystemExit):
+                ci.main(complete + [forbidden, str(self.root / "forbidden")])
+            preflight.assert_not_called()
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            ci.main(complete + ["--preflight-flutter-only"])
+
+    def test_ui_only_gate_records_only_real_checks_and_cannot_run_builds(self):
+        extraction = self.root / "extraction"
+        sdk = extraction / "flutter"
+        sdk.mkdir(parents=True)
+        downloads = self.root / "downloads"
+        downloads.mkdir()
+        font_result = self.root / "font-result.json"
+        font_result.write_text("{}", encoding="utf-8")
+        font = self.root / "font-scratch" / "font.ttf"
+        font.parent.mkdir()
+        font.write_bytes(b"font fixture; never interpreted")
+        args = SimpleNamespace(root=self.root, flutter_result=self.root / "result.json",
+                               flutter_scratch=self.root / "scratch", preflight_stage=self.root / "new-stage",
+                               preflight_ui_only=True, font_result=font_result, font_scratch=font.parent)
+        provision = {"sdk_root": str(sdk), "extraction_directory": str(extraction),
+                     "download_directory": str(downloads), "archive_sha256": "a" * 64}
+        identity = {"flutter_version": "3.47.7", "dart_version": "3.13.5"}
+        with mock.patch.object(ci, "ROOT", self.root), \
+                mock.patch.object(ci, "validate_flutter_result", return_value=provision), \
+                mock.patch.object(ci, "validate_font_result", return_value={"font_path_for_ephemeral_build_only": font}), \
+                mock.patch.object(ci, "stage_flutter_source", return_value=args.preflight_stage / "ui") as staged, \
+                mock.patch.object(ci, "create_flutter_environment", return_value={}), \
+                mock.patch.object(ci, "flutter_version_check", return_value=identity), \
+                mock.patch.object(ci, "run_flutter", return_value=b"") as run, \
+                mock.patch.object(ci, "run_native_window_fixture") as native, \
+                mock.patch.object(ci, "build_worker") as worker, redirect_stdout(io.StringIO()):
+            result = ci.run_flutter_preflight(args)
+            staged.assert_called_once_with(self.root.resolve(), args.preflight_stage.resolve(), font)
+            self.assertEqual([call.args[0] for call in run.call_args_list], ["pub", "l10n", "analyze", "test"])
+            self.assertEqual(result["scope"], "pinned_flutter_identity_and_ui_checks_only")
+            self.assertTrue(all(result["ui_checks"].values()))
+            self.assertFalse(result["native_build_executed"])
+            self.assertFalse(result["runtime_acceptance_verified"])
+            self.assertEqual(ci.read_json(args.preflight_stage / "flutter-ui-preflight.json"), result)
+            native.assert_not_called()
+            worker.assert_not_called()
+            args.preflight_stage = font.parent / "must-not-write"
+            with self.assertRaises(ci.ValidationError):
+                ci.run_flutter_preflight(args)
+            self.assertFalse(args.preflight_stage.exists())
+
+    def test_ui_checks_only_stop_on_analysis_failure_and_never_report_success(self):
+        def fail_analysis(label, *_args, **_kwargs):
+            if label == "analyze":
+                raise ci.ValidationError("Flutter analyze exited unsuccessfully; raw runner-local logs are not uploaded")
+            return b""
+        with mock.patch.object(ci, "run_flutter", side_effect=fail_analysis) as run, \
+                redirect_stdout(io.StringIO()), self.assertRaises(ci.ValidationError):
+            ci.run_flutter_ui_checks(SimpleNamespace(), self.root, self.root, {}, self.root)
+        self.assertEqual([call.args[0] for call in run.call_args_list], ["pub", "l10n", "analyze"])
+
+    def test_workflow_ui_checks_precede_updates_and_quick_mode_cannot_upload_bundle(self):
+        workflow = (Path(ci.ROOT) / ".github/workflows/build-windows.yml").read_text(encoding="utf-8")
+        early = workflow.index("- name: Analyze and test isolated UI before long toolchain updates")
+        update = workflow.index("- name: Update official stable Visual Studio and Windows SDK")
+        self.assertLess(early, update)
+        self.assertIn("--preflight-ui-only", workflow[early:update])
+        self.assertIn("--font-result", workflow[early:update])
+        self.assertIn("type: boolean\n        default: false", workflow)
+        for name in ("Create fresh Worker runtime", "Update official stable Visual Studio and Windows SDK",
+                     "Build, rerun backend tests, validate local math identity"):
+            step = workflow[workflow.index("- name: " + name):].split("      - name:", 1)[0]
+            self.assertIn("if: ${{ !inputs.ui_checks_only }}", step)
+        upload = workflow[workflow.index("- name: Upload only the app ZIP"):]
+        self.assertIn("if: ${{ success() && !inputs.ui_checks_only }}", upload)
+
+    def test_flutter_startup_diagnostic_reports_fixed_markers_and_explicit_known_codes_only(self):
+        stderr = self.root / "stderr.log"
+        private = b"D:\\private-fixture\\profile.json bearer=not-for-public-logs"
+        stderr.write_bytes(b"ProcessException: The system cannot find the file specified\n" + private +
+                           b"\nCommand: dartaotruntime.exe analysis_server_aot.dart.snapshot\n"
+                           b"errorCode=2 errno=8675309 errorCode=222222222222222222222\n")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            ci.flutter_json_shape_diagnostic(b"", stderr, RuntimeError(), exit_code=1)
+        text = output.getvalue()
+        payload = json.loads(text.removeprefix("ChaSteady Flutter JSON diagnostic "))
+        self.assertEqual(payload["process_exit_code"], 1)
+        self.assertEqual(payload["known_os_error_codes"], [2])
+        self.assertTrue(payload["startup_process_exception"])
+        self.assertTrue(payload["startup_windows_file_not_found"])
+        self.assertTrue(payload["startup_analysis_server_aot_snapshot"])
+        self.assertNotIn("not-for-public-logs", text)
+        self.assertNotIn("8675309", text)
+        self.assertNotIn("D:\\private-fixture", text)
+        stderr.write_bytes(b"ProcessException: The system cannot find the file specified\n")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            ci.flutter_json_shape_diagnostic(b"", stderr, RuntimeError())
+        payload = json.loads(output.getvalue().removeprefix("ChaSteady Flutter JSON diagnostic "))
+        self.assertEqual(payload["known_os_error_codes"], [])
+        self.assertIsNone(payload["process_exit_code"])
+
     def test_flutter_json_shape_diagnostic_never_prints_vendor_text_paths_or_credentials(self):
         private = b"D:\\private-fixture\\profile.json bearer=not-for-public-logs"
         raw = b"\xef\xbb\xbf" + private
