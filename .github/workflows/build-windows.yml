@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   build-windows-x64:
-    name: Build-only Windows x64
+    name: Build-only Windows x64 with UI checks
     runs-on: windows-2025-vs2026
     timeout-minutes: 240
 

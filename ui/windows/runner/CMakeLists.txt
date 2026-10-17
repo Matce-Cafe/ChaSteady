@@ -14,6 +14,7 @@ add_executable(${BINARY_NAME} WIN32
   "worker_supervisor.cpp"
   "native_bridge.cpp"
   "native_media.cpp"
+  "window_chrome.cpp"
   "${FLUTTER_MANAGED_DIR}/generated_plugin_registrant.cc"
   "Runner.rc"
   "runner.exe.manifest"
@@ -40,9 +41,30 @@ target_link_libraries(${BINARY_NAME} PRIVATE
   flutter flutter_wrapper_app flutter_wrapper_plugin
 )
 target_link_libraries(${BINARY_NAME} PRIVATE
-  dwmapi mfplat mf mfuuid d3d11 dxgi ole32 oleaut32 shell32 advapi32 uuid
+  dwmapi comctl32 mfplat mf mfuuid d3d11 dxgi ole32 oleaut32 shell32 advapi32 uuid
 )
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
 
 # Run the Flutter tool portions of the build. This must not be removed.
 add_dependencies(${BINARY_NAME} flutter_assemble)
+
+# Explicit opt-in only: never launch a GUI fixture as part of normal app builds
+# or packaging. This standalone test owns all of its HWNDs and uses no Flutter
+# engine, worker, third-party window plugin, or user-window enumeration.
+option(CHASTEADY_BUILD_WINDOW_CHROME_SMOKE "Build the owned Win32 chrome smoke executable" OFF)
+if(CHASTEADY_BUILD_WINDOW_CHROME_SMOKE)
+  add_executable(chasteady_window_chrome_smoke
+    "tests/window_chrome_smoke.cpp"
+    "window_chrome.cpp"
+    "runner.exe.manifest"
+  )
+  apply_standard_settings(chasteady_window_chrome_smoke)
+  # Keep the fixture and its PDB out of runner/Release and the application ZIP.
+  set_target_properties(chasteady_window_chrome_smoke PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/native_smoke/$<CONFIG>"
+    PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/native_smoke/$<CONFIG>"
+  )
+  target_compile_definitions(chasteady_window_chrome_smoke PRIVATE "NOMINMAX")
+  target_include_directories(chasteady_window_chrome_smoke PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+  target_link_libraries(chasteady_window_chrome_smoke PRIVATE dwmapi comctl32)
+endif()

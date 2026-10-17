@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -15,6 +16,9 @@ MediaPlatformAdapter createPlatformAdapter() => Platform.isWindows
 class _WindowsPlatformAdapter implements MediaPlatformAdapter {
   static const _channel = MethodChannel('chasteady/native');
   final _states = <String, ValueNotifier<Map<String, dynamic>>>{};
+  final _windowState = ValueNotifier(const DesktopWindowState());
+  bool _bootstrapReady = false;
+  bool _disposed = false;
   Uri? _origin;
   String? _bearer;
   bool _shuttingDown = false;
@@ -25,22 +29,69 @@ class _WindowsPlatformAdapter implements MediaPlatformAdapter {
   @override
   Future<void> initialize() async {
     _channel.setMethodCallHandler(_onNativeCall);
-    final response = await _channel.invokeMapMethod<String, dynamic>('bootstrap');
+    final response = await _channel.invokeMapMethod<String, dynamic>(
+      'bootstrap',
+    );
     final originValue = response?['origin'];
     final origin = originValue is String ? Uri.tryParse(originValue) : null;
     final bearer = response?['bearer'];
-    if (origin == null || origin.scheme != 'http' ||
-        origin.host != '127.0.0.1' || !origin.hasPort || origin.port <= 0 || origin.port > 65535 ||
-        origin.hasFragment || origin.hasQuery || origin.userInfo.isNotEmpty ||
+    if (origin == null ||
+        origin.scheme != 'http' ||
+        origin.host != '127.0.0.1' ||
+        !origin.hasPort ||
+        origin.port <= 0 ||
+        origin.port > 65535 ||
+        origin.hasFragment ||
+        origin.hasQuery ||
+        origin.userInfo.isNotEmpty ||
         (origin.path.isNotEmpty && origin.path != '/') ||
-        bearer is! String || bearer.length < 32) {
+        bearer is! String ||
+        bearer.length < 32) {
       throw PlatformException(code: 'invalid_native_bootstrap');
     }
     _origin = origin;
     _bearer = bearer;
+    _bootstrapReady = true;
+    // Window controls are optional. A missing/failed capability query must not
+    // turn a valid worker session into StartupFailureApp or disable normal exit.
+    try {
+      _publishWindowState(await _readWindowState('getWindowState'));
+    } catch (_) {
+      _publishWindowState(const DesktopWindowState());
+    }
+  }
+
+  Future<DesktopWindowState> _readWindowState(
+    String method, [
+    Map<String, Object>? arguments,
+  ]) async {
+    final result = await _channel.invokeMapMethod<Object?, Object?>(
+      method,
+      arguments,
+    );
+    if (result == null) throw PlatformException(code: 'invalid_window_state');
+    return DesktopWindowState.fromMap(result);
+  }
+
+  void _publishWindowState(DesktopWindowState state) {
+    if (!_disposed) _windowState.value = state;
   }
 
   Future<dynamic> _onNativeCall(MethodCall call) async {
+    if (call.method == 'windowStateChanged') {
+      if (call.arguments is Map) {
+        try {
+          _publishWindowState(
+            DesktopWindowState.fromMap(
+              Map<Object?, Object?>.from(call.arguments as Map),
+            ),
+          );
+        } on FormatException {
+          // Ignore malformed window notifications, never treat them as media.
+        }
+      }
+      return null;
+    }
     if (call.method == 'requestClose') {
       final handler = _requestClose;
       if (handler != null) return handler();
@@ -73,10 +124,54 @@ class _WindowsPlatformAdapter implements MediaPlatformAdapter {
     _bearer = null;
     return value;
   }
+
   @override
   bool get supportsNativePicker => supportsLocalServer;
   @override
   bool get canOpenWeb => supportsLocalServer;
+  @override
+  bool get isNativeDesktop => true;
+  @override
+  bool get managedShutdown => _bootstrapReady && !_shuttingDown;
+  @override
+  ValueListenable<DesktopWindowState> get desktopWindowState => _windowState;
+
+  @override
+  Future<DesktopWindowState> configureWindowChrome(
+    DesktopWindowGeometry? geometry,
+  ) async {
+    if (!_bootstrapReady ||
+        _disposed ||
+        (geometry != null && !geometry.isValid)) {
+      throw PlatformException(code: 'invalid_window_chrome');
+    }
+    final state = await _readWindowState(
+      'configureWindowChrome',
+      geometry?.toChannelArguments() ?? <String, Object>{'enabled': false},
+    );
+    _publishWindowState(state);
+    return state;
+  }
+
+  Future<void> _windowCommand(
+    String method, [
+    Map<String, Object>? args,
+  ]) async {
+    if (!_windowState.value.supported || _shuttingDown || _disposed) {
+      throw PlatformException(code: 'window_controls_unavailable');
+    }
+    await _channel.invokeMethod<void>(method, args);
+  }
+
+  @override
+  Future<void> minimizeWindow() => _windowCommand('minimizeWindow');
+  @override
+  Future<void> toggleMaximizeWindow() => _windowCommand('toggleMaximizeWindow');
+  @override
+  Future<void> startWindowDrag() => _windowCommand('startWindowDrag');
+  @override
+  Future<void> setAlwaysOnTop(bool value) =>
+      _windowCommand('setAlwaysOnTop', <String, Object>{'value': value});
 
   @override
   Future<String?> pickLocalPath(String kind) async {
@@ -106,14 +201,18 @@ class _WindowsPlatformAdapter implements MediaPlatformAdapter {
       rethrow;
     }
   }
+
   @override
   Future<void> dispose() async {
+    if (_disposed) return;
+    _disposed = true;
     _requestClose = null;
     _shutdownWarning = null;
     for (final player in _states.keys.toList()) {
       await _release(player);
     }
     _channel.setMethodCallHandler(null);
+    _windowState.dispose();
   }
 
   @override
@@ -121,9 +220,13 @@ class _WindowsPlatformAdapter implements MediaPlatformAdapter {
     final match = RegExp(
       r'^/api/artifacts/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/content$',
     ).firstMatch(contentUri.path);
-    if (_origin == null || contentUri.scheme != 'http' ||
-        contentUri.userInfo.isNotEmpty || contentUri.origin != _origin!.origin ||
-        contentUri.hasQuery || contentUri.hasFragment || match == null) {
+    if (_origin == null ||
+        contentUri.scheme != 'http' ||
+        contentUri.userInfo.isNotEmpty ||
+        contentUri.origin != _origin!.origin ||
+        contentUri.hasQuery ||
+        contentUri.hasFragment ||
+        match == null) {
       throw PlatformException(code: 'invalid_native_artifact');
     }
     return _NativeVideoPreview(adapter: this, artifactId: match.group(1)!);
@@ -131,10 +234,13 @@ class _WindowsPlatformAdapter implements MediaPlatformAdapter {
 
   Future<Map<String, dynamic>> _create(String artifactId) async {
     final result = await _channel.invokeMapMethod<String, dynamic>(
-      'createPreview', {'artifact_id': artifactId},
+      'createPreview',
+      {'artifact_id': artifactId},
     );
-    if (result == null || result['player_id'] is! String ||
-        result['texture_id'] is! int || (result['texture_id'] as int) < 0) {
+    if (result == null ||
+        result['player_id'] is! String ||
+        result['texture_id'] is! int ||
+        (result['texture_id'] as int) < 0) {
       throw PlatformException(code: 'invalid_native_player');
     }
     final player = result['player_id'] as String;
@@ -145,14 +251,19 @@ class _WindowsPlatformAdapter implements MediaPlatformAdapter {
     return result;
   }
 
-  Future<void> _command(String method, String player, [Map<String, dynamic>? arguments]) =>
+  Future<void> _command(
+    String method,
+    String player, [
+    Map<String, dynamic>? arguments,
+  ]) =>
       _channel.invokeMethod<void>(method, {'player_id': player, ...?arguments});
 
   Future<void> _refresh(String player) async {
     final notifier = _states[player];
     if (notifier == null || _shuttingDown) return;
     final result = await _channel.invokeMapMethod<String, dynamic>(
-      'playerState', {'player_id': player},
+      'playerState',
+      {'player_id': player},
     );
     if (result != null && _states[player] == notifier) notifier.value = result;
   }
@@ -163,7 +274,9 @@ class _WindowsPlatformAdapter implements MediaPlatformAdapter {
     notifier.dispose();
     if (!_shuttingDown) {
       try {
-        await _channel.invokeMethod<void>('disposePreview', {'player_id': player});
+        await _channel.invokeMethod<void>('disposePreview', {
+          'player_id': player,
+        });
       } on PlatformException {
         // The owned supervisor may already be terminating; its teardown closes
         // all players and leases. Do not launch a new worker for disposal.
@@ -227,7 +340,10 @@ class _NativeVideoPreviewState extends State<_NativeVideoPreview> {
           _aspect = width / height;
         }
       });
-      _timer = Timer.periodic(const Duration(milliseconds: 250), (_) => _poll());
+      _timer = Timer.periodic(
+        const Duration(milliseconds: 250),
+        (_) => _poll(),
+      );
       await _poll();
     } on PlatformException catch (error) {
       if (mounted && generation == _generation) setState(() => _error = error);
@@ -279,9 +395,13 @@ class _NativeVideoPreviewState extends State<_NativeVideoPreview> {
     final strings = AppLocalizations.of(context);
     final notifier = _player == null ? null : widget.adapter._states[_player];
     if (notifier == null) {
-      return Center(child: _error == null
-          ? Text(strings.playerLoading)
-          : Text(strings.playerError(localizedPlatformError(strings, _error!))));
+      return Center(
+        child: _error == null
+            ? Text(strings.playerLoading)
+            : Text(
+                strings.playerError(localizedPlatformError(strings, _error!)),
+              ),
+      );
     }
     return ValueListenableBuilder<Map<String, dynamic>>(
       valueListenable: notifier,
@@ -290,8 +410,15 @@ class _NativeVideoPreviewState extends State<_NativeVideoPreview> {
           final value = state[key];
           return value is num && value.isFinite ? value.toDouble() : fallback;
         }
-        final duration = number('duration_seconds', 0).clamp(0.0, 999999.0).toDouble();
-        final position = number('position_seconds', 0).clamp(0.0, duration).toDouble();
+
+        final duration = number(
+          'duration_seconds',
+          0,
+        ).clamp(0.0, 999999.0).toDouble();
+        final position = number(
+          'position_seconds',
+          0,
+        ).clamp(0.0, duration).toDouble();
         final volume = number('volume', 1).clamp(0.0, 1.0).toDouble();
         final ready = state['ready'] == true;
         final canPlay = ready || state['can_play'] == true;
@@ -301,55 +428,109 @@ class _NativeVideoPreviewState extends State<_NativeVideoPreview> {
         final error = _error != null
             ? localizedPlatformError(strings, _error!)
             : (nativeError is String && nativeError.isNotEmpty
-                ? localizedPlatformError(strings, PlatformException(code: nativeError))
-                : null);
-        return Column(children: [
-          Expanded(child: ColoredBox(
-            color: Colors.black,
-            child: Stack(alignment: Alignment.center, children: [
-              if (_texture != null)
-                Center(child: AspectRatio(aspectRatio: _aspect, child: Texture(textureId: _texture!))),
-              if (error != null)
-                Padding(padding: const EdgeInsets.all(12), child: Text(strings.playerError(error),
-                    style: const TextStyle(color: Colors.white)))
-              else if (!ready)
-                Text(strings.playerLoading, style: const TextStyle(color: Colors.white)),
-            ]),
-          )),
-          LayoutBuilder(builder: (context, constraints) {
-            final compact = constraints.maxWidth < 500;
-            final playback = <Widget>[
-              IconButton(
-                tooltip: playing ? strings.playerPause : strings.playerPlay,
-                onPressed: canPlay && error == null ? () => _control(playing ? 'pause' : 'play') : null,
-                icon: Icon(playing ? Icons.pause : Icons.play_arrow),
+                  ? localizedPlatformError(
+                      strings,
+                      PlatformException(code: nativeError),
+                    )
+                  : null);
+        return Column(
+          children: [
+            Expanded(
+              child: ColoredBox(
+                color: Colors.black,
+                child: Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    if (_texture != null)
+                      Center(
+                        child: AspectRatio(
+                          aspectRatio: _aspect,
+                          child: Texture(textureId: _texture!),
+                        ),
+                      ),
+                    if (error != null)
+                      Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: Text(
+                          strings.playerError(error),
+                          style: const TextStyle(color: Colors.white),
+                        ),
+                      )
+                    else if (!ready)
+                      Text(
+                        strings.playerLoading,
+                        style: const TextStyle(color: Colors.white),
+                      ),
+                  ],
+                ),
               ),
-              Expanded(child: Semantics(label: strings.playerSeek, child: Slider(
-                value: position,
-                max: duration > 0 ? duration : 1,
-                onChanged: ready && duration > 0 && error == null
-                    ? (value) => _control('seek', {'position_seconds': value}) : null,
-              ))),
-              Text('${_time(position)} / ${_time(duration)}'),
-            ];
-            final mute = IconButton(
-              tooltip: muted ? strings.playerUnmute : strings.playerMute,
-              onPressed: error == null ? () => _control('muted', {'muted': !muted}) : null,
-              icon: Icon(muted ? Icons.volume_off : Icons.volume_up),
-            );
-            final volumeControl = Semantics(label: strings.playerVolume, child: Slider(
-              value: volume,
-              onChanged: error == null ? (value) => _control('volume', {'volume': value}) : null,
-            ));
-            if (compact) {
-              return Column(children: [
-                Row(children: playback),
-                Row(children: [mute, Expanded(child: volumeControl)]),
-              ]);
-            }
-            return Row(children: [...playback, mute, SizedBox(width: 90, child: volumeControl)]);
-          }),
-        ]);
+            ),
+            LayoutBuilder(
+              builder: (context, constraints) {
+                final compact = constraints.maxWidth < 500;
+                final playback = <Widget>[
+                  IconButton(
+                    tooltip: playing ? strings.playerPause : strings.playerPlay,
+                    onPressed: canPlay && error == null
+                        ? () => _control(playing ? 'pause' : 'play')
+                        : null,
+                    icon: Icon(playing ? Icons.pause : Icons.play_arrow),
+                  ),
+                  Expanded(
+                    child: Semantics(
+                      label: strings.playerSeek,
+                      child: Slider(
+                        value: position,
+                        max: duration > 0 ? duration : 1,
+                        onChanged: ready && duration > 0 && error == null
+                            ? (value) =>
+                                  _control('seek', {'position_seconds': value})
+                            : null,
+                      ),
+                    ),
+                  ),
+                  Text('${_time(position)} / ${_time(duration)}'),
+                ];
+                final mute = IconButton(
+                  tooltip: muted ? strings.playerUnmute : strings.playerMute,
+                  onPressed: error == null
+                      ? () => _control('muted', {'muted': !muted})
+                      : null,
+                  icon: Icon(muted ? Icons.volume_off : Icons.volume_up),
+                );
+                final volumeControl = Semantics(
+                  label: strings.playerVolume,
+                  child: Slider(
+                    value: volume,
+                    onChanged: error == null
+                        ? (value) => _control('volume', {'volume': value})
+                        : null,
+                  ),
+                );
+                if (compact) {
+                  return Column(
+                    children: [
+                      Row(children: playback),
+                      Row(
+                        children: [
+                          mute,
+                          Expanded(child: volumeControl),
+                        ],
+                      ),
+                    ],
+                  );
+                }
+                return Row(
+                  children: [
+                    ...playback,
+                    mute,
+                    SizedBox(width: 90, child: volumeControl),
+                  ],
+                );
+              },
+            ),
+          ],
+        );
       },
     );
   }

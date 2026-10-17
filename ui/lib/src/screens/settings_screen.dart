@@ -21,11 +21,23 @@ class SettingsScreen extends StatelessWidget {
   const SettingsScreen({
     required this.controller,
     required this.platform,
+    required this.onNavigate,
+    required this.onOpenWeb,
+    required this.onClose,
+    required this.onAbout,
+    required this.onLicenses,
+    required this.onQualityLimits,
     super.key,
   });
 
   final AppController controller;
   final MediaPlatformAdapter platform;
+  final ValueChanged<int> onNavigate;
+  final Future<void> Function() onOpenWeb;
+  final Future<bool> Function() onClose;
+  final VoidCallback onAbout;
+  final VoidCallback onLicenses;
+  final Future<void> Function() onQualityLimits;
 
   @override
   Widget build(BuildContext context) {
@@ -57,7 +69,10 @@ class SettingsScreen extends StatelessWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: <Widget>[
-                    Text(l10n.theme, style: Theme.of(context).textTheme.titleSmall),
+                    Text(
+                      l10n.theme,
+                      style: Theme.of(context).textTheme.titleSmall,
+                    ),
                     const SizedBox(height: 10),
                     SegmentedButton<ThemeMode>(
                       segments: <ButtonSegment<ThemeMode>>[
@@ -89,7 +104,10 @@ class SettingsScreen extends StatelessWidget {
                       },
                     ),
                     const SizedBox(height: 18),
-                    Text(l10n.language, style: Theme.of(context).textTheme.titleSmall),
+                    Text(
+                      l10n.language,
+                      style: Theme.of(context).textTheme.titleSmall,
+                    ),
                     const SizedBox(height: 10),
                     Semantics(
                       label: l10n.language,
@@ -97,25 +115,34 @@ class SettingsScreen extends StatelessWidget {
                         spacing: 8,
                         runSpacing: 8,
                         children: <Widget>[
-                          for (final (mode, label) in <(AppLanguageMode, String)>[
-                            (AppLanguageMode.system, l10n.languageSystem),
-                            (AppLanguageMode.zh, l10n.languageZh),
-                            (AppLanguageMode.en, l10n.languageEn),
-                          ])
+                          for (final (mode, label)
+                              in <(AppLanguageMode, String)>[
+                                (AppLanguageMode.system, l10n.languageSystem),
+                                (AppLanguageMode.zh, l10n.languageZh),
+                                (AppLanguageMode.en, l10n.languageEn),
+                              ])
                             ChoiceChip(
+                              key: ValueKey<String>(
+                                'settings-language-${mode.name}',
+                              ),
                               selected: draft.languageMode == mode,
                               label: Text(label),
-                              onSelected: (_) => controller.updatePreferenceDraft(
-                                controller.draftPreferences.copyWith(
-                                  languageMode: mode,
-                                ),
-                              ),
+                              onSelected: (_) =>
+                                  controller.saveLanguageMode(mode),
                             ),
                         ],
                       ),
                     ),
+                    const SizedBox(height: 8),
+                    Text(
+                      l10n.languageSavesImmediately,
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
                     const SizedBox(height: 18),
-                    Text(l10n.brandSeed, style: Theme.of(context).textTheme.titleSmall),
+                    Text(
+                      l10n.brandSeed,
+                      style: Theme.of(context).textTheme.titleSmall,
+                    ),
                     const SizedBox(height: 8),
                     Wrap(
                       spacing: 8,
@@ -172,7 +199,9 @@ class SettingsScreen extends StatelessWidget {
                       crossAxisAlignment: WrapCrossAlignment.center,
                       children: <Widget>[
                         FilledButton.icon(
-                          onPressed: canSave ? controller.savePreferences : null,
+                          onPressed: canSave
+                              ? controller.savePreferences
+                              : null,
                           icon: const Icon(Icons.save_outlined),
                           label: Text(l10n.savePreferences),
                         ),
@@ -187,6 +216,83 @@ class SettingsScreen extends StatelessWidget {
                             controller.preferencesError == null)
                           Text(l10n.waitingPreferenceRecord),
                       ],
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 16),
+              SectionCard(
+                title: l10n.settingsApplication,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    Text(
+                      l10n.settingsNavigation,
+                      style: Theme.of(context).textTheme.titleSmall,
+                    ),
+                    const SizedBox(height: 10),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: <Widget>[
+                        for (final (index, label, icon)
+                            in <(int, String, IconData)>[
+                              (
+                                0,
+                                l10n.navWorkbench,
+                                Icons.video_library_outlined,
+                              ),
+                              (1, l10n.navJobs, Icons.view_list_outlined),
+                              (2, l10n.navSettings, Icons.tune_outlined),
+                            ])
+                          OutlinedButton.icon(
+                            key: ValueKey<String>('settings-page-$index'),
+                            onPressed: () => onNavigate(index),
+                            icon: Icon(icon),
+                            label: Text(label),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 18),
+                    if (platform.canOpenWeb)
+                      ListTile(
+                        key: const ValueKey<String>('settings-open-web'),
+                        contentPadding: EdgeInsets.zero,
+                        leading: const Icon(Icons.open_in_browser_outlined),
+                        title: Text(l10n.menuOpenWeb),
+                        onTap: onOpenWeb,
+                      ),
+                    if (platform.managedShutdown)
+                      ListTile(
+                        key: const ValueKey<String>('settings-exit'),
+                        contentPadding: EdgeInsets.zero,
+                        leading: const Icon(Icons.power_settings_new),
+                        title: Text(l10n.closeConfirmAction),
+                        onTap: onClose,
+                      ),
+                    if (!platform.canOpenWeb && !platform.managedShutdown)
+                      Text(l10n.desktopActionsUnavailable),
+                    const Divider(height: 24),
+                    ListTile(
+                      key: const ValueKey<String>('settings-about'),
+                      contentPadding: EdgeInsets.zero,
+                      leading: const Icon(Icons.info_outline),
+                      title: Text(l10n.helpAbout),
+                      onTap: onAbout,
+                    ),
+                    ListTile(
+                      key: const ValueKey<String>('settings-licenses'),
+                      contentPadding: EdgeInsets.zero,
+                      leading: const Icon(Icons.description_outlined),
+                      title: Text(l10n.settingsLicenses),
+                      onTap: onLicenses,
+                    ),
+                    ListTile(
+                      key: const ValueKey<String>('settings-quality'),
+                      contentPadding: EdgeInsets.zero,
+                      leading: const Icon(Icons.fact_check_outlined),
+                      title: Text(l10n.helpQualityTitle),
+                      onTap: onQualityLimits,
                     ),
                   ],
                 ),
@@ -243,7 +349,8 @@ bool _samePreferences(AppPreferences a, AppPreferences b) =>
 bool _sameToolPaths(Map<String, String?> a, Map<String, String?> b) =>
     toolPathKeys.every((key) => a[key] == b[key]);
 
-bool _toolPathsAreValid(Map<String, String?> paths) => toolPathKeys.every((key) {
-  final path = paths[key];
-  return path == null || path.trim().isEmpty || isLocalAbsolutePath(path);
-});
+bool _toolPathsAreValid(Map<String, String?> paths) =>
+    toolPathKeys.every((key) {
+      final path = paths[key];
+      return path == null || path.trim().isEmpty || isLocalAbsolutePath(path);
+    });

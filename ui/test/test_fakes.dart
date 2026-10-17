@@ -2,17 +2,86 @@
 import 'package:cha_stabilizer_ui/src/api/api_service.dart';
 import 'package:cha_stabilizer_ui/src/models.dart';
 import 'package:cha_stabilizer_ui/src/platform/media_platform.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 class TestPlatformAdapter implements MediaPlatformAdapter {
-  TestPlatformAdapter({this.nativePicker = false, this.webAvailable = false});
+  TestPlatformAdapter({
+    this.nativePicker = false,
+    this.webAvailable = false,
+    bool nativeDesktop = false,
+    this.managedShutdown = false,
+    DesktopWindowState windowState = const DesktopWindowState(),
+  }) : isNativeDesktop = nativeDesktop,
+       _windowState = ValueNotifier(windowState);
 
   final bool nativePicker;
   final bool webAvailable;
+  @override
+  final bool isNativeDesktop;
+  @override
+  final bool managedShutdown;
+  final ValueNotifier<DesktopWindowState> _windowState;
+  @override
+  ValueListenable<DesktopWindowState> get desktopWindowState => _windowState;
+  final configureCalls = <DesktopWindowGeometry?>[];
+  final windowCommands = <String>[];
+  final alwaysOnTopValues = <bool>[];
+  Future<void>? configureGate;
+  Object? configureError;
+  Object? windowCommandError;
+  bool rejectCustomFrame = false;
   Future<bool> Function()? closeRequestHandler;
   bool shutdownRequested = false;
   bool simulateShutdownWarning = false;
+  Future<void>? shutdownGate;
+  Object? shutdownError;
+  int shutdownCount = 0;
   int openWebCount = 0;
+  bool _disposed = false;
+
+  void emitWindowState(DesktopWindowState state) {
+    if (!_disposed) _windowState.value = state;
+  }
+
+  @override
+  Future<DesktopWindowState> configureWindowChrome(
+    DesktopWindowGeometry? geometry,
+  ) async {
+    configureCalls.add(geometry);
+    if (geometry != null) {
+      await configureGate;
+      if (configureError != null) throw configureError!;
+    }
+    final previous = _windowState.value;
+    final state = DesktopWindowState(
+      supported: previous.supported,
+      customFrameEnabled: geometry != null && !rejectCustomFrame,
+      maximized: previous.maximized,
+      alwaysOnTop: previous.alwaysOnTop,
+      maximizeButtonHovered: previous.maximizeButtonHovered,
+      maximizeButtonPressed: previous.maximizeButtonPressed,
+    );
+    emitWindowState(state);
+    return state;
+  }
+
+  Future<void> _windowCommand(String name) async {
+    windowCommands.add(name);
+    if (windowCommandError != null) throw windowCommandError!;
+  }
+
+  @override
+  Future<void> minimizeWindow() => _windowCommand('minimizeWindow');
+  @override
+  Future<void> toggleMaximizeWindow() => _windowCommand('toggleMaximizeWindow');
+  @override
+  Future<void> startWindowDrag() => _windowCommand('startWindowDrag');
+  @override
+  Future<void> setAlwaysOnTop(bool value) {
+    alwaysOnTopValues.add(value);
+    return _windowCommand('setAlwaysOnTop');
+  }
 
   @override
   Future<void> initialize() async {}
@@ -54,12 +123,19 @@ class TestPlatformAdapter implements MediaPlatformAdapter {
 
   @override
   Future<void> requestShutdown() async {
+    shutdownCount++;
     if (simulateShutdownWarning) await shutdownWarningHandler?.call();
+    await shutdownGate;
+    if (shutdownError != null) throw shutdownError!;
     shutdownRequested = true;
   }
 
   @override
-  Future<void> dispose() async {}
+  Future<void> dispose() async {
+    if (_disposed) return;
+    _disposed = true;
+    _windowState.dispose();
+  }
 
   @override
   Widget buildVideoPreview(Uri contentUri) =>

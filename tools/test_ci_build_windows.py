@@ -847,6 +847,128 @@ class CiBuildWindowsTests(unittest.TestCase):
             self.assertNotIn("outside.log", names)
             self.assertEqual(bundle.read("ChaSteady/Worker/Worker.exe"), b"fixture only; never executed")
 
+    def test_native_window_fixture_uses_audited_cmake_and_stays_outside_app_bundle(self):
+        source = self.root / "ui"
+        build_root = source / "build" / "windows" / "x64"
+        executable = build_root / "native_smoke" / "Release" / "chasteady_window_chrome_smoke.exe"
+        executable.parent.mkdir(parents=True)
+        executable.write_bytes(b"fixture only; never executed")
+        cmake = str(self.root / "audited-cmake.exe")
+        report, args = {"cmake_path": cmake}, SimpleNamespace()
+        with mock.patch.object(ci, "run_window_fixture_step") as run, \
+                mock.patch.object(ci, "validate_flutter_windows_toolchain") as validate, \
+                redirect_stdout(io.StringIO()):
+            result = ci.run_native_window_fixture(args, source, {}, self.root, report)
+        self.assertEqual(run.call_args_list, [
+            mock.call("configure", [cmake, "-S", str(source / "windows"), "-B", str(build_root),
+                      "-DCHASTEADY_BUILD_WINDOW_CHROME_SMOKE=ON"], source, {}, self.root, timeout=300),
+            mock.call("build", [cmake, "--build", str(build_root), "--config", "Release",
+                      "--target", "chasteady_window_chrome_smoke"], source, {}, self.root, timeout=600),
+            mock.call("run", [str(executable)], source, {}, self.root, timeout=60),
+        ])
+        validate.assert_called_once_with(build_root, report)
+        self.assertFalse(executable.is_relative_to(build_root / "runner" / "Release"))
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["scope"], "owned_win32_window_chrome_fixture_only")
+        for key in ("production_app_runtime_verified", "snap_flyout_verified", "multi_monitor_dpi_verified"):
+            self.assertFalse(result[key])
+        self.assertEqual(args._ci_stage, "native_fixture_run")
+
+    def test_native_window_fixture_missing_output_is_not_executed(self):
+        args = SimpleNamespace()
+        with mock.patch.object(ci, "run_window_fixture_step") as run, \
+                mock.patch.object(ci, "validate_flutter_windows_toolchain"), \
+                redirect_stdout(io.StringIO()), self.assertRaises(ci.ValidationError) as failure:
+            ci.run_native_window_fixture(args, self.root, {}, self.root,
+                                         {"cmake_path": str(self.root / "audited-cmake.exe")})
+        self.assertEqual([call.args[0] for call in run.call_args_list], ["configure", "build"])
+        self.assertIn("CI_WINDOW_FIXTURE_OUTPUT", ci.ci_failure_diagnostic(failure.exception, args._ci_stage))
+
+    def test_native_fixture_nonzero_exit_is_fixed_code_with_only_private_logs(self):
+        for label in ("configure", "build", "run"):
+            with self.subTest(label=label):
+                logs = self.root / label
+                logs.mkdir()
+                registry = mock.Mock()
+                registry.snapshot.return_value = []
+                process = mock.Mock()
+                process.wait.return_value = 1
+                with mock.patch.object(ci, "OwnedProcessRegistry", return_value=registry), \
+                        mock.patch.object(ci, "spawn_owned_process", return_value=process) as spawn, \
+                        self.assertRaises(ci.ValidationError) as failure:
+                    ci.run_window_fixture_step(label, ["fixture-never-executed"], self.root, {}, logs, 60)
+                process.wait.assert_called_once_with(timeout=60)
+                registry.discard.assert_called_once_with(process)
+                self.assertEqual(spawn.call_args.args[0], ["fixture-never-executed"])
+                self.assertTrue((logs / ("window-fixture-" + label + ".stdout.log")).is_file())
+                diagnostic = ci.ci_failure_diagnostic(failure.exception, "native_fixture_" + label)
+                self.assertIn("code=CI_WINDOW_FIXTURE_{}_EXIT".format(label.upper()), diagnostic)
+                private = str(failure.exception) + r" D:\PRIVATE\session.json bearer=not-public"
+                redacted = ci.ci_failure_diagnostic(ci.ValidationError(private), "native_fixture_" + label)
+                self.assertIn("code=CI_VALIDATION_FAILED", redacted)
+                self.assertNotIn("not-public", redacted)
+
+    def test_ci_runs_analysis_and_tests_before_both_release_builds(self):
+        args = SimpleNamespace()
+        sdk, source, stage = (self.root / name for name in ("sdk", "ui", "stage"))
+        toolchain, observed = {"fixture": "preflight"}, {"fixture": "actual"}
+        output = io.StringIO()
+        with mock.patch.object(ci, "run_flutter", return_value=b"") as run, \
+                mock.patch.object(ci, "validate_flutter_windows_toolchain", return_value=observed) as validate, \
+                redirect_stdout(output):
+            actual, checks = ci.run_flutter_ui_build(args, sdk, source, {}, stage, toolchain)
+        commands = build_windows.flutter_commands(build_only=False)
+        self.assertEqual([label for label, _command in commands],
+                         ["pub", "l10n", "analyze", "test", "windows", "web"])
+        self.assertEqual(commands[2:4], [("analyze", ["analyze", "--no-pub"]),
+                                        ("test", ["test", "--no-pub", "--reporter", "expanded"])])
+        self.assertEqual(run.call_args_list, [
+            mock.call(label, sdk, command, source, {}, stage,
+                      timeout=3600 if label in ("windows", "web") else 1200)
+            for label, command in commands
+        ])
+        validate.assert_called_once_with(source / "build" / "windows" / "x64", toolchain)
+        self.assertEqual(actual, observed)
+        self.assertEqual(checks, {"flutter_analyze_passed": True, "flutter_tests_passed": True})
+        self.assertEqual(args._ci_stage, "flutter_web")
+        self.assertLess(output.getvalue().index("stage=flutter_analyze"),
+                        output.getvalue().index("stage=flutter_windows"))
+        self.assertLess(output.getvalue().index("stage=flutter_test"),
+                        output.getvalue().index("stage=flutter_windows"))
+
+    def test_ci_ui_check_failure_stops_before_native_build_and_is_safely_reported(self):
+        for failed_label in ("analyze", "test"):
+            with self.subTest(label=failed_label):
+                args = SimpleNamespace()
+                def fail_check(label, *_args, **_kwargs):
+                    if label == failed_label:
+                        raise ci.ValidationError(
+                            "Flutter {} exited unsuccessfully; raw runner-local logs are not uploaded".format(label))
+                    return b""
+                with mock.patch.object(ci, "run_flutter", side_effect=fail_check) as run, \
+                        mock.patch.object(ci, "validate_flutter_windows_toolchain") as validate, \
+                        redirect_stdout(io.StringIO()), self.assertRaises(ci.ValidationError) as failure:
+                    ci.run_flutter_ui_build(args, self.root, self.root, {}, self.root, {})
+                labels = [call.args[0] for call in run.call_args_list]
+                self.assertEqual(labels[-1], failed_label)
+                self.assertNotIn("windows", labels)
+                validate.assert_not_called()
+                self.assertIn("code=CI_FLUTTER_{}_EXIT stage=flutter_{}".format(
+                    failed_label.upper(), failed_label), ci.ci_failure_diagnostic(failure.exception, args._ci_stage))
+                private = str(failure.exception) + r" D:\PRIVATE\profile.json token=do-not-print"
+                diagnostic = ci.ci_failure_diagnostic(ci.ValidationError(private), args._ci_stage)
+                self.assertIn("code=CI_VALIDATION_FAILED", diagnostic)
+                self.assertNotIn("do-not-print", diagnostic)
+
+    def test_ci_does_not_accept_omitted_ui_checks_as_a_successful_build(self):
+        commands = build_windows.flutter_commands(build_only=True)
+        with mock.patch.object(build_windows, "flutter_commands", return_value=commands), \
+                mock.patch.object(ci, "run_flutter", return_value=b""), \
+                mock.patch.object(ci, "validate_flutter_windows_toolchain", return_value={"fixture": True}), \
+                redirect_stdout(io.StringIO()), self.assertRaises(ci.ValidationError) as failure:
+            ci.run_flutter_ui_build(SimpleNamespace(), self.root, self.root, {}, self.root, {})
+        self.assertIn("CI_UI_CHECKS_MISSING", ci.ci_failure_diagnostic(failure.exception, "flutter_web"))
+
     def test_build_commands_keep_only_locked_l10n_and_release_builds(self):
         commands = build_windows.flutter_commands(build_only=True)
         self.assertEqual([label for label, _args in commands], ["pub", "l10n", "windows", "web"])

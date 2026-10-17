@@ -117,7 +117,8 @@ def flutter_commands(build_only=False):
         ("l10n", ["gen-l10n"]),
     ]
     if not build_only:
-        commands.extend([("analyze", ["analyze"]), ("test", ["test"])])
+        commands.extend([("analyze", ["analyze", "--no-pub"]),
+                         ("test", ["test", "--no-pub", "--reporter", "expanded"])])
     commands.extend([
         ("windows", ["build", "windows", "--release"]),
         ("web", ["build", "web", "--release", "--no-web-resources-cdn", "--pwa-strategy=none"]),

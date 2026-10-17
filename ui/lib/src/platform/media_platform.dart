@@ -1,6 +1,10 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 
 import '../localization.dart';
+import 'desktop_window.dart';
+
+export 'desktop_window.dart';
 
 abstract interface class MediaPlatformAdapter {
   /// Performs asynchronous platform bootstrap before API origin/session access.
@@ -18,7 +22,25 @@ abstract interface class MediaPlatformAdapter {
   bool get canOpenWeb;
   Future<void> openWeb();
 
-  /// Called for a native WM_CLOSE request and by the File > Close command.
+  /// True only for an adapter that owns a native desktop window, not Web on a
+  /// desktop OS. Layout must not infer this from file-picker availability.
+  bool get isNativeDesktop;
+
+  /// Owned-worker shutdown remains available even if custom chrome fails.
+  bool get managedShutdown;
+
+  ValueListenable<DesktopWindowState> get desktopWindowState;
+
+  /// Null restores the stock frame; non-null enables measured custom chrome.
+  Future<DesktopWindowState> configureWindowChrome(
+    DesktopWindowGeometry? geometry,
+  );
+  Future<void> minimizeWindow();
+  Future<void> toggleMaximizeWindow();
+  Future<void> startWindowDrag();
+  Future<void> setAlwaysOnTop(bool value);
+
+  /// Called for native WM_CLOSE, the caption close button and Settings > Exit.
   void setRequestCloseHandler(Future<bool> Function() handler);
   void setShutdownWarningHandler(Future<void> Function() handler);
 

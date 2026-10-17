@@ -122,6 +122,84 @@ abstract class AppLocalizations {
   /// **'Settings'**
   String get navSettings;
 
+  /// No description provided for @sidebarShowLabels.
+  ///
+  /// In en, this message translates to:
+  /// **'Show navigation labels'**
+  String get sidebarShowLabels;
+
+  /// No description provided for @sidebarHideLabels.
+  ///
+  /// In en, this message translates to:
+  /// **'Hide navigation labels'**
+  String get sidebarHideLabels;
+
+  /// No description provided for @settingsApplication.
+  ///
+  /// In en, this message translates to:
+  /// **'Application'**
+  String get settingsApplication;
+
+  /// No description provided for @settingsNavigation.
+  ///
+  /// In en, this message translates to:
+  /// **'Pages · Ctrl+1 / Ctrl+2 / Ctrl+3'**
+  String get settingsNavigation;
+
+  /// No description provided for @settingsLicenses.
+  ///
+  /// In en, this message translates to:
+  /// **'Open-source licenses'**
+  String get settingsLicenses;
+
+  /// No description provided for @languageSavesImmediately.
+  ///
+  /// In en, this message translates to:
+  /// **'Language changes save separately from tool paths.'**
+  String get languageSavesImmediately;
+
+  /// No description provided for @windowDrag.
+  ///
+  /// In en, this message translates to:
+  /// **'Drag window'**
+  String get windowDrag;
+
+  /// No description provided for @windowPin.
+  ///
+  /// In en, this message translates to:
+  /// **'Keep window on top'**
+  String get windowPin;
+
+  /// No description provided for @windowUnpin.
+  ///
+  /// In en, this message translates to:
+  /// **'Stop keeping window on top'**
+  String get windowUnpin;
+
+  /// No description provided for @windowMinimize.
+  ///
+  /// In en, this message translates to:
+  /// **'Minimize'**
+  String get windowMinimize;
+
+  /// No description provided for @windowMaximize.
+  ///
+  /// In en, this message translates to:
+  /// **'Maximize'**
+  String get windowMaximize;
+
+  /// No description provided for @windowRestore.
+  ///
+  /// In en, this message translates to:
+  /// **'Restore'**
+  String get windowRestore;
+
+  /// No description provided for @windowClose.
+  ///
+  /// In en, this message translates to:
+  /// **'Close'**
+  String get windowClose;
+
   /// No description provided for @menuFile.
   ///
   /// In en, this message translates to:

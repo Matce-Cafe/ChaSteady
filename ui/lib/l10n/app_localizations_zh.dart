@@ -21,6 +21,45 @@ class AppLocalizationsZh extends AppLocalizations {
   String get navSettings => '设置';
 
   @override
+  String get sidebarShowLabels => '显示导航文字';
+
+  @override
+  String get sidebarHideLabels => '隐藏导航文字';
+
+  @override
+  String get settingsApplication => '应用';
+
+  @override
+  String get settingsNavigation => '页面 · Ctrl+1 / Ctrl+2 / Ctrl+3';
+
+  @override
+  String get settingsLicenses => '开源许可证';
+
+  @override
+  String get languageSavesImmediately => '语言更改会独立即时保存，无需先配置工具路径。';
+
+  @override
+  String get windowDrag => '拖动窗口';
+
+  @override
+  String get windowPin => '窗口置顶';
+
+  @override
+  String get windowUnpin => '取消窗口置顶';
+
+  @override
+  String get windowMinimize => '最小化';
+
+  @override
+  String get windowMaximize => '最大化';
+
+  @override
+  String get windowRestore => '还原';
+
+  @override
+  String get windowClose => '关闭';
+
+  @override
   String get menuFile => '文件';
 
   @override

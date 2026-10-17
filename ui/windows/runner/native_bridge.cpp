@@ -4,6 +4,7 @@
 #include "native_bridge.h"
 
 #include "native_media.h"
+#include "window_chrome.h"
 #include "worker_supervisor.h"
 
 #include <windows.h>
@@ -164,6 +165,17 @@ EncodableValue StateValue(const NativeMediaEvent& state) {
   map.emplace(EncodableValue("muted"), EncodableValue(state.muted));
   map.emplace(EncodableValue("ended"), EncodableValue(state.ended));
   map.emplace(EncodableValue("error_code"), EncodableValue(state.error_code));
+  return EncodableValue(std::move(map));
+}
+
+EncodableValue WindowStateValue(const WindowChrome::State& state) {
+  EncodableMap map;
+  map.emplace(EncodableValue("supported"), EncodableValue(state.supported));
+  map.emplace(EncodableValue("customFrameEnabled"), EncodableValue(state.custom_frame_enabled));
+  map.emplace(EncodableValue("maximized"), EncodableValue(state.maximized));
+  map.emplace(EncodableValue("alwaysOnTop"), EncodableValue(state.always_on_top));
+  map.emplace(EncodableValue("maximizeButtonHovered"), EncodableValue(state.maximize_button_hovered));
+  map.emplace(EncodableValue("maximizeButtonPressed"), EncodableValue(state.maximize_button_pressed));
   return EncodableValue(std::move(map));
 }
 
@@ -381,6 +393,7 @@ FileDialogResult ShowNativePicker(HWND owner, const std::string& kind) {
 class NativeBridge::Impl final {
  public:
   Impl(HWND owner_window,
+       HWND flutter_child,
        flutter::BinaryMessenger* messenger,
        flutter::TextureRegistrar* texture_registrar)
       : owner_window_(owner_window),
@@ -394,6 +407,15 @@ class NativeBridge::Impl final {
             }),
         channel_(std::make_unique<MethodChannel>(messenger, kNativeChannelName,
             &flutter::StandardMethodCodec::GetInstance())) {
+    window_chrome_ = std::make_unique<WindowChrome>(owner_window_, flutter_child,
+        [this](const WindowChrome::State& state) {
+          // Chrome lives and emits only on the platform thread, never through
+          // the worker operation queue. WindowChrome deduplicates snapshots.
+          if (!destroying_.load(std::memory_order_acquire) && channel_) {
+            channel_->InvokeMethod("windowStateChanged",
+                std::make_unique<EncodableValue>(WindowStateValue(state)));
+          }
+        });
     const std::shared_ptr<CallbackGate> gate = gate_;
     supervisor_.SetExitCallback([this, gate] {
       GateLease lease(gate);
@@ -417,6 +439,8 @@ class NativeBridge::Impl final {
     destroying_.store(true, std::memory_order_release);
     if (channel_) channel_->SetMethodCallHandler(nullptr);
     gate_->CloseAndWait();
+    // Remove the documented Flutter child subclass before engine/child teardown.
+    window_chrome_.reset();
     KillTimer(owner_window_, kCloseRequestTimer);
     KillTimer(owner_window_, kShutdownWarningTimer);
     operation_queue_.Post([this] {
@@ -437,9 +461,11 @@ class NativeBridge::Impl final {
   }
 
   bool HandleWindowMessage(HWND window, UINT message, WPARAM wparam,
-                           LPARAM, LRESULT* result) {
+                           LPARAM lparam, LRESULT* result) {
     if (window != owner_window_) return false;
     if (!destroying_.load(std::memory_order_acquire)) DrainDeferredReplies();
+    if (window_chrome_ && window_chrome_->HandleWindowMessage(
+        window, message, wparam, lparam, result)) return true;
     if (message == WM_CLOSE) {
       if (CloseRequest()) {
         if (result != nullptr) *result = 0;
@@ -783,6 +809,101 @@ class NativeBridge::Impl final {
     if (!result) return;
     const std::string& method = call.method_name();
     const EncodableValue* arguments = call.arguments();
+
+    // Owned-window control is deliberately independent of bootstrap, media,
+    // worker capabilities, and the serialized worker operation queue.
+    if (method == "getWindowState" || method == "minimizeWindow" ||
+        method == "toggleMaximizeWindow" || method == "startWindowDrag") {
+      if (!NoArguments(arguments)) {
+        result->Error("invalid_arguments", "This window method accepts no arguments.");
+        return;
+      }
+      if (method == "getWindowState") {
+        result->Success(WindowStateValue(window_chrome_ ?
+            window_chrome_->GetState() : WindowChrome::State{}));
+        return;
+      }
+      std::string error;
+      bool succeeded = false;
+      if (window_chrome_) {
+        if (method == "minimizeWindow") {
+          succeeded = window_chrome_->Minimize(&error);
+        } else if (method == "toggleMaximizeWindow") {
+          succeeded = window_chrome_->ToggleMaximize(&error);
+        } else {
+          succeeded = window_chrome_->StartDrag(&error);
+        }
+      }
+      if (!succeeded) {
+        result->Error(error.empty() ? "window_unavailable" : error,
+                      "The owned desktop window could not perform the command.");
+      } else {
+        result->Success();
+      }
+      return;
+    }
+    if (method == "setAlwaysOnTop") {
+      const EncodableMap* map = nullptr;
+      bool value = false;
+      if (!IsMap(arguments, &map) || !HasExactKeys(*map, {"value"}) ||
+          !GetBoolean(FindValue(map, "value"), &value)) {
+        result->Error("invalid_arguments", "setAlwaysOnTop requires only a boolean value.");
+        return;
+      }
+      std::string error;
+      if (!window_chrome_ || !window_chrome_->SetAlwaysOnTop(value, &error)) {
+        result->Error(error.empty() ? "window_unavailable" : error,
+                      "The owned desktop window could not change its topmost state.");
+      } else {
+        result->Success();
+      }
+      return;
+    }
+    if (method == "configureWindowChrome") {
+      const EncodableMap* map = nullptr;
+      const EncodableMap* maximize = nullptr;
+      WindowChrome::Geometry geometry;
+      bool enabled = false;
+      bool valid = IsMap(arguments, &map) &&
+          GetBoolean(FindValue(map, "enabled"), &enabled);
+      if (valid && enabled) {
+        valid = HasExactKeys(*map, {"enabled", "titleBarHeight", "controlsLeft",
+                                   "clientWidth", "maximizeButton"}) &&
+            GetFiniteNumber(FindValue(map, "titleBarHeight"), &geometry.title_bar_height) &&
+            GetFiniteNumber(FindValue(map, "controlsLeft"), &geometry.controls_left) &&
+            GetFiniteNumber(FindValue(map, "clientWidth"), &geometry.client_width) &&
+            IsMap(FindValue(map, "maximizeButton"), &maximize) &&
+            HasExactKeys(*maximize, {"left", "top", "width", "height"}) &&
+            GetFiniteNumber(FindValue(maximize, "left"), &geometry.maximize_left) &&
+            GetFiniteNumber(FindValue(maximize, "top"), &geometry.maximize_top) &&
+            GetFiniteNumber(FindValue(maximize, "width"), &geometry.maximize_width) &&
+            GetFiniteNumber(FindValue(maximize, "height"), &geometry.maximize_height) &&
+            WindowChrome::IsValidGeometry(geometry);
+      } else if (valid) {
+        valid = HasExactKeys(*map, {"enabled"});
+      }
+      if (!valid) {
+        // Fail closed even on malformed updates: Dart can remove its custom
+        // controls without leaving an old native caption-less layout active.
+        std::string ignored;
+        if (window_chrome_) window_chrome_->Configure(false, {}, &ignored);
+        result->Error("invalid_arguments", "Window chrome requires the finite, bounded layout schema.");
+        return;
+      }
+      if (enabled && !bootstrap_ready_.load(std::memory_order_acquire)) {
+        result->Error("window_chrome_not_ready", "Enable custom chrome only after the normal AppShell layout.");
+        return;
+      }
+      std::string error;
+      if (!window_chrome_ || !window_chrome_->Configure(enabled, geometry, &error)) {
+        result->Error(error.empty() ? "window_chrome_unavailable" : error,
+                      "The owned desktop window could not configure its frame; use the stock caption.");
+      } else {
+        result->Success(WindowStateValue(window_chrome_->GetState()));
+      }
+      return;
+    }
+
     if (method == "bootstrap") {
       if (!NoArguments(arguments)) {
         CompleteMethodError(std::move(result), "invalid_arguments", "nativeProtocol.error.invalidRequest",
@@ -1363,6 +1484,7 @@ class NativeBridge::Impl final {
   WorkerSupervisor supervisor_;
   NativeMediaManager media_manager_;
   std::unique_ptr<MethodChannel> channel_;
+  std::unique_ptr<WindowChrome> window_chrome_;  // Platform thread only.
   TaskQueue operation_queue_;
 
   std::mutex session_mutex_;
@@ -1396,9 +1518,11 @@ class NativeBridge::Impl final {
 };
 
 NativeBridge::NativeBridge(HWND owner_window,
+                           HWND flutter_child,
                            flutter::BinaryMessenger* messenger,
                            flutter::TextureRegistrar* texture_registrar)
-    : impl_(std::make_unique<Impl>(owner_window, messenger, texture_registrar)) {}
+    : impl_(std::make_unique<Impl>(owner_window, flutter_child, messenger,
+                                   texture_registrar)) {}
 NativeBridge::~NativeBridge() = default;
 
 bool NativeBridge::HandleWindowMessage(HWND window, UINT message, WPARAM wparam,
