@@ -7,6 +7,10 @@ on:
         description: Run pinned Flutter identity, locked analysis and UI tests only; no native build or artifacts
         type: boolean
         default: false
+      window_fixture_only:
+        description: Diagnose only the owned Win32 fixture with reported preinstalled tools; no production build or artifacts
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -15,7 +19,7 @@ jobs:
   build-windows-x64:
     name: Build-only Windows x64 with UI checks
     runs-on: windows-2025-vs2026
-    timeout-minutes: ${{ inputs.ui_checks_only && 15 || 240 }}
+    timeout-minutes: ${{ (inputs.ui_checks_only || inputs.window_fixture_only) && 15 || 240 }}
 
     steps:
       - name: Checkout reviewed source without persisted credentials
@@ -24,6 +28,12 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
           submodules: false
+
+      - name: Reject conflicting diagnostic modes before any provisioning
+        if: ${{ inputs.ui_checks_only && inputs.window_fixture_only }}
+        shell: pwsh
+        run: |
+          throw 'Select only one diagnostic-only mode.'
 
       - name: Allocate a new runner-local job directory
         id: run-root
@@ -41,6 +51,7 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "ci_root=$runRoot" -Encoding utf8
 
       - name: Select the single approved sanitized local math sidecar
+        if: ${{ !inputs.window_fixture_only }}
         id: sidecar
         shell: pwsh
         run: |
@@ -88,8 +99,33 @@ jobs:
             }
           }
 
+      - name: Diagnose owned window fixture with preinstalled tools only
+        if: ${{ inputs.window_fixture_only }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repo = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
+          $ciRoot = '${{ steps.run-root.outputs.ci_root }}'
+          $report = Join-Path $ciRoot 'preinstalled-window-toolchain.json'
+          & (Join-Path $repo 'tools/ci_toolchain_preflight.ps1') `
+            -OutputPath $report `
+            -RunnerLabel 'windows-2025-vs2026' `
+            -FixtureProbeOnly
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          $stage = Join-Path $ciRoot ('window-probe-' + [Guid]::NewGuid().ToString('N'))
+          & '${{ steps.host-python.outputs.path }}' -I (Join-Path $repo 'tools/ci_build_windows.py') `
+            --root $repo `
+            --window-fixture-only `
+            --toolchain-report $report `
+            --preflight-stage $stage
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
       - name: Create fresh Worker runtime using the current repository root
-        if: ${{ !inputs.ui_checks_only }}
+        if: ${{ !inputs.ui_checks_only && !inputs.window_fixture_only }}
         id: worker-runtime
         shell: pwsh
         run: |
@@ -119,6 +155,7 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "path=$report" -Encoding utf8
 
       - name: Fetch and verify the pinned Noto font as ephemeral data
+        if: ${{ !inputs.window_fixture_only }}
         id: font
         shell: pwsh
         run: |
@@ -138,6 +175,7 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "scratch=$scratch" -Encoding utf8
 
       - name: Download and verify the pinned official Flutter SDK
+        if: ${{ !inputs.window_fixture_only }}
         id: flutter
         shell: pwsh
         run: |
@@ -155,6 +193,7 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "scratch=$scratch" -Encoding utf8
 
       - name: Verify Flutter executable identity before long toolchain updates
+        if: ${{ !inputs.window_fixture_only }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -172,6 +211,7 @@ jobs:
           }
 
       - name: Analyze and test isolated UI before long toolchain updates
+        if: ${{ !inputs.window_fixture_only }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -191,7 +231,7 @@ jobs:
           }
 
       - name: Update official stable Visual Studio and Windows SDK
-        if: ${{ !inputs.ui_checks_only }}
+        if: ${{ !inputs.ui_checks_only && !inputs.window_fixture_only }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -207,7 +247,7 @@ jobs:
           }
 
       - name: Build, rerun backend tests, validate local math identity, and stage public-safe bundle
-        if: ${{ !inputs.ui_checks_only }}
+        if: ${{ !inputs.ui_checks_only && !inputs.window_fixture_only }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -229,7 +269,7 @@ jobs:
           }
 
       - name: Upload only the app ZIP, digest, and sanitized manifest
-        if: ${{ success() && !inputs.ui_checks_only }}
+        if: ${{ success() && !inputs.ui_checks_only && !inputs.window_fixture_only }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: ChaSteady-Windows-x64-${{ github.run_id }}-${{ github.run_attempt }}
