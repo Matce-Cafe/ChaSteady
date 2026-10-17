@@ -692,13 +692,14 @@ def run_flutter(label: str, sdk_root: Path, args: list[str], cwd: Path, env: dic
         if registry.snapshot():
             registry.terminate_all()
     if code != 0:
-        flutter_json_shape_diagnostic(stdout_path.read_bytes(), stderr_path, RuntimeError())
+        flutter_json_shape_diagnostic(stdout_path.read_bytes(), stderr_path, RuntimeError(), exit_code=code)
         raise ValidationError("Flutter {} exited unsuccessfully; raw runner-local logs are not uploaded".format(label))
     return stdout_path.read_bytes()
 
 
-def flutter_json_shape_diagnostic(raw: bytes, stderr_path: Path, error: Exception) -> None:
-    """Print only bounded numeric/boolean shape, never child output or paths."""
+def flutter_json_shape_diagnostic(raw: bytes, stderr_path: Path, error: Exception,
+                                  exit_code: int | None = None) -> None:
+    """Print bounded shape and fixed startup markers, never child output or paths."""
     stderr_bytes, stderr_sample = None, b""
     try:
         if stderr_path.is_file() and not is_reparse(stderr_path):
@@ -722,6 +723,35 @@ def flutter_json_shape_diagnostic(raw: bytes, stderr_path: Path, error: Exceptio
     for name, marker in markers.items():
         shape["stdout_" + name] = marker in raw
         shape["stderr_" + name] = marker in stderr_sample
+    shape["process_exit_code"] = exit_code if type(exit_code) is int and -(2 ** 31) <= exit_code < 2 ** 32 else None
+    shape["stderr_sample_truncated"] = stderr_bytes is not None and stderr_bytes > len(stderr_sample)
+    shape["stderr_sample_lines"] = len(stderr_sample.splitlines())
+    startup_markers = {
+        "process_exception": b"ProcessException:",
+        "filesystem_exception": b"FileSystemException:",
+        "socket_exception": b"SocketException:",
+        "analysis_server_exception": b"AnalysisServerException:",
+        "analysis_server_aot_snapshot": b"analysis_server_aot.dart.snapshot",
+        "analysis_server_snapshot": b"analysis_server.dart.snapshot",
+        "dartaotruntime": b"dartaotruntime.exe",
+        "missing_pubspec": b"No pubspec.yaml file found",
+        "unknown_option": b"Could not find an option named",
+        "analysis_server_exited": b"Analysis server exited",
+        "windows_file_not_found": b"The system cannot find the file specified",
+        "windows_path_not_found": b"The system cannot find the path specified",
+        "windows_access_denied": b"Access is denied",
+        "windows_filename_too_long": b"The filename or extension is too long",
+        "windows_not_valid_application": b"is not a valid Win32 application",
+    }
+    for name, marker in startup_markers.items():
+        shape["startup_" + name] = marker in stderr_sample
+    # Only known OS/loader constants may cross this boundary, not arbitrary
+    # numbers/strings taken from vendor stderr or credentials masquerading as codes.
+    known_errors = {2, 3, 5, 8, 87, 193, 206, 216, 740, 126, 127,
+                    -1073741515, -1073741701, 3221225781, 3221225595}
+    reported_errors = {int(match[1]) for match in re.finditer(
+        rb"\b(?:errno|errorCode)\s*[:=]\s*(-?[0-9]{1,10})(?![0-9])", stderr_sample)}
+    shape["known_os_error_codes"] = sorted(reported_errors & known_errors)
     print("ChaSteady Flutter JSON diagnostic " + json.dumps(shape, sort_keys=True), flush=True)
 
 
@@ -1071,8 +1101,28 @@ def write_zip(app_root: Path, archive_path: Path) -> None:
             archive.write(str(path), "ChaSteady/" + relative)
 
 
+def stage_flutter_source(root: Path, stage: Path, font_path: Path) -> Path:
+    source = stage / "ui"
+    source.mkdir(exist_ok=False)
+    for name in ("lib", "test", "web", "assets"):
+        build_windows.copy_directory(root / "ui" / name, source / name)
+    font_destination = source / "assets" / "fonts" / "NotoSansSC-wght.ttf"
+    _copy_file(font_path, font_destination)
+    if (sha256_file(font_destination) != ci_prepare_assets.FONT_SHA256
+            or ci_prepare_assets.git_blob_sha1_file(font_destination) != ci_prepare_assets.FONT_BLOB_SHA1):
+        raise ValidationError("Downloaded font changed while entering the isolated Flutter source copy")
+    build_windows.copy_windows_source(root / "ui" / "windows", source / "windows")
+    for name in ("pubspec.yaml", "pubspec.lock", "analysis_options.yaml", "l10n.yaml"):
+        original = root / "ui" / name
+        if original.is_file():
+            _copy_file(original, source / name)
+    if not (source / "pubspec.lock").is_file():
+        raise ValidationError("Locked Flutter UI dependency graph is required")
+    return source
+
+
 def run_flutter_preflight(args) -> dict:
-    """Execute only the pinned Flutter identity gate, before VS/SDK installation."""
+    """Verify identity and optional UI checks, without a native/Worker build."""
     mark_ci_stage(args, "checkout")
     root = args.root.resolve(strict=True)
     if root != ROOT.resolve(strict=True):
@@ -1081,23 +1131,39 @@ def run_flutter_preflight(args) -> dict:
     result = validate_flutter_result(args.flutter_result, args.flutter_scratch)
     sdk_root = Path(result["sdk_root"])
     stage_path = args.preflight_stage.resolve()
+    ui_only = getattr(args, "preflight_ui_only", False)
+    font_path = None
     excluded = [sdk_root, Path(result["extraction_directory"]), Path(result["download_directory"]),
                 root / "tools", root / "worker", root / "ui"]
+    if ui_only:
+        mark_ci_stage(args, "font_report")
+        font = validate_font_result(args.font_result.resolve(strict=True), args.font_scratch, root)
+        font_path = font["font_path_for_ephemeral_build_only"]
+        excluded.append(args.font_scratch)
     if any(stage_path.is_relative_to(path.resolve()) or path.resolve().is_relative_to(stage_path)
            for path in excluded):
         raise ValidationError("Flutter preflight stage overlaps SDK or source files")
     stage = make_new_directory(stage_path)
+    source = root
+    if ui_only:
+        mark_ci_stage(args, "stage_ui")
+        source = stage_flutter_source(root, stage, font_path)
     mark_ci_stage(args, "flutter_environment")
     environment = create_flutter_environment(os.environ, stage)
     mark_ci_stage(args, "flutter_version")
-    identity = flutter_version_check(sdk_root, root, environment, stage)
+    identity = flutter_version_check(sdk_root, source, environment, stage)
+    checks = run_flutter_ui_checks(args, sdk_root, source, environment, stage) if ui_only else None
     mark_ci_stage(args, "flutter_preflight_result")
-    receipt = {"schema_version": 1, "scope": "pinned_flutter_executable_identity_only",
+    receipt = {"schema_version": 1,
+               "scope": "pinned_flutter_identity_and_ui_checks_only" if ui_only else "pinned_flutter_executable_identity_only",
                "archive_sha256": result["archive_sha256"], "identity": identity,
                "strict_machine_json_verified": True, "native_build_executed": False,
                "worker_tests_or_math_executed": False, "runtime_acceptance_verified": False}
-    _write_json_new(stage / "flutter-preflight.json", receipt)
-    print("Pinned Flutter executable identity preflight passed; no native or Worker build was run.", flush=True)
+    if ui_only:
+        receipt["ui_checks"] = checks
+    _write_json_new(stage / ("flutter-ui-preflight.json" if ui_only else "flutter-preflight.json"), receipt)
+    print("Pinned Flutter {} preflight passed; no native or Worker build was run.".format(
+        "identity and UI checks" if ui_only else "executable identity"), flush=True)
     return receipt
 
 
@@ -1148,24 +1214,36 @@ def run_native_window_fixture(args, source: Path, environment: dict,
             "multi_monitor_dpi_verified": False}
 
 
-def run_flutter_ui_build(args, sdk_root: Path, source: Path, environment: dict,
-                         stage: Path, toolchain_report: dict) -> tuple[dict, dict]:
+def run_flutter_ui_checks(args, sdk_root: Path, source: Path, environment: dict,
+                          stage: Path) -> dict:
     checks = {"flutter_analyze_passed": False, "flutter_tests_passed": False}
-    actual_windows_toolchain = None
     for label, command in build_windows.flutter_commands(build_only=False):
+        if label in ("windows", "web"):
+            continue
         mark_ci_stage(args, "flutter_" + label)
-        run_flutter(label, sdk_root, command, source, environment, stage,
-                    timeout=3600 if label in ("windows", "web") else 1200)
+        run_flutter(label, sdk_root, command, source, environment, stage, timeout=1200)
         if label == "analyze":
             checks["flutter_analyze_passed"] = True
         elif label == "test":
             checks["flutter_tests_passed"] = True
-        elif label == "windows":
+    if not all(checks.values()):
+        raise ValidationError("Required Flutter UI analysis or tests did not execute")
+    return checks
+
+
+def run_flutter_ui_build(args, sdk_root: Path, source: Path, environment: dict,
+                         stage: Path, toolchain_report: dict) -> tuple[dict, dict]:
+    checks = run_flutter_ui_checks(args, sdk_root, source, environment, stage)
+    actual_windows_toolchain = None
+    for label, command in build_windows.flutter_commands(build_only=False):
+        if label not in ("windows", "web"):
+            continue
+        mark_ci_stage(args, "flutter_" + label)
+        run_flutter(label, sdk_root, command, source, environment, stage, timeout=3600)
+        if label == "windows":
             mark_ci_stage(args, "native_toolchain")
             actual_windows_toolchain = validate_flutter_windows_toolchain(
                 source / "build" / "windows" / "x64", toolchain_report)
-    if not all(checks.values()):
-        raise ValidationError("Required Flutter UI analysis or tests did not execute")
     if actual_windows_toolchain is None:
         raise ValidationError("Flutter did not execute the required Windows release build")
     return actual_windows_toolchain, checks
@@ -1201,22 +1279,7 @@ def run_build(args) -> dict:
     toolchains.mkdir(exist_ok=True)
     stage = make_new_directory(toolchains / ("ci-build-" + uuid.uuid4().hex))
     app_stage = stage / "app-stage"
-    flutter_source = stage / "ui"
-    flutter_source.mkdir(exist_ok=False)
-    for name in ("lib", "test", "web", "assets"):
-        build_windows.copy_directory(root / "ui" / name, flutter_source / name)
-    font_destination = flutter_source / "assets" / "fonts" / "NotoSansSC-wght.ttf"
-    _copy_file(font_path, font_destination)
-    if (sha256_file(font_destination) != ci_prepare_assets.FONT_SHA256
-            or ci_prepare_assets.git_blob_sha1_file(font_destination) != ci_prepare_assets.FONT_BLOB_SHA1):
-        raise ValidationError("Downloaded font changed while entering the isolated Flutter source copy")
-    build_windows.copy_windows_source(root / "ui" / "windows", flutter_source / "windows")
-    for name in ("pubspec.yaml", "pubspec.lock", "analysis_options.yaml", "l10n.yaml"):
-        source = root / "ui" / name
-        if source.is_file():
-            _copy_file(source, flutter_source / name)
-    if not (flutter_source / "pubspec.lock").is_file():
-        raise ValidationError("Locked Flutter UI dependency graph is required")
+    flutter_source = stage_flutter_source(root, stage, font_path)
 
     mark_ci_stage(args, "flutter_environment")
     flutter_env = create_flutter_environment(os.environ, stage)
@@ -1368,9 +1431,12 @@ def run_build(args) -> dict:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT)
-    parser.add_argument("--preflight-flutter-only", action="store_true",
-                        help="Verify only the pinned Flutter executable identity; never build native/Worker outputs")
-    parser.add_argument("--preflight-stage", type=Path, help="New isolated stage for version-only preflight logs/receipt")
+    preflight_modes = parser.add_mutually_exclusive_group()
+    preflight_modes.add_argument("--preflight-flutter-only", action="store_true",
+                                 help="Verify only the pinned Flutter executable identity; never build native/Worker outputs")
+    preflight_modes.add_argument("--preflight-ui-only", action="store_true",
+                                 help="Verify identity, locked UI analysis and tests; never build native/Worker outputs")
+    parser.add_argument("--preflight-stage", type=Path, help="New isolated stage for preflight logs/receipt")
     parser.add_argument("--toolchain-report", type=Path)
     parser.add_argument("--flutter-result", type=Path, required=True)
     parser.add_argument("--flutter-scratch", type=Path, required=True)
@@ -1386,14 +1452,22 @@ def main(argv=None) -> int:
             parser.error("--preflight-flutter-only requires --preflight-stage")
         if any(getattr(args, field) is not None for field in full_fields):
             parser.error("--preflight-flutter-only cannot accept full-build inputs or an artifact directory")
+    elif args.preflight_ui_only:
+        required = ("preflight_stage", "font_result", "font_scratch")
+        missing = ["--" + field.replace("_", "-") for field in required if getattr(args, field) is None]
+        if missing:
+            parser.error("--preflight-ui-only requires " + ", ".join(missing))
+        if any(getattr(args, field) is not None for field in
+               ("toolchain_report", "worker_manifest", "math_sidecar", "artifact_dir")):
+            parser.error("--preflight-ui-only cannot accept native/Worker inputs or an artifact directory")
     else:
         if args.preflight_stage is not None:
-            parser.error("--preflight-stage requires --preflight-flutter-only")
+            parser.error("--preflight-stage requires a preflight-only mode")
         missing = ["--" + field.replace("_", "-") for field in full_fields if getattr(args, field) is None]
         if missing:
             parser.error("Full build requires " + ", ".join(missing))
     try:
-        if args.preflight_flutter_only:
+        if args.preflight_flutter_only or args.preflight_ui_only:
             run_flutter_preflight(args)
         else:
             run_build(args)
