@@ -39,7 +39,10 @@ class SectionCard extends StatelessWidget {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: <Widget>[
-                      Text(title, style: Theme.of(context).textTheme.titleMedium),
+                      Text(
+                        title,
+                        style: Theme.of(context).textTheme.titleMedium,
+                      ),
                       if (subtitle != null) ...<Widget>[
                         const SizedBox(height: 4),
                         Text(
@@ -53,7 +56,7 @@ class SectionCard extends StatelessWidget {
                 ),
                 if (trailing != null) ...<Widget>[
                   const SizedBox(width: 10),
-                  trailing!,
+                  Flexible(child: trailing!),
                 ],
               ],
             ),
@@ -256,11 +259,7 @@ class CapabilitiesPanel extends StatelessWidget {
             ),
             _FactLine(
               label: l10n.savedPathProfileGuard,
-              value: _pathGuardStatus(
-                l10n,
-                data.gyroflow,
-                savedGyroflowPath,
-              ),
+              value: _pathGuardStatus(l10n, data.gyroflow, savedGyroflowPath),
             ),
             _FactLine(
               label: l10n.latestExportValidation,
@@ -405,7 +404,9 @@ class _FactLine extends StatelessWidget {
     padding: const EdgeInsets.only(top: 7),
     child: Row(
       children: <Widget>[
-        Expanded(child: Text(label, style: Theme.of(context).textTheme.bodySmall)),
+        Expanded(
+          child: Text(label, style: Theme.of(context).textTheme.bodySmall),
+        ),
         Text(value, style: Theme.of(context).textTheme.labelMedium),
       ],
     ),

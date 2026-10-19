@@ -457,11 +457,331 @@ void main() {
     skip: !Platform.isWindows,
   );
 
+  test(
+    'all native picker kinds publish a shared boundary and invalidate drop generations on cancel and error',
+    () async {
+      final calls = <MethodCall>[];
+      Completer<String?>? pickerGate;
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        calls.add(call);
+        if (call.method == 'bootstrap')
+          return {'origin': origin, 'bearer': bearer};
+        if (call.method == 'pickFile') return pickerGate!.future;
+        return null;
+      });
+      final platform = createPlatformAdapter();
+      await platform.initialize();
+      final activity = <bool>[];
+      platform.nativePickerActive.addListener(
+        () => activity.add(platform.nativePickerActive.value),
+      );
+      const target = MediaDropTarget(
+        targetId: 'source',
+        rect: Rect.fromLTRB(230, 120, 850, 220),
+        clientWidth: 1000,
+      );
+      final accepted = <String>[];
+      await platform.configureMediaDrop(target, onDrop: accepted.add);
+      final initialGeneration =
+          (calls.last.arguments as Map)['generation'] as int;
+      var previousGeneration = initialGeneration;
+      for (final kind in <String>['video', 'project', 'folder', 'executable']) {
+        pickerGate = Completer<String?>();
+        final picking = platform.pickLocalPath(kind);
+        await Future<void>.delayed(Duration.zero);
+        expect(platform.nativePickerActive.value, isTrue);
+        final pickIndex = calls.lastIndexWhere(
+          (call) => call.method == 'pickFile',
+        );
+        expect(calls[pickIndex].arguments, {'kind': kind});
+        expect(calls[pickIndex - 1].method, 'configureMediaDrop');
+        expect(calls[pickIndex - 1].arguments, {'enabled': false});
+        await receiveNative('mediaFileDropped', {
+          'targetId': 'source',
+          'generation': previousGeneration,
+          'path': r'D:\late-picker-drop.mp4',
+        });
+        expect(accepted, isEmpty);
+        if (kind == 'video') {
+          await expectLater(
+            platform.configureMediaDrop(target, onDrop: accepted.add),
+            throwsA(
+              isA<PlatformException>().having(
+                (error) => error.code,
+                'code',
+                'media_drop_unavailable',
+              ),
+            ),
+          );
+        }
+        if (kind == 'project') {
+          pickerGate.completeError(
+            PlatformException(code: 'simulated_picker_failure'),
+          );
+          await expectLater(picking, throwsA(isA<PlatformException>()));
+        } else {
+          pickerGate.complete(null);
+          expect(await picking, isNull);
+        }
+        expect(platform.nativePickerActive.value, isFalse);
+        await platform.configureMediaDrop(target, onDrop: accepted.add);
+        final generation = (calls.last.arguments as Map)['generation'] as int;
+        expect(generation, greaterThan(previousGeneration));
+        previousGeneration = generation;
+      }
+      expect(activity, [true, false, true, false, true, false, true, false]);
+      await receiveNative('mediaFileDropped', {
+        'targetId': 'source',
+        'generation': initialGeneration,
+        'path': r'D:\old-native-drop.mp4',
+      });
+      expect(accepted, isEmpty);
+      await receiveNative('mediaFileDropped', {
+        'targetId': 'source',
+        'generation': previousGeneration,
+        'path': r'D:\new-native-drop.mp4',
+      });
+      expect(accepted, [r'D:\new-native-drop.mp4']);
+      await platform.dispose();
+    },
+    skip: !Platform.isWindows,
+  );
+
+  test(
+    'simulated native drop uses exact agreed fields and rejects stale, hidden and fakepath callbacks',
+    () async {
+      final calls = <MethodCall>[];
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        calls.add(call);
+        if (call.method == 'bootstrap')
+          return {'origin': origin, 'bearer': bearer};
+        return null;
+      });
+      final platform = createPlatformAdapter();
+      await platform.initialize();
+      const target = MediaDropTarget(
+        targetId: 'source',
+        rect: Rect.fromLTRB(230, 120, 850, 220),
+        clientWidth: 1000,
+      );
+      final accepted = <String>[];
+      await platform.configureMediaDrop(target, onDrop: accepted.add);
+      final firstConfig = Map<String, dynamic>.from(
+        calls.last.arguments as Map,
+      );
+      expect(calls.last.method, 'configureMediaDrop');
+      expect(firstConfig.keys.toSet(), {
+        'enabled',
+        'targetId',
+        'generation',
+        'rect',
+        'clientWidth',
+      });
+      expect(firstConfig['rect'], {
+        'left': 230.0,
+        'top': 120.0,
+        'right': 850.0,
+        'bottom': 220.0,
+      });
+      expect(firstConfig['clientWidth'], 1000.0);
+      final generation = firstConfig['generation'] as int;
+      for (final event in <Map<String, Object>>[
+        {
+          'targetId': 'other',
+          'generation': generation,
+          'path': r'D:\source.mp4',
+        },
+        {
+          'targetId': 'source',
+          'generation': generation - 1,
+          'path': r'D:\source.mp4',
+        },
+        {
+          'targetId': 'source',
+          'generation': generation,
+          'path': r'C:\fakepath\source.mp4',
+        },
+        {
+          'targetId': 'source',
+          'generation': generation,
+          'path': 'relative.mp4',
+        },
+      ]) {
+        await receiveNative('mediaFileDropped', event);
+      }
+      expect(accepted, isEmpty);
+      await receiveNative('mediaFileDropped', {
+        'targetId': 'source',
+        'generation': generation,
+        'path': r'D:\中文 空格\source.mp4',
+      });
+      expect(accepted, [r'D:\中文 空格\source.mp4']);
+      await platform.configureMediaDrop(null);
+      expect(calls.last.arguments, {'enabled': false});
+      await receiveNative('mediaFileDropped', {
+        'targetId': 'source',
+        'generation': generation,
+        'path': r'D:\hidden.mp4',
+      });
+      expect(accepted, hasLength(1));
+      await platform.configureMediaDrop(target, onDrop: accepted.add);
+      final secondGeneration =
+          (calls.last.arguments as Map)['generation'] as int;
+      expect(secondGeneration, greaterThan(generation));
+      await receiveNative('mediaFileDropped', {
+        'targetId': 'source',
+        'generation': generation,
+        'path': r'D:\late.mp4',
+      });
+      expect(accepted, hasLength(1));
+      await platform.dispose();
+    },
+    skip: !Platform.isWindows,
+  );
+
+  testWidgets(
+    'late native create is released before the next host creates a lease',
+    (tester) async {
+      final firstCreate = Completer<Map<String, dynamic>>();
+      final firstRelease = Completer<void>();
+      final calls = <String>[];
+      final leases = <String>{};
+      var maximum = 0;
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        final args = call.arguments is Map ? call.arguments as Map : const {};
+        if (call.method == 'bootstrap')
+          return {'origin': origin, 'bearer': bearer};
+        if (call.method == 'createPreview') {
+          final id = args['artifact_id'] as String;
+          calls.add('create:$id');
+          final result = id == first
+              ? await firstCreate.future
+              : <String, dynamic>{
+                  'player_id': id,
+                  'texture_id': 0,
+                  'state': {'ready': true},
+                };
+          leases.add(id);
+          if (leases.length > maximum) maximum = leases.length;
+          return result;
+        }
+        if (call.method == 'disposePreview') {
+          final id = args['player_id'] as String;
+          calls.add('release:$id');
+          if (id == first) await firstRelease.future;
+          leases.remove(id);
+        }
+        return null;
+      });
+      final platform = createPlatformAdapter();
+      await platform.initialize();
+      Widget host(String id) => MaterialApp(
+        locale: const Locale('en'),
+        localizationsDelegates: AppLocalizations.localizationsDelegates,
+        supportedLocales: AppLocalizations.supportedLocales,
+        home: Scaffold(
+          body: SizedBox(
+            key: ValueKey(id),
+            width: 360,
+            height: 300,
+            child: platform.buildVideoPreview(
+              Uri.parse('$origin/api/artifacts/$id/content'),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpWidget(host(first));
+      await tester.pump();
+      expect(calls, ['create:$first']);
+      await tester.pumpWidget(host(second));
+      await tester.pump();
+      expect(calls, ['create:$first']);
+      firstCreate.complete({
+        'player_id': first,
+        'texture_id': 0,
+        'state': {'ready': true},
+      });
+      await tester.pump();
+      await tester.pump();
+      expect(calls, ['create:$first', 'release:$first']);
+      firstRelease.complete();
+      await tester.pump();
+      await tester.pump();
+      expect(calls, ['create:$first', 'release:$first', 'create:$second']);
+      expect(maximum, 1);
+      expect(leases, {second});
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pump();
+      await platform.dispose();
+      expect(leases, isEmpty);
+      expect(tester.takeException(), isNull);
+    },
+    skip: !Platform.isWindows,
+  );
+
+  testWidgets(
+    'native lease release failure blocks a second create instead of hiding failure',
+    (tester) async {
+      var allowRelease = false;
+      final created = <String>[];
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        final args = call.arguments is Map ? call.arguments as Map : const {};
+        if (call.method == 'bootstrap')
+          return {'origin': origin, 'bearer': bearer};
+        if (call.method == 'createPreview') {
+          final id = args['artifact_id'] as String;
+          created.add(id);
+          return {
+            'player_id': id,
+            'texture_id': 0,
+            'state': {'ready': true},
+          };
+        }
+        if (call.method == 'disposePreview' && !allowRelease)
+          throw PlatformException(code: 'media_dispose_failed');
+        return null;
+      });
+      final platform = createPlatformAdapter();
+      await platform.initialize();
+      Widget host(String id) => MaterialApp(
+        locale: const Locale('en'),
+        localizationsDelegates: AppLocalizations.localizationsDelegates,
+        supportedLocales: AppLocalizations.supportedLocales,
+        home: Scaffold(
+          body: SizedBox(
+            key: ValueKey(id),
+            width: 360,
+            height: 300,
+            child: platform.buildVideoPreview(
+              Uri.parse('$origin/api/artifacts/$id/content'),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpWidget(host(first));
+      await tester.pump();
+      await tester.pumpWidget(host(second));
+      await tester.pump();
+      await tester.pump();
+      expect(created, [first]);
+      expect(find.textContaining('media_dispose_failed'), findsOneWidget);
+      allowRelease = true;
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pump();
+      await platform.dispose();
+      expect(tester.takeException(), isNull);
+    },
+    skip: !Platform.isWindows,
+  );
+
   testWidgets(
     'Native preview switches leases and fits narrow controls; channel mock is not decoder evidence',
     (tester) async {
       final created = <String>[];
       final disposed = <String>[];
+      final controls = <String>[];
+      var playing = false;
+      var muted = true;
       messenger.setMockMethodCallHandler(channel, (call) async {
         final arguments = call.arguments is Map
             ? call.arguments as Map
@@ -484,13 +804,26 @@ void main() {
             },
           };
         }
+        if (const {
+          'play',
+          'pause',
+          'seek',
+          'volume',
+          'muted',
+        }.contains(call.method)) {
+          controls.add(call.method);
+          if (call.method == 'play') playing = true;
+          if (call.method == 'pause') playing = false;
+          if (call.method == 'muted') muted = arguments['muted'] as bool;
+          return null;
+        }
         if (call.method == 'playerState') {
           return {
             'player_id': arguments['player_id'],
             'ready': true,
             'can_play': true,
-            'playing': false,
-            'muted': true,
+            'playing': playing,
+            'muted': muted,
             'volume': 1.0,
             'position_seconds': 0.0,
             'duration_seconds': 16.0,
@@ -523,6 +856,20 @@ void main() {
       await tester.pump();
       expect(tester.takeException(), isNull);
       expect(created, [first]);
+      await tester.tap(find.byTooltip('Play'));
+      await tester.pump();
+      await tester.tap(find.byTooltip('Pause'));
+      await tester.pump();
+      await tester.drag(find.byType(Slider).first, const Offset(24, 0));
+      await tester.pump();
+      await tester.tap(find.byTooltip('Unmute'));
+      await tester.pump();
+      await tester.drag(find.byType(Slider).last, const Offset(-24, 0));
+      await tester.pump();
+      expect(
+        controls,
+        containsAll(<String>['play', 'pause', 'seek', 'muted', 'volume']),
+      );
       await receiveNative('windowStateChanged', <String, Object>{
         ...windowState(maximized: true),
         'player_id': first,

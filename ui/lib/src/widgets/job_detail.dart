@@ -5,9 +5,11 @@ import 'package:flutter/material.dart';
 import '../controller.dart';
 import '../localization.dart';
 import '../models.dart';
+import '../path_rules.dart';
 import '../platform/media_platform.dart';
 import 'common_widgets.dart';
 import 'job_widgets.dart';
+import 'source_path_field.dart';
 
 class JobDetailPanel extends StatelessWidget {
   const JobDetailPanel({
@@ -15,6 +17,7 @@ class JobDetailPanel extends StatelessWidget {
     required this.controller,
     required this.platform,
     required this.onError,
+    this.previewEnabled = true,
     super.key,
   });
 
@@ -22,12 +25,19 @@ class JobDetailPanel extends StatelessWidget {
   final AppController controller;
   final MediaPlatformAdapter platform;
   final ValueChanged<String> onError;
+  final bool previewEnabled;
 
   @override
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
     final l10n = context.l10n;
     final artifacts = _artifactsPreviewFirst(job.artifacts);
+    // 单原片工作流只从关联的独立预览任务取租约，不把父任务中间产物当预览。
+    final isWorkflow =
+        job.kind == 'stabilize' || job.kind == 'stabilize_continue';
+    final previewArtifactId = isWorkflow
+        ? null
+        : artifacts.where(_canPreviewArtifact).firstOrNull?.id;
     return SectionCard(
       title: l10n.jobDetails,
       subtitle: job.id,
@@ -35,7 +45,10 @@ class JobDetailPanel extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
-          Text(jobKindLabel(l10n, job.kind), style: Theme.of(context).textTheme.titleSmall),
+          Text(
+            jobKindLabel(l10n, job.kind),
+            style: Theme.of(context).textTheme.titleSmall,
+          ),
           if (job.stage != null) ...<Widget>[
             const SizedBox(height: 8),
             Text(l10n.stageValue(workerStageLabel(l10n, job.stage))),
@@ -43,6 +56,10 @@ class JobDetailPanel extends StatelessWidget {
           if (job.message != null || job.messageKey != null) ...<Widget>[
             const SizedBox(height: 6),
             Text(localizedWorkerText(l10n, job.workerMessage)),
+          ],
+          if (job.workflow != null) ...<Widget>[
+            const SizedBox(height: 12),
+            _WorkflowDetails(job: job, controller: controller),
           ],
           if (job.isActive) ...<Widget>[
             const SizedBox(height: 12),
@@ -71,6 +88,14 @@ class JobDetailPanel extends StatelessWidget {
               isWarning: true,
               icon: Icons.pan_tool_alt_outlined,
             ),
+            if ((job.kind == 'stabilize' || job.kind == 'stabilize_continue') &&
+                controller.capabilities?.supportsStabilizeContinuation == true)
+              _ManualContinuationButton(
+                job: job,
+                controller: controller,
+                platform: platform,
+                onError: onError,
+              ),
           ],
           if (job.state == 'needs_review') ...<Widget>[
             const SizedBox(height: 12),
@@ -106,11 +131,17 @@ class JobDetailPanel extends StatelessWidget {
           ],
           if (job.artifacts.isNotEmpty) ...<Widget>[
             const SizedBox(height: 16),
-            Text(l10n.ownedOutputs, style: Theme.of(context).textTheme.titleSmall),
+            Text(
+              l10n.ownedOutputs,
+              style: Theme.of(context).textTheme.titleSmall,
+            ),
             const SizedBox(height: 8),
             for (var index = 0; index < artifacts.length; index++) ...<Widget>[
               _ArtifactCard(
+                key: ValueKey<String>('artifact-${artifacts[index].id}'),
                 artifact: artifacts[index],
+                previewEnabled:
+                    previewEnabled && artifacts[index].id == previewArtifactId,
                 controller: controller,
                 platform: platform,
                 onError: onError,
@@ -123,7 +154,10 @@ class JobDetailPanel extends StatelessWidget {
             ExpansionTile(
               key: ValueKey<String>('worker-warnings-${job.id}'),
               tilePadding: EdgeInsets.zero,
-              leading: Icon(Icons.warning_amber_outlined, color: colors.tertiary),
+              leading: Icon(
+                Icons.warning_amber_outlined,
+                color: colors.tertiary,
+              ),
               title: Text(l10n.workerWarningsCount(job.warnings.length)),
               children: <Widget>[
                 for (final warning in job.workerWarnings)
@@ -190,9 +224,12 @@ class _ArtifactCard extends StatelessWidget {
     required this.controller,
     required this.platform,
     required this.onError,
+    required this.previewEnabled,
+    super.key,
   });
 
   final ArtifactRecord artifact;
+  final bool previewEnabled;
   final AppController controller;
   final MediaPlatformAdapter platform;
   final ValueChanged<String> onError;
@@ -200,14 +237,7 @@ class _ArtifactCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final l10n = context.l10n;
-    final canPreview =
-        artifact.isBrowserPreview &&
-        _hasCodec(artifact.mediaMetadata['video_codec'], const <String>[
-          'h264',
-          'h.264',
-          'avc1',
-        ]) &&
-        _hasCodec(artifact.mediaMetadata['audio_codec'], const <String>['aac']);
+    final canPreview = _canPreviewArtifact(artifact);
     final canOpen = artifact.mime.toLowerCase().startsWith('video/');
     final reportedFov = _formatReportedFov(
       artifact.mediaMetadata['reference_fov'],
@@ -220,7 +250,12 @@ class _ArtifactCard extends StatelessWidget {
         style: Theme.of(context).textTheme.titleSmall,
       ),
       const SizedBox(height: 4),
-      Text(l10n.artifactFormat(_artifactKindLabel(l10n, artifact.kind), artifact.mime)),
+      Text(
+        l10n.artifactFormat(
+          _artifactKindLabel(l10n, artifact.kind),
+          artifact.mime,
+        ),
+      ),
       if (reportedFov != null) ...<Widget>[
         const SizedBox(height: 6),
         Text(l10n.reportedReferenceFov(reportedFov)),
@@ -241,7 +276,7 @@ class _ArtifactCard extends StatelessWidget {
           icon: Icons.fact_check_outlined,
         ),
       ],
-      if (canPreview) ...<Widget>[
+      if (canPreview && previewEnabled) ...<Widget>[
         const SizedBox(height: 12),
         ClipRRect(
           borderRadius: BorderRadius.circular(14),
@@ -256,8 +291,11 @@ class _ArtifactCard extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 6),
-        Text(l10n.artifactPreview, style: Theme.of(context).textTheme.bodySmall),
-      ] else if (artifact.isBrowserPreview) ...<Widget>[
+        Text(
+          l10n.artifactPreview,
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+      ] else if (artifact.isBrowserPreview && !canPreview) ...<Widget>[
         const SizedBox(height: 8),
         Text(l10n.previewCodecUnknown),
       ],
@@ -337,6 +375,203 @@ String _artifactKindLabel(AppLocalizations l10n, String kind) => switch (kind) {
   'validate' => l10n.jobKindValidate,
   _ => l10n.artifactKindUnknown(kind),
 };
+
+class _WorkflowDetails extends StatelessWidget {
+  const _WorkflowDetails({required this.job, required this.controller});
+  final JobSummary job;
+  final AppController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = context.l10n;
+    final workflow = job.workflow!;
+    final stages = workflow['stages'];
+    final preview = workflow['preview'];
+    final parent = workflow['parent_job_id'];
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text(l10n.workflowProfile(workflow['profile']?.toString() ?? '—')),
+        Text(l10n.workflowAttempt(workflow['attempt']?.toString() ?? '—')),
+        if (parent is String) Text(l10n.workflowParent(parent)),
+        if (workflow['ctb_origin'] == 'manual_import')
+          Text(l10n.manualContinuationProvenance),
+        if (stages is List)
+          for (final stage in stages.whereType<Map>())
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                l10n.workflowStageStatus(
+                  workerStageLabel(l10n, stage['id']?.toString()),
+                  workflowStateLabel(l10n, stage['state']?.toString()),
+                ),
+              ),
+            ),
+        if (preview is Map) ...<Widget>[
+          const SizedBox(height: 8),
+          Text(
+            l10n.workflowPreviewStatus(
+              workflowStateLabel(l10n, preview['state']?.toString()),
+            ),
+          ),
+          if (preview['job_id'] is String)
+            TextButton.icon(
+              onPressed: () =>
+                  controller.selectJob(preview['job_id'] as String),
+              icon: const Icon(Icons.movie_outlined),
+              label: Text(l10n.openWorkflowPreviewJob),
+            ),
+        ],
+      ],
+    );
+  }
+}
+
+class _ManualContinuationButton extends StatefulWidget {
+  const _ManualContinuationButton({
+    required this.job,
+    required this.controller,
+    required this.platform,
+    required this.onError,
+  });
+  final JobSummary job;
+  final AppController controller;
+  final MediaPlatformAdapter platform;
+  final ValueChanged<String> onError;
+
+  @override
+  State<_ManualContinuationButton> createState() =>
+      _ManualContinuationButtonState();
+}
+
+class _ManualContinuationButtonState extends State<_ManualContinuationButton> {
+  bool _busy = false;
+
+  Future<void> _continue() async {
+    if (_busy || widget.controller.isCreatingJob) return;
+    setState(() => _busy = true);
+    final source = TextEditingController();
+    final origin = TextEditingController(text: '0');
+    var declaredManual = false;
+    try {
+      final selected = await showDialog<(String, double)>(
+        context: context,
+        builder: (dialogContext) => StatefulBuilder(
+          builder: (context, updateDialog) {
+            final seconds = double.tryParse(origin.text.trim());
+            final valid =
+                isLocalAbsolutePath(source.text) &&
+                seconds != null &&
+                seconds.isFinite &&
+                seconds >= 0 &&
+                declaredManual;
+            return AlertDialog(
+              title: Text(context.l10n.manualContinueTitle),
+              content: SizedBox(
+                width: 500,
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: <Widget>[
+                      Text(context.l10n.manualContinuationProvenance),
+                      const SizedBox(height: 12),
+                      SourcePathField(
+                        label: context.l10n.manualCtbPath,
+                        helper: context.l10n.ctbInputHelper,
+                        kind: 'video',
+                        pathController: source,
+                        appController: widget.controller,
+                        platform: widget.platform,
+                        onChanged: (_) => updateDialog(() {}),
+                        onError: widget.onError,
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        key: const ValueKey<String>('manual-ctb-origin'),
+                        controller: origin,
+                        keyboardType: const TextInputType.numberWithOptions(
+                          decimal: true,
+                        ),
+                        decoration: InputDecoration(
+                          labelText: context.l10n.manualCtbOrigin,
+                          border: const OutlineInputBorder(),
+                        ),
+                        onChanged: (_) => updateDialog(() {}),
+                      ),
+                      CheckboxListTile(
+                        key: const ValueKey<String>('declare-manual-ctb'),
+                        contentPadding: EdgeInsets.zero,
+                        value: declaredManual,
+                        onChanged: (value) =>
+                            updateDialog(() => declaredManual = value ?? false),
+                        title: Text(context.l10n.declareManualCtb),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              actions: <Widget>[
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(),
+                  child: Text(context.l10n.cancelAction),
+                ),
+                FilledButton(
+                  key: const ValueKey<String>('submit-manual-continuation'),
+                  onPressed: valid
+                      ? () => Navigator.of(
+                          dialogContext,
+                        ).pop((source.text.trim(), seconds))
+                      : null,
+                  child: Text(context.l10n.createContinuationJob),
+                ),
+              ],
+            );
+          },
+        ),
+      );
+      if (selected == null || !mounted) return;
+      await widget.controller.createJob(<String, dynamic>{
+        'kind': 'stabilize_continue',
+        'request': <String, dynamic>{
+          'parent_job_id': widget.job.id,
+          'manual_ctb': <String, dynamic>{
+            'source': selected.$1,
+            'origin_seconds': selected.$2,
+            'declared_at': DateTime.now().toUtc().toIso8601String(),
+          },
+        },
+      });
+    } catch (error) {
+      if (mounted) widget.onError(localizedError(context.l10n, error));
+    } finally {
+      // 对话框退场后再释放文本控制器，避免退场动画仍访问已释放资源。
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+      source.dispose();
+      origin.dispose();
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.only(top: 10),
+    child: OutlinedButton.icon(
+      key: const ValueKey<String>('manual-continue'),
+      onPressed: _busy || widget.controller.isCreatingJob ? null : _continue,
+      icon: const Icon(Icons.input_outlined),
+      label: Text(context.l10n.manualContinueTitle),
+    ),
+  );
+}
+
+bool _canPreviewArtifact(ArtifactRecord artifact) =>
+    artifact.isBrowserPreview &&
+    _hasCodec(artifact.mediaMetadata['video_codec'], const <String>[
+      'h264',
+      'h.264',
+      'avc1',
+    ]) &&
+    _hasCodec(artifact.mediaMetadata['audio_codec'], const <String>['aac']);
 
 bool _hasCodec(dynamic value, List<String> supported) {
   if (value is! String) return false;

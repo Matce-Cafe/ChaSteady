@@ -18,6 +18,9 @@ class _WebPlatformAdapter implements MediaPlatformAdapter {
   bool get supportsNativePicker => false;
 
   @override
+  ValueListenable<bool> get nativePickerActive => noNativePickerActivity;
+
+  @override
   Future<String?> pickLocalPath(String kind) async => null;
 
   @override
@@ -102,6 +105,14 @@ class _WebPlatformAdapter implements MediaPlatformAdapter {
   @override
   Widget buildVideoPreview(Uri contentUri) =>
       _LocalVideoElement(uri: contentUri);
+
+  @override
+  bool get supportsNativeMediaDrop => false;
+  @override
+  Future<void> configureMediaDrop(
+    MediaDropTarget? target, {
+    ValueChanged<String>? onDrop,
+  }) async {}
 }
 
 class _LocalVideoElement extends StatefulWidget {

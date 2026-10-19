@@ -33,9 +33,11 @@ String? intervalValidationMessage(
     null => null,
     IntervalValidationCode.nonNumeric => l10n.intervalNonNumeric(row),
     IntervalValidationCode.negativeStart => l10n.intervalNegativeStart(row),
-    IntervalValidationCode.endNotAfterStart =>
-      l10n.intervalEndNotAfterStart(row),
-    IntervalValidationCode.chronologicalOrder => l10n.intervalChronologicalOrder,
+    IntervalValidationCode.endNotAfterStart => l10n.intervalEndNotAfterStart(
+      row,
+    ),
+    IntervalValidationCode.chronologicalOrder =>
+      l10n.intervalChronologicalOrder,
     IntervalValidationCode.overlap => l10n.intervalOverlap(row),
     IntervalValidationCode.missingSourceWindow => l10n.sourceWindowInvalid,
   };
@@ -78,6 +80,32 @@ String? _knownWorkerMessage(AppLocalizations l10n, WorkerText text) {
   final key = text.messageKey;
   if (key == null) return null;
   switch (key) {
+    case 'job.progress.sourceAcceptance':
+      return l10n.stageSourceAcceptance;
+    case 'job.progress.capabilityPreflight':
+      return l10n.stageCapabilityPreflight;
+    case 'job.progress.ctb':
+      return l10n.stageCtb;
+    case 'job.progress.gf':
+      return l10n.stageGf;
+    case 'job.progress.correspondence':
+      return l10n.stageCorrespondence;
+    case 'job.progress.freshMeasurement':
+      return l10n.stageFreshMeasurement;
+    case 'job.progress.finalValidation':
+      return l10n.stageFinalValidation;
+    case 'job.progress.gyroflowPreflight':
+      return l10n.stageCapabilityPreflight;
+    case 'job.progress.gyroflowExport':
+      return l10n.stageGf;
+    case 'job.progress.gyroflowExportVerified':
+      return l10n.gyroflowDeclaredChecksPassed;
+    case 'job.progress.cancellationRequested':
+      return l10n.cancellationRequested;
+    case 'job.error.ctbExecutorUnavailable':
+      return l10n.ctbExecutorUnavailable;
+    case 'job.error.fullContentCorrespondenceUnverified':
+      return l10n.fullContentCorrespondenceUnverified;
     case 'job.progress.queued':
       return l10n.workerQueued;
     case 'job.progress.starting':
@@ -210,6 +238,8 @@ String? _knownWorkerMessage(AppLocalizations l10n, WorkerText text) {
       return l10n.invalidLocalResourceId;
     case 'ui.error.jobRecordMissing':
       return l10n.missingJobRecord;
+    case 'ui.error.jobCreatePending':
+      return l10n.jobCreatePending;
     case 'ui.error.jobKindRequired':
       return l10n.invalidApiJobKind;
     case 'ui.error.jobFieldsNested':
@@ -266,22 +296,22 @@ String localizedError(AppLocalizations l10n, Object error) {
           ? l10n.originalServiceMessage(message)
           : l10n.originalServiceMessageWithCode(error.code, message);
     }
-    if (error.messageKey != null) return l10n.serviceMessageCodeOnly(error.messageKey!);
-    if (error.statusCode != null) return l10n.serviceHttpError(error.statusCode!);
+    if (error.messageKey != null)
+      return l10n.serviceMessageCodeOnly(error.messageKey!);
+    if (error.statusCode != null)
+      return l10n.serviceHttpError(error.statusCode!);
   }
   if (error is PlatformException) {
     return localizedPlatformError(l10n, error);
   }
-  if (error is UnsupportedError && error.message == 'native_session_unavailable') {
+  if (error is UnsupportedError &&
+      error.message == 'native_session_unavailable') {
     return l10n.sessionUnsupported;
   }
   return l10n.originalServiceMessage(error.toString());
 }
 
-String localizedPlatformError(
-  AppLocalizations l10n,
-  PlatformException error,
-) {
+String localizedPlatformError(AppLocalizations l10n, PlatformException error) {
   final details = error.details;
   String? messageKey;
   Map<String, dynamic> args = const <String, dynamic>{};
@@ -299,7 +329,10 @@ String localizedPlatformError(
   final parts = <String>[];
   final translated = messageKey == null
       ? null
-      : _knownWorkerMessage(l10n, WorkerText(messageKey: messageKey, args: args));
+      : _knownWorkerMessage(
+          l10n,
+          WorkerText(messageKey: messageKey, args: args),
+        );
   if (translated != null) {
     parts.add(translated);
   } else if (messageKey != null) {
@@ -331,6 +364,8 @@ String jobStateLabel(AppLocalizations l10n, String state) => switch (state) {
 };
 
 String jobKindLabel(AppLocalizations l10n, String kind) => switch (kind) {
+  'stabilize' => l10n.jobKindStabilize,
+  'stabilize_continue' => l10n.jobKindStabilizeContinue,
   'fusion' => l10n.jobKindFusion,
   'preview' => l10n.jobKindPreview,
   'gyroflow_export' => l10n.jobKindGyroflowExport,
@@ -342,6 +377,19 @@ String jobKindLabel(AppLocalizations l10n, String kind) => switch (kind) {
 String workerStageLabel(AppLocalizations l10n, String? stage) {
   if (stage == null || stage.isEmpty) return l10n.currentStage;
   return switch (stage) {
+    'queued' => l10n.jobStateQueued,
+    'verified_media' => l10n.jobStateVerifiedMedia,
+    'gyroflow_preflight' => l10n.stageCapabilityPreflight,
+    'gyroflow_export' => l10n.stageGf,
+    'gyroflow_export_verified' => l10n.gyroflowDeclaredChecksPassed,
+    'cancellation_requested' => l10n.cancellationRequested,
+    'source_acceptance' => l10n.stageSourceAcceptance,
+    'capability_preflight' => l10n.stageCapabilityPreflight,
+    'ctb' => l10n.stageCtb,
+    'gf' => l10n.stageGf,
+    'correspondence' => l10n.stageCorrespondence,
+    'fresh_measurement' => l10n.stageFreshMeasurement,
+    'final_validation' => l10n.stageFinalValidation,
     'starting' => l10n.stageStarting,
     'inspect' => l10n.stageInspect,
     'preview_encode' => l10n.stagePreviewEncode,
@@ -361,6 +409,17 @@ String workerStageLabel(AppLocalizations l10n, String? stage) {
   };
 }
 
+String workflowStateLabel(AppLocalizations l10n, String? state) =>
+    switch (state) {
+      null => l10n.unknown,
+      'pending' => l10n.workflowPending,
+      'passed' => l10n.workflowPassed,
+      'ready' => l10n.workflowReady,
+      'not_requested' => l10n.workflowNotRequested,
+      'blocked' => l10n.blocked,
+      _ => jobStateLabel(l10n, state),
+    };
+
 String toolStatusLabel(AppLocalizations l10n, String? value) => switch (value) {
   null => l10n.unknown,
   'verified' => l10n.verified,
@@ -375,9 +434,10 @@ String toolStatusLabel(AppLocalizations l10n, String? value) => switch (value) {
   _ => l10n.originalStatusValue(value),
 };
 
-String capabilityModeLabel(AppLocalizations l10n, String? mode) => switch (mode) {
-  null => l10n.unknown,
-  'cli' => l10n.cliMode,
-  'assisted' => l10n.catalyst,
-  _ => l10n.originalStatusValue(mode),
-};
+String capabilityModeLabel(AppLocalizations l10n, String? mode) =>
+    switch (mode) {
+      null => l10n.unknown,
+      'cli' => l10n.cliMode,
+      'assisted' => l10n.catalyst,
+      _ => l10n.originalStatusValue(mode),
+    };

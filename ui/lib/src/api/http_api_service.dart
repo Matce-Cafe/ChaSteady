@@ -46,9 +46,7 @@ class HttpApiService implements ApiService {
   @override
   Future<AppPreferences> patchPreferences(Map<String, dynamic> patch) async =>
       AppPreferences.fromJson(
-        _requiredMap(
-          await _request('PUT', '/api/preferences', body: patch),
-        ),
+        _requiredMap(await _request('PUT', '/api/preferences', body: patch)),
       );
 
   @override

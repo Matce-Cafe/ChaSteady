@@ -45,6 +45,60 @@ void main() {
   );
 
   test(
+    'stabilize typed messages, stages and preview states localize in both languages',
+    () async {
+      for (final locale in const <Locale>[Locale('en'), Locale('zh')]) {
+        final l10n = await AppLocalizations.delegate.load(locale);
+        for (final key in <String>[
+          'job.progress.sourceAcceptance',
+          'job.progress.capabilityPreflight',
+          'job.progress.ctb',
+          'job.progress.gf',
+          'job.progress.correspondence',
+          'job.progress.freshMeasurement',
+          'job.progress.finalValidation',
+          'job.progress.gyroflowPreflight',
+          'job.progress.gyroflowExport',
+          'job.progress.gyroflowExportVerified',
+          'job.progress.cancellationRequested',
+          'job.error.ctbExecutorUnavailable',
+          'job.error.fullContentCorrespondenceUnverified',
+        ]) {
+          expect(
+            localizedWorkerText(l10n, WorkerText(messageKey: key)),
+            isNot(contains(key)),
+          );
+        }
+        for (final stage in <String>[
+          'source_acceptance',
+          'capability_preflight',
+          'ctb',
+          'gf',
+          'correspondence',
+          'fresh_measurement',
+          'final_validation',
+          'gyroflow_preflight',
+          'gyroflow_export',
+          'gyroflow_export_verified',
+          'cancellation_requested',
+        ]) {
+          expect(
+            workerStageLabel(l10n, stage),
+            isNot(contains(l10n.originalWorkerStage(stage))),
+          );
+        }
+        expect(jobKindLabel(l10n, 'stabilize'), l10n.jobKindStabilize);
+        expect(
+          jobKindLabel(l10n, 'stabilize_continue'),
+          l10n.jobKindStabilizeContinue,
+        );
+        expect(workflowStateLabel(l10n, 'ready'), l10n.workflowReady);
+        expect(workflowStateLabel(l10n, 'blocked'), l10n.blocked);
+      }
+    },
+  );
+
+  test(
     'old preference schema preserves theme and tool paths with system locale',
     () {
       final preferences = AppPreferences.fromJson(<String, dynamic>{
@@ -106,7 +160,13 @@ void main() {
 
     expect(tester.widget<MaterialApp>(find.byType(MaterialApp)).locale, isNull);
     expect(find.byTooltip('工作台'), findsOneWidget);
-    expect(find.byTooltip('任务'), findsOneWidget);
+    expect(
+      find.descendant(
+        of: find.byType(DesktopSidebar),
+        matching: find.byTooltip('任务'),
+      ),
+      findsOneWidget,
+    );
   });
 
   testWidgets(
@@ -173,7 +233,9 @@ void main() {
       expect(find.byType(MenuBar), findsNothing);
       expect(find.byType(JobActivitySheet), findsNothing);
       expect(find.text('Job activity'), findsNothing);
-      await tester.tap(find.byIcon(Icons.view_list_outlined));
+      await tester.tap(
+        find.byKey(const ValueKey<String>('sidebar-destination-1')),
+      );
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 60));
       expect(find.byType(JobActivitySheet), findsNothing);
@@ -331,7 +393,7 @@ void main() {
           expect(find.byTooltip('设置'), findsOneWidget);
           expect(
             tester.widget<DesktopSidebar>(find.byType(DesktopSidebar)).expanded,
-            size.width >= 1100,
+            isTrue,
           );
         }
         expect(find.byType(JobActivitySheet), findsNothing);
@@ -349,7 +411,14 @@ void main() {
           findsNothing,
         );
 
-        await tester.tap(find.byIcon(Icons.view_list_outlined));
+        await tester.tap(
+          size.width < 800
+              ? find.descendant(
+                  of: find.byType(NavigationBar),
+                  matching: find.text('任务'),
+                )
+              : find.byKey(const ValueKey<String>('sidebar-destination-1')),
+        );
         await tester.pump();
         await tester.pump(const Duration(milliseconds: 60));
         expect(find.byType(JobListTile), findsOneWidget);

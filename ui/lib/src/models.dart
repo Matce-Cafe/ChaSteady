@@ -168,6 +168,7 @@ class Capabilities {
     required this.presetCatalog,
     required this.nativePicker,
     this.version,
+    this.stabilize = const <String, dynamic>{},
   });
 
   final ToolCapability ffmpeg;
@@ -177,6 +178,11 @@ class Capabilities {
   final List<PresetRecord> presetCatalog;
   final bool? nativePicker;
   final String? version;
+  final Map<String, dynamic> stabilize;
+
+  bool get supportsStabilize => stabilize['workflow_version'] == 1;
+  bool get supportsStabilizeContinuation =>
+      supportsStabilize && stabilize['continuation_supported'] == true;
 
   factory Capabilities.fromJson(Map<String, dynamic> json) {
     final catalog = json['preset_catalog'];
@@ -192,6 +198,7 @@ class Capabilities {
           ? json['native_picker'] as bool
           : null,
       version: _nonEmptyString(json['version']),
+      stabilize: _stringKeyedMap(json['stabilize']),
     );
   }
 }
@@ -313,11 +320,13 @@ class WorkerText {
     if (value is Map) {
       final map = Map<String, dynamic>.from(value);
       return WorkerText(
-        messageKey: _nonEmptyString(map['message_key']) ??
+        messageKey:
+            _nonEmptyString(map['message_key']) ??
             _nonEmptyString(map['messageKey']) ??
             _nonEmptyString(messageKey),
         args: _stringKeyedMap(map['args'] ?? map['message_args'] ?? args),
-        original: _nonEmptyString(map['message']) ??
+        original:
+            _nonEmptyString(map['message']) ??
             _nonEmptyString(map['text']) ??
             _nonEmptyString(map['original']),
       );
@@ -349,11 +358,7 @@ enum IntervalValidationCode {
 }
 
 class IntervalValidation {
-  const IntervalValidation({
-    this.ranges = const [],
-    this.code,
-    this.row,
-  });
+  const IntervalValidation({this.ranges = const [], this.code, this.row});
 
   final List<IntervalRange> ranges;
   final IntervalValidationCode? code;
@@ -546,6 +551,7 @@ class JobSummary {
     this.errorArgs = const <String, dynamic>{},
     this.warningTexts = const <WorkerText>[],
     this.result,
+    this.workflow,
   });
 
   final String id;
@@ -566,12 +572,10 @@ class JobSummary {
   final Map<String, dynamic> errorArgs;
   final List<WorkerText> warningTexts;
   final Map<String, dynamic>? result;
+  final Map<String, dynamic>? workflow;
 
-  WorkerText get workerMessage => WorkerText(
-    messageKey: messageKey,
-    args: messageArgs,
-    original: message,
-  );
+  WorkerText get workerMessage =>
+      WorkerText(messageKey: messageKey, args: messageArgs, original: message);
 
   WorkerText? get workerError => errorMessage == null && errorMessageKey == null
       ? null
@@ -634,6 +638,9 @@ class JobSummary {
       errorMessageKey: errorText?.messageKey,
       errorArgs: errorText?.args ?? const <String, dynamic>{},
       result: rawResult is Map ? Map<String, dynamic>.from(rawResult) : null,
+      workflow: json['workflow'] is Map
+          ? _stringKeyedMap(json['workflow'])
+          : null,
     );
   }
 }
@@ -672,12 +679,10 @@ DateTime? _dateTime(dynamic value) {
 
 Map<String, dynamic> _stringKeyedMap(dynamic value) {
   if (value is! Map) return const <String, dynamic>{};
-  return Map<String, dynamic>.unmodifiable(
-    <String, dynamic>{
-      for (final entry in value.entries)
-        if (entry.key is String) entry.key as String: entry.value,
-    },
-  );
+  return Map<String, dynamic>.unmodifiable(<String, dynamic>{
+    for (final entry in value.entries)
+      if (entry.key is String) entry.key as String: entry.value,
+  });
 }
 
 List<WorkerText> _workerTextList(dynamic value) {

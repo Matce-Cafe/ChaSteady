@@ -9,6 +9,213 @@ class AppLocalizationsEn extends AppLocalizations {
   AppLocalizationsEn([String locale = 'en']) : super(locale);
 
   @override
+  String workerComponentVersion(Object version) {
+    return 'Worker component: $version';
+  }
+
+  @override
+  String get importOriginal => 'Import original video';
+
+  @override
+  String get gyroflowDeclaredChecksPassed =>
+      'GF export passed its declared checks; inspect the reported scope.';
+
+  @override
+  String get cancellationRequested =>
+      'Cancellation requested; waiting for owned work to stop.';
+
+  @override
+  String get ctbExecutorUnavailable =>
+      'No validated lawful unattended CTB exporter is available. Manual intervention is required; no automatic export has been completed.';
+
+  @override
+  String get fullContentCorrespondenceUnverified =>
+      'Full-source frame-by-frame content correspondence is not verified. The job remains needs_review and retains diagnostics.';
+
+  @override
+  String get originalImportSubtitle =>
+      'Read-only local source. The workflow manages its own intermediate outputs.';
+
+  @override
+  String get recommendedProfile => 'Recommended · recommended-v1';
+
+  @override
+  String get recommendedProfileSubtitle =>
+      'A versioned starting point, not a universal quality guarantee.';
+
+  @override
+  String get fullOriginalWorkflow =>
+      'Process the complete original video with source acceptance, capability checks, CTB, GF, fresh measurement, rigid fusion and final verification.';
+
+  @override
+  String get automaticWorkflowLimit => 'Automation is still being verified';
+
+  @override
+  String get automaticWorkflowLimitMessage =>
+      'No validated unattended CTB exporter is available yet. Starting a job records the real blocker as needs_manual; manual continuation is not automatic stabilization. Measurement failures remain needs_review.';
+
+  @override
+  String get stabilizeAdvancedParameters => 'Advanced parameters';
+
+  @override
+  String get stabilizeParametersInvalid =>
+      'Enter finite values within the displayed ranges. Quality gates cannot be disabled.';
+
+  @override
+  String get stabilizeWorkerUnsupported =>
+      'This Worker does not report stabilize-v1 support. The advanced research paths remain available.';
+
+  @override
+  String get startStabilize => 'Start stabilization';
+
+  @override
+  String get advancedResearchTitle =>
+      'Advanced research · explicit inputs and history';
+
+  @override
+  String get advancedResearchSubtitle =>
+      'Three-source fusion, historical presets and standalone stages.';
+
+  @override
+  String get advancedResearchWarning =>
+      'These are separate research operations, not the single-original automatic workflow. The original video above is shared; CTB/reference inputs, manual ranges and historical cache reproduction keep their original meaning.';
+
+  @override
+  String get alignmentTauName => 'Alignment tau';
+
+  @override
+  String get weightTransitionName => 'Minimum weight transition';
+
+  @override
+  String get weightCornerSpeedName => 'Weight corner speed';
+
+  @override
+  String get anchorCornerSpeedName => 'Anchor corner speed';
+
+  @override
+  String get parameterQuietSigma => 'Quiet sigma (s) · 0 < value ≤ 10';
+
+  @override
+  String get parameterReferenceFov => 'Reference analysis FOV · 1–4×';
+
+  @override
+  String get parameterAlignmentTau => 'Alignment tau (s) · 0.01–2';
+
+  @override
+  String get parameterTransition => 'Minimum weight transition (s) · 0.04–5';
+
+  @override
+  String get parameterWeightSpeed =>
+      'Weight corner speed (1280-wide analysis px/s) · 0 < value ≤ 100';
+
+  @override
+  String get parameterAnchorSpeed =>
+      'Anchor corner speed (1280-wide analysis px/s) · 0 < value ≤ 100';
+
+  @override
+  String get dropSingleOriginalHint =>
+      'Drop one local media file here to import its path. The Worker still validates the file and streams.';
+
+  @override
+  String get nativeDropUnavailable =>
+      'Native drop is currently unavailable. Use the local picker or type an absolute path.';
+
+  @override
+  String get browserLocalPathNotice =>
+      'Browsers cannot expose an Explorer drop as an absolute local path. Use the local-service picker when available, or type the path. No fakepath or media upload is used.';
+
+  @override
+  String get jobCreatePending =>
+      'A job creation is still pending. Wait for it to finish before starting another.';
+
+  @override
+  String get jobKindStabilize => 'Original-video stabilization';
+
+  @override
+  String get jobKindStabilizeContinue => 'Manual-CTB continuation';
+
+  @override
+  String get manualContinueTitle => 'Continue with manual CTB';
+
+  @override
+  String get manualCtbPath => 'Manual CTB video';
+
+  @override
+  String get manualCtbOrigin => 'CTB source origin (s, ≥ 0)';
+
+  @override
+  String get declareManualCtb =>
+      'I declare that this CTB file was exported manually from the same original.';
+
+  @override
+  String get createContinuationJob => 'Create linked continuation';
+
+  @override
+  String get manualContinuationProvenance =>
+      'Manual CTB import creates a new linked job and revalidates it. The parent remains blocked; this does not count as unattended CTB export.';
+
+  @override
+  String workflowProfile(Object profile) {
+    return 'Workflow profile: $profile';
+  }
+
+  @override
+  String workflowAttempt(Object attempt) {
+    return 'Workflow attempt: $attempt';
+  }
+
+  @override
+  String workflowParent(Object id) {
+    return 'Parent job: $id';
+  }
+
+  @override
+  String workflowStageStatus(Object stage, Object state) {
+    return '$stage: $state';
+  }
+
+  @override
+  String workflowPreviewStatus(Object state) {
+    return 'Output preview: $state';
+  }
+
+  @override
+  String get openWorkflowPreviewJob => 'Open preview job';
+
+  @override
+  String get workflowPending => 'Not started';
+
+  @override
+  String get workflowReady => 'Ready for preview';
+
+  @override
+  String get workflowPassed => 'Passed declared checks';
+
+  @override
+  String get workflowNotRequested => 'Not requested';
+
+  @override
+  String get stageSourceAcceptance => 'Source acceptance';
+
+  @override
+  String get stageCapabilityPreflight => 'Capability preflight';
+
+  @override
+  String get stageCtb => 'CTB export';
+
+  @override
+  String get stageGf => 'GF export';
+
+  @override
+  String get stageCorrespondence => 'Time and content correspondence';
+
+  @override
+  String get stageFreshMeasurement => 'Fresh measurement';
+
+  @override
+  String get stageFinalValidation => 'Final verification';
+
+  @override
   String get appTitle => 'ChaSteady';
 
   @override
@@ -218,7 +425,7 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get screenWorkbenchSubtitle =>
-      'Three local sources, explicit intervals, real worker jobs.';
+      'Import an original, start a job, inspect real stages and outputs.';
 
   @override
   String get refreshLocalJobs => 'Refresh local jobs';

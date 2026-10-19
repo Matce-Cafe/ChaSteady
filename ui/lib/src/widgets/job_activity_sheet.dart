@@ -173,7 +173,10 @@ class _SheetHeader extends StatelessWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: <Widget>[
-                    Text(l10n.jobActivity, style: Theme.of(context).textTheme.titleMedium),
+                    Text(
+                      l10n.jobActivity,
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
                     Text(
                       controller.jobs == null
                           ? l10n.waitingLocalQueue

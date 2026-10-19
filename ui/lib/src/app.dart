@@ -34,6 +34,7 @@ class ChaSteadyApp extends StatefulWidget {
 
 class _ChaSteadyAppState extends State<ChaSteadyApp> {
   late final AppController _controller;
+  late final AppLifecycleListener _lifecycle;
   final _shellKey = GlobalKey<_AppShellState>();
   final _closing = ValueNotifier(false);
 
@@ -57,11 +58,16 @@ class _ChaSteadyAppState extends State<ChaSteadyApp> {
       platform: widget.platform,
       sessionNonce: widget.sessionNonce,
     );
+    _lifecycle = AppLifecycleListener(
+      onStateChange: (state) =>
+          _controller.setForeground(state == AppLifecycleState.resumed),
+    );
     _controller.initialize();
   }
 
   @override
   void dispose() {
+    _lifecycle.dispose();
     _controller.dispose();
     _closing.dispose();
     unawaited(widget.platform.dispose());
@@ -263,11 +269,20 @@ class _AppShellState extends State<AppShell> {
     showAboutDialog(
       context: context,
       applicationName: l10n.appTitle,
+      applicationVersion: productVersionLabel,
       applicationIcon: Icon(
         Icons.videocam_outlined,
         color: Theme.of(context).colorScheme.primary,
       ),
-      children: <Widget>[Text(l10n.helpAboutBody)],
+      children: <Widget>[
+        Text(l10n.helpAboutBody),
+        const SizedBox(height: 12),
+        Text(
+          l10n.workerComponentVersion(
+            widget.controller.capabilities?.version ?? l10n.unknown,
+          ),
+        ),
+      ],
     );
   }
 
@@ -385,16 +400,27 @@ class _AppShellState extends State<AppShell> {
   @override
   Widget build(BuildContext context) => LayoutBuilder(
     builder: (context, constraints) {
-      final bottomNavigation =
-          !widget.platform.isNativeDesktop && constraints.maxWidth < 800;
-      final expandedSidebar =
-          _sidebarLabelsPreferred && constraints.maxWidth >= 1100;
+      final bottomNavigation = constraints.maxWidth < 800;
+      final expandedSidebar = _sidebarLabelsPreferred;
       final pages = <Widget>[
         WorkbenchScreen(
           controller: widget.controller,
           platform: widget.platform,
+          active:
+              _selectedIndex == 0 &&
+              !_closing &&
+              widget.controller.isForeground,
+          dropActive: _selectedIndex == 0 && !_closing,
+          onOpenJobs: () => _select(1),
         ),
-        JobsScreen(controller: widget.controller, platform: widget.platform),
+        JobsScreen(
+          controller: widget.controller,
+          platform: widget.platform,
+          active:
+              _selectedIndex == 1 &&
+              !_closing &&
+              widget.controller.isForeground,
+        ),
         SettingsScreen(
           controller: widget.controller,
           platform: widget.platform,
@@ -438,6 +464,7 @@ class _AppShellState extends State<AppShell> {
                         ),
                       ],
                       Expanded(
+                        key: const ValueKey<String>('app-pages'),
                         child: IndexedStack(
                           index: _selectedIndex,
                           children: pages,

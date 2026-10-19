@@ -17,6 +17,9 @@ abstract interface class MediaPlatformAdapter {
   String? consumeSessionNonce();
 
   bool get supportsNativePicker;
+
+  /// 任意共享原生选择器的明确边界；拖入宿主据此撤销旧几何并在结束后重配。
+  ValueListenable<bool> get nativePickerActive;
   Future<String?> pickLocalPath(String kind);
 
   bool get canOpenWeb;
@@ -51,6 +54,60 @@ abstract interface class MediaPlatformAdapter {
   Future<void> dispose();
 
   Widget buildVideoPreview(Uri contentUri);
+
+  /// 只配置当前可见原片导入区；空值立即撤销订阅和原生几何。
+  bool get supportsNativeMediaDrop;
+  Future<void> configureMediaDrop(
+    MediaDropTarget? target, {
+    ValueChanged<String>? onDrop,
+  });
+}
+
+const ValueListenable<bool> noNativePickerActivity = _NoNativePickerActivity();
+
+class _NoNativePickerActivity implements ValueListenable<bool> {
+  const _NoNativePickerActivity();
+  @override
+  bool get value => false;
+  @override
+  void addListener(VoidCallback listener) {}
+  @override
+  void removeListener(VoidCallback listener) {}
+}
+
+class MediaDropTarget {
+  const MediaDropTarget({
+    required this.targetId,
+    required this.rect,
+    required this.clientWidth,
+  });
+  final String targetId;
+  final Rect rect;
+  final double clientWidth;
+
+  bool get isValid =>
+      RegExp(r'^[A-Za-z0-9_-]{1,64}$').hasMatch(targetId) &&
+      <double>[
+        rect.left,
+        rect.top,
+        rect.right,
+        rect.bottom,
+        clientWidth,
+      ].every((value) => value.isFinite) &&
+      clientWidth > 0 &&
+      rect.left >= 0 &&
+      rect.top >= 0 &&
+      !rect.isEmpty &&
+      rect.right <= clientWidth;
+
+  @override
+  bool operator ==(Object other) =>
+      other is MediaDropTarget &&
+      other.targetId == targetId &&
+      other.rect == rect &&
+      other.clientWidth == clientWidth;
+  @override
+  int get hashCode => Object.hash(targetId, rect, clientWidth);
 }
 
 class UnsupportedVideoPreview extends StatelessWidget {

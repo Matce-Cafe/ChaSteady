@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../localization.dart';
+import '../path_rules.dart';
 import 'media_platform.dart';
 import 'platform_adapter_stub.dart' as fallback;
 
@@ -17,6 +18,7 @@ class _WindowsPlatformAdapter implements MediaPlatformAdapter {
   static const _channel = MethodChannel('chasteady/native');
   final _states = <String, ValueNotifier<Map<String, dynamic>>>{};
   final _windowState = ValueNotifier(const DesktopWindowState());
+  final _nativePickerActive = ValueNotifier(false);
   bool _bootstrapReady = false;
   bool _disposed = false;
   Uri? _origin;
@@ -25,6 +27,16 @@ class _WindowsPlatformAdapter implements MediaPlatformAdapter {
   Future<void>? _shutdownFuture;
   Future<bool> Function()? _requestClose;
   Future<void> Function()? _shutdownWarning;
+  int _dropGeneration = 0;
+  String? _dropTargetId;
+  ValueChanged<String>? _dropHandler;
+  bool _dropEnabled = false;
+  bool _hasDropTarget = false;
+  Future<void> _previewQueue = Future<void>.value();
+  Object? _previewOwner;
+  int _previewEpoch = 0;
+  String? _activePlayer;
+  final _playerOwners = <String, Object>{};
 
   @override
   Future<void> initialize() async {
@@ -104,6 +116,21 @@ class _WindowsPlatformAdapter implements MediaPlatformAdapter {
       await _shutdownWarning?.call();
       return null;
     }
+    if (call.method == 'mediaFileDropped') {
+      final event = call.arguments;
+      if (!_disposed &&
+          !_nativePickerActive.value &&
+          _dropEnabled &&
+          event is Map &&
+          event.length == 3 &&
+          event['targetId'] == _dropTargetId &&
+          event['generation'] == _dropGeneration &&
+          event['path'] is String &&
+          isLocalAbsolutePath(event['path'] as String)) {
+        _dropHandler?.call(event['path'] as String);
+      }
+      return null;
+    }
     if (call.method == 'mediaEvent' && call.arguments is Map) {
       final state = Map<String, dynamic>.from(call.arguments as Map);
       final player = state['player_id'];
@@ -127,6 +154,8 @@ class _WindowsPlatformAdapter implements MediaPlatformAdapter {
 
   @override
   bool get supportsNativePicker => supportsLocalServer;
+  @override
+  ValueListenable<bool> get nativePickerActive => _nativePickerActive;
   @override
   bool get canOpenWeb => supportsLocalServer;
   @override
@@ -174,11 +203,73 @@ class _WindowsPlatformAdapter implements MediaPlatformAdapter {
       _windowCommand('setAlwaysOnTop', <String, Object>{'value': value});
 
   @override
+  bool get supportsNativeMediaDrop =>
+      _bootstrapReady && !_shuttingDown && !_disposed;
+
+  @override
+  Future<void> configureMediaDrop(
+    MediaDropTarget? target, {
+    ValueChanged<String>? onDrop,
+  }) async {
+    final generation = ++_dropGeneration;
+    _dropEnabled = false;
+    _dropTargetId = null;
+    _dropHandler = null;
+    if (target == null) {
+      _hasDropTarget = false;
+      await _channel.invokeMethod<void>('configureMediaDrop', <String, Object>{
+        'enabled': false,
+      });
+      return;
+    }
+    if (_nativePickerActive.value) {
+      throw PlatformException(code: 'media_drop_unavailable');
+    }
+    if (!supportsNativeMediaDrop || !target.isValid || onDrop == null) {
+      throw PlatformException(code: 'media_drop_invalid_config');
+    }
+    _hasDropTarget = true;
+    await _channel.invokeMethod<void>('configureMediaDrop', <String, Object>{
+      'enabled': true,
+      'targetId': target.targetId,
+      'generation': generation,
+      'rect': <String, double>{
+        'left': target.rect.left,
+        'top': target.rect.top,
+        'right': target.rect.right,
+        'bottom': target.rect.bottom,
+      },
+      'clientWidth': target.clientWidth,
+    });
+    if (_disposed || generation != _dropGeneration) return;
+    _dropTargetId = target.targetId;
+    _dropHandler = onDrop;
+    _dropEnabled = true;
+  }
+
+  @override
   Future<String?> pickLocalPath(String kind) async {
     if (!const {'video', 'project', 'folder', 'executable'}.contains(kind)) {
       throw PlatformException(code: 'invalid_picker_kind');
     }
-    return _channel.invokeMethod<String>('pickFile', {'kind': kind});
+    if (_disposed ||
+        _shuttingDown ||
+        !_bootstrapReady ||
+        _nativePickerActive.value) {
+      throw PlatformException(code: 'native_picker_unavailable');
+    }
+    // 原生 owner 禁用会清除 OLE 配置；所有字段共用此边界，不依赖焦点通知。
+    ++_dropGeneration;
+    _dropEnabled = false;
+    _dropTargetId = null;
+    _dropHandler = null;
+    _nativePickerActive.value = true;
+    try {
+      if (_hasDropTarget) await configureMediaDrop(null);
+      return await _channel.invokeMethod<String>('pickFile', {'kind': kind});
+    } finally {
+      if (!_disposed) _nativePickerActive.value = false;
+    }
   }
 
   @override
@@ -194,6 +285,17 @@ class _WindowsPlatformAdapter implements MediaPlatformAdapter {
 
   Future<void> _performShutdown() async {
     try {
+      ++_previewEpoch;
+      _previewOwner = null;
+      ++_dropGeneration;
+      _dropEnabled = false;
+      _dropHandler = null;
+      if (_hasDropTarget) await configureMediaDrop(null);
+      await _enqueuePreview(() async {
+        for (final player in _states.keys.toList()) {
+          await _release(player);
+        }
+      });
       await _channel.invokeMethod<void>('requestShutdown');
       _shuttingDown = true;
     } catch (_) {
@@ -206,13 +308,32 @@ class _WindowsPlatformAdapter implements MediaPlatformAdapter {
   Future<void> dispose() async {
     if (_disposed) return;
     _disposed = true;
+    ++_previewEpoch;
+    ++_dropGeneration;
+    _previewOwner = null;
+    _dropEnabled = false;
+    _dropHandler = null;
     _requestClose = null;
     _shutdownWarning = null;
+    if (_hasDropTarget) {
+      try {
+        await configureMediaDrop(null);
+      } on PlatformException {
+        // 退出时原生窗口会撤销 OLE 注册；Dart 回调已经同步失效。
+      }
+    }
+    await _previewQueue;
     for (final player in _states.keys.toList()) {
-      await _release(player);
+      try {
+        await _release(player);
+      } on PlatformException {
+        // 原生监督进程退出时负责最终回收；此处不启动新 Worker。
+        _states.remove(player)?.dispose();
+      }
     }
     _channel.setMethodCallHandler(null);
     _windowState.dispose();
+    _nativePickerActive.dispose();
   }
 
   @override
@@ -232,22 +353,78 @@ class _WindowsPlatformAdapter implements MediaPlatformAdapter {
     return _NativeVideoPreview(adapter: this, artifactId: match.group(1)!);
   }
 
+  Future<T> _enqueuePreview<T>(Future<T> Function() operation) {
+    final result = _previewQueue.then((_) => operation());
+    _previewQueue = result.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace __) {},
+    );
+    return result;
+  }
+
+  Future<Map<String, dynamic>?> _acquirePreview(
+    String artifactId,
+    Object owner,
+  ) {
+    final epoch = ++_previewEpoch;
+    _previewOwner = owner;
+    bool current() =>
+        !_disposed &&
+        !_shuttingDown &&
+        epoch == _previewEpoch &&
+        identical(owner, _previewOwner);
+    return _enqueuePreview(() async {
+      if (!current()) return null;
+      // 切换先等待旧租约释放；释放失败不得创建第二个播放器。
+      final previous = _activePlayer;
+      if (previous != null) await _release(previous);
+      if (!current()) return null;
+      final result = await _create(artifactId);
+      final player = result['player_id'] as String;
+      _playerOwners[player] = owner;
+      if (!current()) {
+        await _release(player);
+        return null;
+      }
+      _activePlayer = player;
+      return result;
+    });
+  }
+
+  Future<void> _releasePreviewOwner(Object owner) {
+    if (identical(owner, _previewOwner)) {
+      ++_previewEpoch;
+      _previewOwner = null;
+    }
+    return _enqueuePreview(() async {
+      for (final player in _playerOwners.keys.toList()) {
+        if (identical(_playerOwners[player], owner)) await _release(player);
+      }
+    });
+  }
+
   Future<Map<String, dynamic>> _create(String artifactId) async {
     final result = await _channel.invokeMapMethod<String, dynamic>(
       'createPreview',
       {'artifact_id': artifactId},
     );
-    if (result == null ||
-        result['player_id'] is! String ||
-        result['texture_id'] is! int ||
-        (result['texture_id'] as int) < 0) {
+    if (result == null || result['player_id'] is! String) {
       throw PlatformException(code: 'invalid_native_player');
     }
     final player = result['player_id'] as String;
+    if (player.isEmpty || _states.containsKey(player)) {
+      throw PlatformException(code: 'invalid_native_player');
+    }
     final initial = result['state'] is Map
         ? Map<String, dynamic>.from(result['state'] as Map)
         : <String, dynamic>{};
     _states[player] = ValueNotifier(initial);
+    // 先登记已创建租约，迟到创建或纹理无效时释放失败也不能漏过下次切换门禁。
+    _activePlayer = player;
+    if (result['texture_id'] is! int || (result['texture_id'] as int) < 0) {
+      await _release(player);
+      throw PlatformException(code: 'invalid_native_player');
+    }
     return result;
   }
 
@@ -269,18 +446,18 @@ class _WindowsPlatformAdapter implements MediaPlatformAdapter {
   }
 
   Future<void> _release(String player) async {
-    final notifier = _states.remove(player);
+    final notifier = _states[player];
     if (notifier == null) return;
-    notifier.dispose();
     if (!_shuttingDown) {
-      try {
-        await _channel.invokeMethod<void>('disposePreview', {
-          'player_id': player,
-        });
-      } on PlatformException {
-        // The owned supervisor may already be terminating; its teardown closes
-        // all players and leases. Do not launch a new worker for disposal.
-      }
+      await _channel.invokeMethod<void>('disposePreview', {
+        'player_id': player,
+      });
+    }
+    if (_states[player] == notifier) {
+      _states.remove(player);
+      _playerOwners.remove(player);
+      if (_activePlayer == player) _activePlayer = null;
+      notifier.dispose();
     }
   }
 }
@@ -301,6 +478,7 @@ class _NativeVideoPreviewState extends State<_NativeVideoPreview> {
   Timer? _timer;
   bool _polling = false;
   int _generation = 0;
+  final Object _owner = Object();
 
   @override
   void initState() {
@@ -313,22 +491,27 @@ class _NativeVideoPreviewState extends State<_NativeVideoPreview> {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.artifactId == widget.artifactId) return;
     _timer?.cancel();
-    final previous = _player;
     _player = null;
     _texture = null;
     _error = null;
     _aspect = 16 / 9;
-    if (previous != null) unawaited(oldWidget.adapter._release(previous));
+    unawaited(
+      oldWidget.adapter._releasePreviewOwner(_owner).catchError((Object _) {}),
+    );
     unawaited(_initialize());
   }
 
   Future<void> _initialize() async {
     final generation = ++_generation;
     try {
-      final result = await widget.adapter._create(widget.artifactId);
+      final result = await widget.adapter._acquirePreview(
+        widget.artifactId,
+        _owner,
+      );
+      if (result == null) return;
       final player = result['player_id'] as String;
       if (!mounted || generation != _generation) {
-        await widget.adapter._release(player);
+        await widget.adapter._releasePreviewOwner(_owner);
         return;
       }
       final width = result['width'];
@@ -380,8 +563,9 @@ class _NativeVideoPreviewState extends State<_NativeVideoPreview> {
   void dispose() {
     ++_generation;
     _timer?.cancel();
-    final player = _player;
-    if (player != null) unawaited(widget.adapter._release(player));
+    unawaited(
+      widget.adapter._releasePreviewOwner(_owner).catchError((Object _) {}),
+    );
     super.dispose();
   }
 

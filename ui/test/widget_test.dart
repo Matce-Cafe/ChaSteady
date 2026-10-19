@@ -268,6 +268,7 @@ void main() {
         ('CTB input video', r'N:\manual\ctb.mp4'),
         ('Gyroflow reference video', r'N:\manual\reference.mp4'),
       ]) {
+        if (label == 'CTB input video') await _openResearch(tester);
         final field = find.byWidgetPredicate(
           (widget) =>
               widget is TextField && widget.decoration?.labelText == label,
@@ -306,18 +307,13 @@ void main() {
         240,
         scrollable: _workbenchScrollable(),
       );
-      final reviewTile = tester.widget<CheckboxListTile>(
-        find.byType(CheckboxListTile),
-      );
-      reviewTile.onChanged!(true);
+      await _scrollToHit(tester, review);
+      await tester.tap(review);
       await tester.pump();
-      await tester.drag(_workbenchScrollable(), const Offset(0, 1200));
-      await tester.pumpAndSettle();
-      final createJob = tester.widget<FilledButton>(
-        find.widgetWithText(FilledButton, 'Create fusion job'),
-      );
-      expect(createJob.onPressed, isNotNull);
-      createJob.onPressed!();
+      final createJob = find.widgetWithText(FilledButton, 'Create fusion job');
+      await _scrollToHit(tester, createJob);
+      expect(tester.widget<FilledButton>(createJob).onPressed, isNotNull);
+      await tester.tap(createJob);
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 50));
 
@@ -603,6 +599,7 @@ void main() {
         ),
       );
       await tester.pump();
+      await _openResearch(tester);
       await tester.scrollUntilVisible(
         find.text('Request Catalyst manual steps'),
         280,
@@ -620,6 +617,32 @@ void main() {
       expect(find.text('Run Catalyst automatically'), findsNothing);
     },
   );
+}
+
+Future<void> _scrollToHit(WidgetTester tester, Finder target) async {
+  for (
+    var step = 0;
+    step < 60 && target.hitTestable().evaluate().isEmpty;
+    step++
+  ) {
+    final above =
+        target.evaluate().isNotEmpty && tester.getCenter(target).dy < 100;
+    await tester.drag(_workbenchScrollable(), Offset(0, above ? 260 : -260));
+    await tester.pump(const Duration(milliseconds: 80));
+  }
+  expect(target.hitTestable(), findsOneWidget);
+}
+
+Future<void> _openResearch(WidgetTester tester) async {
+  final research = find.text('Advanced research · explicit inputs and history');
+  await tester.scrollUntilVisible(
+    research,
+    240,
+    scrollable: _workbenchScrollable(),
+  );
+  await tester.ensureVisible(research);
+  await tester.tap(research);
+  await tester.pump(const Duration(milliseconds: 250));
 }
 
 Finder _workbenchScrollable() => find

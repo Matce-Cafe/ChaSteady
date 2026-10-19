@@ -221,8 +221,7 @@ void main() {
           'original': r'C:\Media\SampleProject\C7037.MP4',
           'ctb':
               r'C:\Media\SampleProject\Catalyst Browse\C7037-Catalyst-Browse.mp4',
-          'reference':
-              r'C:\Media\SampleProject\Gyroflow\C7037_Gyroflow.mp4',
+          'reference': r'C:\Media\SampleProject\Gyroflow\C7037_Gyroflow.mp4',
           'start': 212.0,
           'end': 228.0,
           'ctb_origin': 0,

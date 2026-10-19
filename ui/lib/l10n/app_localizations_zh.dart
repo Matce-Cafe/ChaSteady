@@ -9,6 +9,200 @@ class AppLocalizationsZh extends AppLocalizations {
   AppLocalizationsZh([String locale = 'zh']) : super(locale);
 
   @override
+  String workerComponentVersion(Object version) {
+    return 'Worker 组件版本：$version';
+  }
+
+  @override
+  String get importOriginal => '导入原片';
+
+  @override
+  String get gyroflowDeclaredChecksPassed => 'GF 导出已通过声明范围内的检查，请查看实际验证范围。';
+
+  @override
+  String get cancellationRequested => '已请求取消，正在等待自有处理停止。';
+
+  @override
+  String get ctbExecutorUnavailable =>
+      '目前没有已验证的合法无人值守 CTB 导出器，需要人工处理；尚未完成自动导出。';
+
+  @override
+  String get fullContentCorrespondenceUnverified =>
+      '尚未验证全源逐帧内容对应关系。任务保持 needs_review 并保留诊断。';
+
+  @override
+  String get originalImportSubtitle => '原片保持只读，中间产物由工作流程管理。';
+
+  @override
+  String get recommendedProfile => '推荐配置 · recommended-v1';
+
+  @override
+  String get recommendedProfileSubtitle => '版本化的可靠起点，不是对任意素材效果的保证。';
+
+  @override
+  String get fullOriginalWorkflow =>
+      '处理完整原片，依次进行来源验收、能力预检、CTB、GF、新测量、刚性融合与最终验证。';
+
+  @override
+  String get automaticWorkflowLimit => '自动流程仍在验证';
+
+  @override
+  String get automaticWorkflowLimitMessage =>
+      '目前没有已验证的合法无人值守 CTB 导出器。开始后会以 needs_manual 如实记录阻塞；人工续跑不算自动稳像。测量门禁未通过仍保留 needs_review。';
+
+  @override
+  String get stabilizeAdvancedParameters => '高级参数';
+
+  @override
+  String get stabilizeParametersInvalid => '请输入显示范围内的有限数值；质量门禁不能关闭。';
+
+  @override
+  String get stabilizeWorkerUnsupported =>
+      '此 Worker 未报告 stabilize-v1 能力；高级研究路径仍可使用。';
+
+  @override
+  String get startStabilize => '开始稳像';
+
+  @override
+  String get advancedResearchTitle => '高级研究 · 显式输入与历史复现';
+
+  @override
+  String get advancedResearchSubtitle => '三路融合、历史预设及独立处理阶段。';
+
+  @override
+  String get advancedResearchWarning =>
+      '以下是独立研究操作，不是单原片自动流程。上方原片共用；CTB／参考输入、人工区间与历史缓存复现保留原有含义。';
+
+  @override
+  String get alignmentTauName => '配准 tau';
+
+  @override
+  String get weightTransitionName => '最小权重过渡';
+
+  @override
+  String get weightCornerSpeedName => '权重角点速度';
+
+  @override
+  String get anchorCornerSpeedName => '锚定角点速度';
+
+  @override
+  String get parameterQuietSigma => '静稳 sigma（秒）· 0 < 数值 ≤ 10';
+
+  @override
+  String get parameterReferenceFov => '参考分析 FOV · 1–4 倍';
+
+  @override
+  String get parameterAlignmentTau => '配准 tau（秒）· 0.01–2';
+
+  @override
+  String get parameterTransition => '最小权重过渡（秒）· 0.04–5';
+
+  @override
+  String get parameterWeightSpeed => '权重角点速度（1280 宽分析像素／秒）· 0 < 数值 ≤ 100';
+
+  @override
+  String get parameterAnchorSpeed => '锚定角点速度（1280 宽分析像素／秒）· 0 < 数值 ≤ 100';
+
+  @override
+  String get dropSingleOriginalHint => '将单个本地媒体文件拖入此处导入路径；文件和媒体流仍须由 Worker 验收。';
+
+  @override
+  String get nativeDropUnavailable => '当前无法使用原生拖入，请使用本机选择器或输入绝对路径。';
+
+  @override
+  String get browserLocalPathNotice =>
+      '浏览器无法从资源管理器拖入取得本机绝对路径。请使用可用的本地服务选择器或手输路径；不会使用 fakepath，也不会上传媒体。';
+
+  @override
+  String get jobCreatePending => '任务仍在创建，请等待完成后再开始其他任务。';
+
+  @override
+  String get jobKindStabilize => '原片稳像';
+
+  @override
+  String get jobKindStabilizeContinue => '人工 CTB 关联续跑';
+
+  @override
+  String get manualContinueTitle => '使用人工 CTB 继续';
+
+  @override
+  String get manualCtbPath => '人工 CTB 视频';
+
+  @override
+  String get manualCtbOrigin => 'CTB 对应原片起点（秒，≥ 0）';
+
+  @override
+  String get declareManualCtb => '我声明此 CTB 文件由同一原片人工导出。';
+
+  @override
+  String get createContinuationJob => '创建关联续跑任务';
+
+  @override
+  String get manualContinuationProvenance =>
+      '人工 CTB 导入会创建关联的新任务并重新验收。父任务仍保留阻塞，不计为无人值守 CTB 导出。';
+
+  @override
+  String workflowProfile(Object profile) {
+    return '工作流配置：$profile';
+  }
+
+  @override
+  String workflowAttempt(Object attempt) {
+    return '工作流尝试：$attempt';
+  }
+
+  @override
+  String workflowParent(Object id) {
+    return '父任务：$id';
+  }
+
+  @override
+  String workflowStageStatus(Object stage, Object state) {
+    return '$stage：$state';
+  }
+
+  @override
+  String workflowPreviewStatus(Object state) {
+    return '成片预览：$state';
+  }
+
+  @override
+  String get openWorkflowPreviewJob => '打开预览任务';
+
+  @override
+  String get workflowPending => '尚未开始';
+
+  @override
+  String get workflowReady => '预览已就绪';
+
+  @override
+  String get workflowPassed => '已通过声明范围检查';
+
+  @override
+  String get workflowNotRequested => '未请求';
+
+  @override
+  String get stageSourceAcceptance => '来源验收';
+
+  @override
+  String get stageCapabilityPreflight => '能力预检';
+
+  @override
+  String get stageCtb => 'CTB 导出';
+
+  @override
+  String get stageGf => 'GF 导出';
+
+  @override
+  String get stageCorrespondence => '时间与内容对应检查';
+
+  @override
+  String get stageFreshMeasurement => '新测量';
+
+  @override
+  String get stageFinalValidation => '最终验证';
+
+  @override
   String get appTitle => 'ChaSteady';
 
   @override
@@ -211,7 +405,7 @@ class AppLocalizationsZh extends AppLocalizations {
   String get screenWorkbenchTitle => '稳定工作区';
 
   @override
-  String get screenWorkbenchSubtitle => '三个本地来源、明确的时间区间和真实工作进程任务。';
+  String get screenWorkbenchSubtitle => '导入原片、开始任务，查看真实阶段与输出。';
 
   @override
   String get refreshLocalJobs => '刷新本地任务';

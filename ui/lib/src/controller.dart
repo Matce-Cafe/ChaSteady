@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart' show ThemeMode;
@@ -35,10 +36,36 @@ class AppController extends ChangeNotifier {
   Object? presetDiscoveryError;
 
   Timer? _pollTimer;
-  Timer? _preferencesTimer;
-  bool _refreshingJobs = false;
+  Future<void>? _initializing;
+  Future<void>? _jobsRefresh;
+  Future<JobSummary>? _creatingJob;
+  String? _creatingPayload;
+  final _cancellations = <String, Future<void>>{};
+  final _jobRevisions = <String, int>{};
+  int _revision = 0;
+  int _selectionGeneration = 0;
+  bool _foreground = true;
+  bool _refreshOnResume = false;
   bool _refreshingPreferences = false;
   bool _disposed = false;
+
+  bool get isCreatingJob => _creatingJob != null;
+  bool get isForeground => _foreground;
+  bool isCancellingJob(String id) => _cancellations.containsKey(id);
+
+  /// 前台只有一个调度器；恢复焦点立即刷新，不由各任务宿主另建轮询。
+  void setForeground(bool foreground) {
+    if (_disposed || _foreground == foreground) return;
+    _foreground = foreground;
+    _notify();
+    _pollTimer?.cancel();
+    _pollTimer = null;
+    if (foreground && isApiReady) {
+      _refreshOnResume = _jobsRefresh != null;
+      unawaited(refreshJobs());
+      unawaited(refreshPreferences());
+    }
+  }
 
   bool get isApiReady => connectionState == AppConnectionState.ready;
 
@@ -65,7 +92,14 @@ class AppController extends ChangeNotifier {
     return all;
   }
 
-  Future<void> initialize() async {
+  Future<void> initialize() {
+    if (_disposed) return Future<void>.value();
+    return _initializing ??= _initialize().whenComplete(
+      () => _initializing = null,
+    );
+  }
+
+  Future<void> _initialize() async {
     if (!platform.supportsLocalServer) {
       connectionState = AppConnectionState.unsupported;
       connectionError = UnsupportedError('native_session_unavailable');
@@ -100,10 +134,6 @@ class AppController extends ChangeNotifier {
       _loadPreferences(),
       refreshJobs(),
     ]);
-    _preferencesTimer ??= Timer.periodic(
-      const Duration(seconds: 5),
-      (_) => refreshPreferences(),
-    );
     _updatePolling();
   }
 
@@ -169,42 +199,106 @@ class AppController extends ChangeNotifier {
     );
   }
 
-  Future<void> refreshJobs() async {
-    if (!isApiReady || _refreshingJobs) return;
-    _refreshingJobs = true;
+  Future<void> refreshJobs() {
+    if (!isApiReady || _disposed) return Future<void>.value();
+    final pending = _jobsRefresh;
+    if (pending != null) return pending;
+    _pollTimer?.cancel();
+    _pollTimer = null;
+    final revision = _revision;
+    return _jobsRefresh = _receiveJobs(revision).whenComplete(() {
+      _jobsRefresh = null;
+      _notify();
+      if (_refreshOnResume && _foreground && !_disposed) {
+        _refreshOnResume = false;
+        unawaited(refreshJobs());
+      } else {
+        _updatePolling();
+      }
+    });
+  }
+
+  Future<void> _receiveJobs(int revision) async {
     try {
       final received = await api.getJobs();
-      jobs = received;
+      if (_disposed) return;
+      final current = <String, JobSummary>{
+        for (final job in jobs ?? const <JobSummary>[]) job.id: job,
+      };
+      final merged = <JobSummary>[];
+      final ids = <String>{};
+      // 刷新开始之后的创建、详情和取消优先，旧列表不得覆盖新结果。
+      for (final job in current.values) {
+        if ((_jobRevisions[job.id] ?? 0) > revision) {
+          merged.add(job);
+          ids.add(job.id);
+        }
+      }
+      for (final job in received) {
+        if (ids.add(job.id)) merged.add(job);
+      }
+      jobs = merged;
       jobsError = null;
-      if (selectedJobId != null &&
-          !received.any((job) => job.id == selectedJobId)) {
+      if (selectedJobId != null && !ids.contains(selectedJobId)) {
         selectedJobId = null;
+        selectedJobError = null;
+        ++_selectionGeneration;
       }
     } catch (error) {
-      jobsError = error;
-    } finally {
-      _refreshingJobs = false;
-      _notify();
-      _updatePolling();
+      if (!_disposed) jobsError = error;
     }
   }
 
   Future<void> selectJob(String id) async {
+    final generation = ++_selectionGeneration;
+    final revision = _revision;
     selectedJobId = id;
     selectedJobError = null;
     _notify();
     if (!isApiReady) return;
     try {
       final detail = await api.getJob(id);
-      _upsertJob(detail);
+      if (_disposed ||
+          generation != _selectionGeneration ||
+          selectedJobId != id)
+        return;
+      if ((_jobRevisions[id] ?? 0) <= revision) _upsertJob(detail);
       selectedJobError = null;
     } catch (error) {
+      if (_disposed ||
+          generation != _selectionGeneration ||
+          selectedJobId != id)
+        return;
       selectedJobError = error;
     }
     _notify();
+    _updatePolling();
   }
 
-  Future<JobSummary> createJob(Map<String, dynamic> payload) async {
+  Future<JobSummary> createJob(Map<String, dynamic> payload) {
+    final identity = jsonEncode(payload);
+    if (_creatingJob != null) {
+      if (_creatingPayload == identity) return _creatingJob!;
+      return Future<JobSummary>.error(
+        const ApiException(
+          code: 'job_create_pending',
+          message: 'Another job creation is still pending.',
+          messageKey: 'ui.error.jobCreatePending',
+        ),
+      );
+    }
+    _creatingPayload = identity;
+    final future = _createJob(payload);
+    _creatingJob = future.whenComplete(() {
+      _creatingJob = null;
+      _creatingPayload = null;
+      _notify();
+    });
+    _notify();
+    return _creatingJob!;
+  }
+
+  Future<JobSummary> _createJob(Map<String, dynamic> payload) async {
     final kind = payload['kind'];
     if (kind is! String || kind.trim().isEmpty) {
       throw const ApiException(
@@ -235,7 +329,9 @@ class AppController extends ChangeNotifier {
       }
     }
     final job = await api.createJob(kind, request);
+    if (_disposed) return job;
     _upsertJob(job);
+    ++_selectionGeneration;
     selectedJobId = job.id;
     selectedJobError = null;
     _notify();
@@ -243,10 +339,26 @@ class AppController extends ChangeNotifier {
     return job;
   }
 
-  Future<void> cancelJob(String id) async {
+  Future<void> cancelJob(String id) {
+    final pending = _cancellations[id];
+    if (pending != null) return pending;
+    final future = _cancelJob(id).whenComplete(() {
+      _cancellations.remove(id);
+      _notify();
+    });
+    _cancellations[id] = future;
+    _notify();
+    return future;
+  }
+
+  Future<void> _cancelJob(String id) async {
     final job = await api.cancelJob(id);
+    if (_disposed) return;
     _upsertJob(job);
-    selectedJobError = null;
+    if (selectedJobId == id) {
+      ++_selectionGeneration;
+      selectedJobError = null;
+    }
     _notify();
     _updatePolling();
   }
@@ -283,7 +395,9 @@ class AppController extends ChangeNotifier {
         AppLanguageMode.en => 'en',
       };
       _mergeServerPreferences(
-        await api.patchPreferences(<String, dynamic>{'language_mode': language}),
+        await api.patchPreferences(<String, dynamic>{
+          'language_mode': language,
+        }),
       );
       preferencesSaveError = null;
     } catch (error) {
@@ -385,21 +499,20 @@ class AppController extends ChangeNotifier {
       updated[index] = job;
       jobs = updated;
     }
-    jobsError = null;
+    _jobRevisions[job.id] = ++_revision;
   }
 
   void _updatePolling() {
-    if (_disposed) return;
+    _pollTimer?.cancel();
+    _pollTimer = null;
+    if (_disposed || !_foreground || !isApiReady || _jobsRefresh != null)
+      return;
     final hasActive = jobs?.any((job) => job.isActive) ?? false;
-    if (hasActive && _pollTimer == null && isApiReady) {
-      _pollTimer = Timer.periodic(
-        const Duration(seconds: 3),
-        (_) => refreshJobs(),
-      );
-    } else if (!hasActive) {
-      _pollTimer?.cancel();
+    _pollTimer = Timer(Duration(seconds: hasActive ? 3 : 15), () {
       _pollTimer = null;
-    }
+      unawaited(refreshPreferences());
+      unawaited(refreshJobs());
+    });
   }
 
   void _notify() {
@@ -410,10 +523,8 @@ class AppController extends ChangeNotifier {
   void dispose() {
     _disposed = true;
     _pollTimer?.cancel();
-    _preferencesTimer?.cancel();
     super.dispose();
   }
 }
 
 enum AppConnectionState { starting, ready, unsupported, needsSession, error }
-

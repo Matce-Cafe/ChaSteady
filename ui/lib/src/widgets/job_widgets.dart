@@ -64,11 +64,13 @@ class JobStateLabel extends StatelessWidget {
           children: <Widget>[
             Icon(icon, size: 16, color: foreground),
             const SizedBox(width: 6),
-            Text(
-              label,
-              style: Theme.of(
-                context,
-              ).textTheme.labelMedium?.copyWith(color: foreground),
+            Flexible(
+              child: Text(
+                label,
+                style: Theme.of(
+                  context,
+                ).textTheme.labelMedium?.copyWith(color: foreground),
+              ),
             ),
           ],
         ),
@@ -96,7 +98,10 @@ class JobProgressFeedback extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: <Widget>[
         if (progress == null) ...<Widget>[
-          Text(l10n.progressNotReported, style: Theme.of(context).textTheme.labelMedium),
+          Text(
+            l10n.progressNotReported,
+            style: Theme.of(context).textTheme.labelMedium,
+          ),
           const SizedBox(height: 4),
         ],
         Semantics(
@@ -109,7 +114,10 @@ class JobProgressFeedback extends StatelessWidget {
         ),
         if (progress == null) ...<Widget>[
           const SizedBox(height: 4),
-          Text(l10n.noWorkerPercentage, style: Theme.of(context).textTheme.bodySmall),
+          Text(
+            l10n.noWorkerPercentage,
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
         ],
       ],
     );

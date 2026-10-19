@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 
 import '../app.dart';
-import '../brand.dart';
 import '../controller.dart';
 import '../localization.dart';
 import '../models.dart';
@@ -10,16 +9,24 @@ import '../platform/media_platform.dart';
 import '../widgets/common_widgets.dart';
 import '../widgets/interval_editor.dart';
 import '../widgets/source_path_field.dart';
+import 'jobs_screen.dart';
 
 class WorkbenchScreen extends StatefulWidget {
   const WorkbenchScreen({
     required this.controller,
     required this.platform,
+    this.active = true,
+    this.dropActive = true,
+    this.onOpenJobs,
     super.key,
   });
 
   final AppController controller;
   final MediaPlatformAdapter platform;
+  final bool active;
+  // 外部 OLE 源窗口可占前台，拖入资格不能复用预览的前台租约条件。
+  final bool dropActive;
+  final VoidCallback? onOpenJobs;
 
   @override
   State<WorkbenchScreen> createState() => _WorkbenchScreenState();
@@ -55,6 +62,42 @@ class _WorkbenchScreenState extends State<WorkbenchScreen> {
   bool _creatingPreview = false;
   bool _validating = false;
   bool _requestingManual = false;
+  bool _stabilizing = false;
+  bool _researchExpanded = false;
+  bool _parametersExpanded = false;
+  bool _inspecting = false;
+  int _sourceGeneration = 0;
+  final _recommendedParameters = <String, TextEditingController>{
+    'quiet_sigma_seconds': TextEditingController(text: '1.3'),
+    'reference_fov': TextEditingController(text: '1'),
+    'alignment_tau_seconds': TextEditingController(text: '0.12'),
+    'minimum_weight_transition_seconds': TextEditingController(text: '0.30'),
+    'weight_corner_speed': TextEditingController(text: '12.5'),
+    'anchor_corner_speed': TextEditingController(text: '5'),
+  };
+
+  Map<String, double>? get _parsedParameters {
+    const bounds = <String, (double, double, bool)>{
+      'quiet_sigma_seconds': (0, 10, false),
+      'reference_fov': (1, 4, true),
+      'alignment_tau_seconds': (0.01, 2, true),
+      'minimum_weight_transition_seconds': (0.04, 5, true),
+      'weight_corner_speed': (0, 100, false),
+      'anchor_corner_speed': (0, 100, false),
+    };
+    final parsed = <String, double>{};
+    for (final entry in _recommendedParameters.entries) {
+      final value = double.tryParse(entry.value.text.trim());
+      final (min, max, inclusive) = bounds[entry.key]!;
+      if (value == null ||
+          !value.isFinite ||
+          value > max ||
+          (inclusive ? value < min : value <= min))
+        return null;
+      parsed[entry.key] = value;
+    }
+    return parsed;
+  }
 
   List<PresetRecord> get _c7037Presets => widget.controller.availablePresets
       .where((preset) => preset.isC7037 && preset.hasCompleteCachedV9Request)
@@ -117,6 +160,10 @@ class _WorkbenchScreenState extends State<WorkbenchScreen> {
 
   @override
   void dispose() {
+    ++_sourceGeneration;
+    for (final controller in _recommendedParameters.values) {
+      controller.dispose();
+    }
     _original.dispose();
     _ctb.dispose();
     _reference.dispose();
@@ -142,6 +189,10 @@ class _WorkbenchScreenState extends State<WorkbenchScreen> {
     ).showSnackBar(SnackBar(content: Text(message)));
   }
 
+  void _showError(Object error) {
+    if (mounted) _showMessage(localizedError(context.l10n, error));
+  }
+
   void _invalidateSelectedPreset() {
     if (_fusionMode == 'cached_v9' && _selectedPreset != null) {
       _selectedPreset = null;
@@ -151,7 +202,9 @@ class _WorkbenchScreenState extends State<WorkbenchScreen> {
   }
 
   void _sourceChanged(String _) {
+    ++_sourceGeneration;
     setState(() {
+      _inspecting = false;
       _invalidateSelectedPreset();
       _reviewedIntervals = false;
       _inspection = null;
@@ -324,6 +377,8 @@ class _WorkbenchScreenState extends State<WorkbenchScreen> {
       _selectedPreset = canonical;
       _selectedPresetErrorKey = fieldErrorKey;
       _selectedPresetIntervalError = fieldValidationError;
+      ++_sourceGeneration;
+      _inspecting = false;
       _original.text = original ?? '';
       _ctb.text = ctb ?? '';
       _reference.text = reference ?? '';
@@ -343,21 +398,68 @@ class _WorkbenchScreenState extends State<WorkbenchScreen> {
   }
 
   Future<void> _inspectOriginal() async {
+    if (_inspecting) return;
     final path = _original.text.trim();
     if (path.isEmpty ||
         !isLocalAbsolutePath(path) ||
         !widget.controller.isApiReady) {
       return;
     }
+    final generation = ++_sourceGeneration;
     setState(() {
+      _inspecting = true;
       _inspection = null;
       _inspectionError = null;
     });
+    bool current() =>
+        mounted &&
+        generation == _sourceGeneration &&
+        _original.text.trim() == path;
     try {
       final result = await widget.controller.inspectMedia(path);
-      if (mounted) setState(() => _inspection = result);
+      if (current()) setState(() => _inspection = result);
     } catch (error) {
-      if (mounted) setState(() => _inspectionError = error);
+      if (current()) setState(() => _inspectionError = error);
+    } finally {
+      if (current()) setState(() => _inspecting = false);
+    }
+  }
+
+  Future<void> _startStabilize() async {
+    if (_stabilizing ||
+        widget.controller.isCreatingJob ||
+        !widget.controller.isApiReady ||
+        widget.controller.capabilities?.supportsStabilize != true ||
+        !isLocalAbsolutePath(_original.text))
+      return;
+    final parameters = _parsedParameters;
+    if (parameters == null) {
+      _showMessage(context.l10n.stabilizeParametersInvalid);
+      return;
+    }
+    setState(() => _stabilizing = true);
+    try {
+      final job = await widget.controller.createJob(<String, dynamic>{
+        'kind': 'stabilize',
+        'request': <String, dynamic>{
+          'original': _original.text.trim(),
+          'profile': 'recommended-v1',
+          'full_source': true,
+          'parameters': parameters,
+        },
+      });
+      if (!mounted) return;
+      _showMessage(
+        context.l10n.jobCreatedNotice(
+          jobKindLabel(context.l10n, job.kind),
+          job.id,
+          jobStateLabel(context.l10n, job.state),
+        ),
+      );
+    } catch (error) {
+      if (mounted) _showMessage(localizedError(context.l10n, error));
+    } finally {
+      if (mounted) setState(() => _stabilizing = false);
     }
   }
 
@@ -371,6 +473,7 @@ class _WorkbenchScreenState extends State<WorkbenchScreen> {
   }
 
   Future<void> _startFusion() async {
+    if (_submitting || widget.controller.isCreatingJob) return;
     setState(() => _attemptedFusion = true);
     final window = _sourceWindowValidation;
     final intervals = _intervalValidation;
@@ -424,9 +527,10 @@ class _WorkbenchScreenState extends State<WorkbenchScreen> {
     setState(() => _submitting = true);
     try {
       final job = await widget.controller.createJob(payload);
+      if (!mounted) return;
       _showMessage(context.l10n.jobCreatedNotice(job.kind, job.id, job.state));
     } catch (error) {
-      _showMessage(localizedError(context.l10n, error));
+      _showError(error);
     } finally {
       if (mounted) setState(() => _submitting = false);
     }
@@ -495,6 +599,7 @@ class _WorkbenchScreenState extends State<WorkbenchScreen> {
   }
 
   Future<void> _createPreview() async {
+    if (_creatingPreview || widget.controller.isCreatingJob) return;
     final caps = widget.controller.capabilities;
     if (!widget.controller.isApiReady ||
         !isLocalAbsolutePath(_original.text) ||
@@ -508,15 +613,17 @@ class _WorkbenchScreenState extends State<WorkbenchScreen> {
         'source': _original.text.trim(),
         'start': 0,
       });
+      if (!mounted) return;
       _showMessage(context.l10n.previewJobCreatedNotice(job.id, job.state));
     } catch (error) {
-      _showMessage(localizedError(context.l10n, error));
+      _showError(error);
     } finally {
       if (mounted) setState(() => _creatingPreview = false);
     }
   }
 
   Future<void> _validateOriginal() async {
+    if (_validating || widget.controller.isCreatingJob) return;
     if (!widget.controller.isApiReady ||
         !isLocalAbsolutePath(_original.text) ||
         widget.controller.capabilities?.ffprobe.detected != true) {
@@ -528,15 +635,17 @@ class _WorkbenchScreenState extends State<WorkbenchScreen> {
         'kind': 'validate',
         'source': _original.text.trim(),
       });
+      if (!mounted) return;
       _showMessage(context.l10n.validationJobCreatedNotice(job.id, job.state));
     } catch (error) {
-      _showMessage(localizedError(context.l10n, error));
+      _showError(error);
     } finally {
       if (mounted) setState(() => _validating = false);
     }
   }
 
   Future<void> _exportGyroflow() async {
+    if (_exporting || widget.controller.isCreatingJob) return;
     final capability = widget.controller.capabilities?.gyroflow;
     if (!widget.controller.isApiReady ||
         !isLocalAbsolutePath(_original.text) ||
@@ -564,9 +673,10 @@ class _WorkbenchScreenState extends State<WorkbenchScreen> {
     }
     try {
       final job = await widget.controller.createJob(request);
+      if (!mounted) return;
       _showMessage(context.l10n.gyroflowJobCreatedNotice(job.id, job.state));
     } catch (error) {
-      _showMessage(localizedError(context.l10n, error));
+      _showError(error);
     } finally {
       if (mounted) setState(() => _exporting = false);
     }
@@ -765,6 +875,7 @@ class _WorkbenchScreenState extends State<WorkbenchScreen> {
   }
 
   Future<void> _requestManualCatalystStage() async {
+    if (_requestingManual || widget.controller.isCreatingJob) return;
     final capability = widget.controller.capabilities?.catalyst;
     if (!widget.controller.isApiReady ||
         !isLocalAbsolutePath(_original.text) ||
@@ -778,100 +889,293 @@ class _WorkbenchScreenState extends State<WorkbenchScreen> {
         'kind': 'catalyst_assisted',
         'original': _original.text.trim(),
       });
+      if (!mounted) return;
       _showMessage(context.l10n.manualCatalystNotice(job.id, job.state));
     } catch (error) {
-      _showMessage(localizedError(context.l10n, error));
+      _showError(error);
     } finally {
       if (mounted) setState(() => _requestingManual = false);
     }
   }
 
   @override
-  Widget build(BuildContext context) => Column(
-    children: <Widget>[
-      ScreenHeader(
-        title: context.l10n.screenWorkbenchTitle,
-        subtitle: context.l10n.screenWorkbenchSubtitle,
-        trailing: IconButton(
-          tooltip: context.l10n.refreshLocalJobs,
-          onPressed: widget.controller.isApiReady
-              ? widget.controller.refreshJobs
-              : null,
-          icon: const Icon(Icons.refresh),
-        ),
-      ),
-      Expanded(child: _workspaceList()),
-    ],
+  Widget build(BuildContext context) => LayoutBuilder(
+    builder: (context, constraints) {
+      // 实际工作区扣除左右 18、间距 20 后，保证表单 600 与任务列 360。
+      final twoColumns = constraints.maxWidth >= 1016;
+      final taskWidth = ((constraints.maxWidth - 56) * 0.36).clamp(
+        360.0,
+        440.0,
+      );
+      return Column(
+        children: <Widget>[
+          ScreenHeader(
+            title: context.l10n.screenWorkbenchTitle,
+            subtitle: context.l10n.screenWorkbenchSubtitle,
+            trailing: IconButton(
+              key: const ValueKey<String>('workbench-open-jobs'),
+              tooltip: context.l10n.navJobs,
+              onPressed: widget.onOpenJobs,
+              icon: const Icon(Icons.view_list_outlined),
+            ),
+          ),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 18),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: <Widget>[
+                  Expanded(child: _workspaceList()),
+                  if (twoColumns) ...<Widget>[
+                    const SizedBox(width: 20),
+                    SizedBox(
+                      key: const ValueKey<String>('workbench-task-column'),
+                      width: taskWidth,
+                      child: Column(
+                        children: <Widget>[
+                          Row(
+                            children: <Widget>[
+                              Expanded(
+                                child: Text(
+                                  context.l10n.navJobs,
+                                  style: Theme.of(
+                                    context,
+                                  ).textTheme.titleMedium,
+                                ),
+                              ),
+                              IconButton(
+                                tooltip: context.l10n.refreshJobs,
+                                onPressed: widget.controller.isApiReady
+                                    ? widget.controller.refreshJobs
+                                    : null,
+                                icon: const Icon(Icons.refresh),
+                              ),
+                            ],
+                          ),
+                          Expanded(
+                            child: JobsContent(
+                              controller: widget.controller,
+                              platform: widget.platform,
+                              active: widget.active,
+                              scrollKey: const PageStorageKey<String>(
+                                'workbench-jobs-list',
+                              ),
+                              padding: const EdgeInsets.only(bottom: 24),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        ],
+      );
+    },
   );
 
   Widget _workspaceList() => ListView(
     key: const ValueKey<String>('workbench-list'),
-    padding: const EdgeInsets.fromLTRB(18, 0, 18, 24),
+    padding: const EdgeInsets.only(bottom: 24),
     children: <Widget>[
       ConnectionStatusNotice(controller: widget.controller),
       if (widget.controller.connectionState != AppConnectionState.ready)
         const SizedBox(height: 14),
-      NoticeBox(
-        title: context.l10n.localMediaWorkspace,
-        message: context.l10n.localMediaWorkspaceMessage(productName),
-        icon: Icons.computer_outlined,
+      _sourceCard(originalOnly: true),
+      const SizedBox(height: 14),
+      _stabilizeCard(),
+      const SizedBox(height: 14),
+      ExpansionTile(
+        key: const ValueKey<String>('advanced-research'),
+        maintainState: true,
+        initiallyExpanded: _researchExpanded,
+        onExpansionChanged: (value) =>
+            setState(() => _researchExpanded = value),
+        tilePadding: const EdgeInsets.symmetric(horizontal: 12),
+        title: Text(context.l10n.advancedResearchTitle),
+        subtitle: Text(context.l10n.advancedResearchSubtitle),
+        children: <Widget>[
+          NoticeBox(
+            title: context.l10n.advancedResearchTitle,
+            message: context.l10n.advancedResearchWarning,
+            isWarning: true,
+          ),
+          const SizedBox(height: 14),
+          _sourceCard(),
+          const SizedBox(height: 14),
+          _fusionCard(),
+          const SizedBox(height: 14),
+          _presetDiscoveryCard(),
+          const SizedBox(height: 14),
+          _manualIntervalsCard(),
+          const SizedBox(height: 14),
+          _jobToolsCard(),
+          const SizedBox(height: 14),
+          CapabilitiesPanel(controller: widget.controller),
+        ],
       ),
-      const SizedBox(height: 14),
-      _sourceCard(),
-      const SizedBox(height: 14),
-      _fusionCard(),
-      const SizedBox(height: 14),
-      _presetDiscoveryCard(),
-      const SizedBox(height: 14),
-      _manualIntervalsCard(),
-      const SizedBox(height: 14),
-      _jobToolsCard(),
-      const SizedBox(height: 14),
-      CapabilitiesPanel(controller: widget.controller),
     ],
   );
 
-  Widget _sourceCard() => SectionCard(
-    title: context.l10n.sourcePaths,
-    subtitle: context.l10n.sourcePathsSubtitle,
+  Widget _stabilizeCard() {
+    final l10n = context.l10n;
+    final supported = widget.controller.capabilities?.supportsStabilize == true;
+    final parametersValid = _parsedParameters != null;
+    return SectionCard(
+      title: l10n.recommendedProfile,
+      subtitle: l10n.recommendedProfileSubtitle,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Text(l10n.fullOriginalWorkflow),
+          const SizedBox(height: 12),
+          NoticeBox(
+            title: l10n.automaticWorkflowLimit,
+            message: l10n.automaticWorkflowLimitMessage,
+            isWarning: true,
+            icon: Icons.fact_check_outlined,
+          ),
+          ExpansionTile(
+            key: const ValueKey<String>('stabilize-parameters'),
+            maintainState: true,
+            initiallyExpanded: _parametersExpanded,
+            onExpansionChanged: (value) =>
+                setState(() => _parametersExpanded = value),
+            title: Text(l10n.stabilizeAdvancedParameters),
+            tilePadding: EdgeInsets.zero,
+            children: <Widget>[
+              for (final entry in _recommendedParameters.entries) ...<Widget>[
+                TextField(
+                  key: ValueKey<String>('stabilize-parameter-${entry.key}'),
+                  controller: entry.value,
+                  enabled: !_stabilizing,
+                  keyboardType: const TextInputType.numberWithOptions(
+                    decimal: true,
+                  ),
+                  decoration: InputDecoration(
+                    labelText: _parameterTitle(entry.key),
+                    helperText: _parameterLabel(entry.key),
+                    helperMaxLines: 4,
+                    border: const OutlineInputBorder(),
+                  ),
+                  onChanged: (_) => setState(() {}),
+                ),
+                const SizedBox(height: 12),
+              ],
+            ],
+          ),
+          if (!parametersValid)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: Text(
+                l10n.stabilizeParametersInvalid,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+            ),
+          if (!supported && widget.controller.isApiReady)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: Text(l10n.stabilizeWorkerUnsupported),
+            ),
+          FilledButton.icon(
+            key: const ValueKey<String>('start-stabilize'),
+            onPressed:
+                supported &&
+                    widget.controller.isApiReady &&
+                    isLocalAbsolutePath(_original.text) &&
+                    parametersValid &&
+                    !_stabilizing &&
+                    !widget.controller.isCreatingJob
+                ? _startStabilize
+                : null,
+            icon: _stabilizing
+                ? const SizedBox.square(
+                    dimension: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.play_arrow),
+            label: Text(_stabilizing ? l10n.creatingJob : l10n.startStabilize),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _parameterTitle(String key) => switch (key) {
+    'quiet_sigma_seconds' => context.l10n.quietSigmaWindow,
+    'reference_fov' => context.l10n.referenceFov,
+    'alignment_tau_seconds' => context.l10n.alignmentTauName,
+    'minimum_weight_transition_seconds' => context.l10n.weightTransitionName,
+    'weight_corner_speed' => context.l10n.weightCornerSpeedName,
+    'anchor_corner_speed' => context.l10n.anchorCornerSpeedName,
+    _ => key,
+  };
+
+  String _parameterLabel(String key) => switch (key) {
+    'quiet_sigma_seconds' => context.l10n.parameterQuietSigma,
+    'reference_fov' => context.l10n.parameterReferenceFov,
+    'alignment_tau_seconds' => context.l10n.parameterAlignmentTau,
+    'minimum_weight_transition_seconds' => context.l10n.parameterTransition,
+    'weight_corner_speed' => context.l10n.parameterWeightSpeed,
+    'anchor_corner_speed' => context.l10n.parameterAnchorSpeed,
+    _ => key,
+  };
+
+  Widget _sourceCard({bool originalOnly = false}) => SectionCard(
+    title: originalOnly
+        ? context.l10n.importOriginal
+        : context.l10n.sourcePaths,
+    subtitle: originalOnly
+        ? context.l10n.originalImportSubtitle
+        : context.l10n.sourcePathsSubtitle,
     child: Column(
       children: <Widget>[
-        SourcePathField(
-          label: context.l10n.originalVideo,
-          helper: context.l10n.originalVideoHelper,
-          kind: 'video',
-          pathController: _original,
-          appController: widget.controller,
-          platform: widget.platform,
-          enabled: !_cachedPresetLocked,
-          onChanged: _sourceChanged,
-          onError: _showMessage,
-        ),
-        const SizedBox(height: 12),
-        SourcePathField(
-          label: context.l10n.ctbInputVideo,
-          helper: context.l10n.ctbInputHelper,
-          kind: 'video',
-          pathController: _ctb,
-          appController: widget.controller,
-          platform: widget.platform,
-          enabled: !_cachedPresetLocked,
-          onChanged: _sourceChanged,
-          onError: _showMessage,
-        ),
-        const SizedBox(height: 12),
-        SourcePathField(
-          label: context.l10n.gyroflowReferenceVideo,
-          helper: context.l10n.gyroflowReferenceHelper,
-          kind: 'video',
-          pathController: _reference,
-          appController: widget.controller,
-          platform: widget.platform,
-          enabled: !_cachedPresetLocked,
-          onChanged: _sourceChanged,
-          onError: _showMessage,
-        ),
-        if (_hasInvalidSourcePath) ...<Widget>[
+        if (originalOnly)
+          SourcePathField(
+            key: const ValueKey<String>('original-source-field'),
+            label: context.l10n.originalVideo,
+            helper: context.l10n.originalVideoHelper,
+            kind: 'video',
+            pathController: _original,
+            appController: widget.controller,
+            platform: widget.platform,
+            enabled: !_stabilizing,
+            dropTargetActive: widget.dropActive && !_stabilizing,
+            dropTargetId: 'source',
+            onChanged: _sourceChanged,
+            onError: _showMessage,
+          ),
+        if (!originalOnly) ...<Widget>[
+          SourcePathField(
+            label: context.l10n.ctbInputVideo,
+            helper: context.l10n.ctbInputHelper,
+            kind: 'video',
+            pathController: _ctb,
+            appController: widget.controller,
+            platform: widget.platform,
+            enabled: !_cachedPresetLocked,
+            onChanged: _sourceChanged,
+            onError: _showMessage,
+          ),
+          const SizedBox(height: 12),
+          SourcePathField(
+            label: context.l10n.gyroflowReferenceVideo,
+            helper: context.l10n.gyroflowReferenceHelper,
+            kind: 'video',
+            pathController: _reference,
+            appController: widget.controller,
+            platform: widget.platform,
+            enabled: !_cachedPresetLocked,
+            onChanged: _sourceChanged,
+            onError: _showMessage,
+          ),
+        ],
+        if (originalOnly
+            ? (_original.text.trim().isNotEmpty &&
+                  !isLocalAbsolutePath(_original.text))
+            : _hasInvalidSourcePath) ...<Widget>[
           const SizedBox(height: 10),
           NoticeBox(
             title: context.l10n.useLocalAbsolutePaths,
@@ -879,30 +1183,33 @@ class _WorkbenchScreenState extends State<WorkbenchScreen> {
             isWarning: true,
           ),
         ],
-        const SizedBox(height: 10),
-        Align(
-          alignment: Alignment.centerLeft,
-          child: OutlinedButton.icon(
-            onPressed:
-                widget.controller.isApiReady &&
-                    isLocalAbsolutePath(_original.text)
-                ? _inspectOriginal
-                : null,
-            icon: const Icon(Icons.search_outlined),
-            label: Text(context.l10n.inspectOriginalMetadata),
-          ),
-        ),
-        if (_inspectionError != null) ...<Widget>[
+        if (originalOnly) ...<Widget>[
           const SizedBox(height: 10),
-          NoticeBox(
-            title: context.l10n.inspectionFailed,
-            message: localizedError(context.l10n, _inspectionError!),
-            isWarning: true,
+          Align(
+            alignment: Alignment.centerLeft,
+            child: OutlinedButton.icon(
+              onPressed:
+                  widget.controller.isApiReady &&
+                      !_inspecting &&
+                      isLocalAbsolutePath(_original.text)
+                  ? _inspectOriginal
+                  : null,
+              icon: const Icon(Icons.search_outlined),
+              label: Text(context.l10n.inspectOriginalMetadata),
+            ),
           ),
-        ],
-        if (_inspection != null) ...<Widget>[
-          const SizedBox(height: 10),
-          _MediaInspectionCard(info: _inspection!),
+          if (_inspectionError != null) ...<Widget>[
+            const SizedBox(height: 10),
+            NoticeBox(
+              title: context.l10n.inspectionFailed,
+              message: localizedError(context.l10n, _inspectionError!),
+              isWarning: true,
+            ),
+          ],
+          if (_inspection != null) ...<Widget>[
+            const SizedBox(height: 10),
+            _MediaInspectionCard(info: _inspection!),
+          ],
         ],
       ],
     ),
@@ -1316,7 +1623,9 @@ class _WorkbenchScreenState extends State<WorkbenchScreen> {
                 onPressed:
                     widget.controller.isApiReady &&
                         isLocalAbsolutePath(_original.text) &&
-                        ffmpegReady
+                        ffmpegReady &&
+                        !_creatingPreview &&
+                        !widget.controller.isCreatingJob
                     ? _createPreview
                     : null,
                 icon: _creatingPreview

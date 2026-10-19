@@ -1,10 +1,8 @@
 import 'package:flutter/material.dart';
 
-import '../brand.dart';
 import '../localization.dart';
 
-/// Session-only label preference is owned by AppShell. A temporary compact
-/// layout must never overwrite it. Settings and the toggle stay at the bottom.
+/// 会话显隐偏好由外壳持有；短窗允许整列滚动，设置与切换入口始终可达。
 class DesktopSidebar extends StatelessWidget {
   const DesktopSidebar({
     required this.selectedIndex,
@@ -32,64 +30,59 @@ class DesktopSidebar extends StatelessWidget {
       width: expanded ? 220 : 72,
       child: Material(
         color: colors.surfaceContainerLow,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 12),
-          child: Column(
-            children: <Widget>[
-              SizedBox(
-                height: 44,
-                child: expanded
-                    ? Align(
-                        alignment: Alignment.centerLeft,
-                        child: Padding(
-                          padding: const EdgeInsets.only(left: 12),
-                          child: Text(
-                            productName,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: Theme.of(context).textTheme.titleSmall,
-                          ),
-                        ),
-                      )
-                    : Icon(Icons.videocam_outlined, color: colors.primary),
+        child: LayoutBuilder(
+          builder: (context, constraints) => SingleChildScrollView(
+            key: const ValueKey<String>('sidebar-scroll'),
+            child: ConstrainedBox(
+              constraints: BoxConstraints(minHeight: constraints.maxHeight),
+              child: IntrinsicHeight(
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 12,
+                  ),
+                  child: Column(
+                    children: <Widget>[
+                      _destination(
+                        context,
+                        index: 0,
+                        label: l10n.navWorkbench,
+                        icon: Icons.video_library_outlined,
+                        selectedIcon: Icons.video_library,
+                      ),
+                      const SizedBox(height: 6),
+                      _destination(
+                        context,
+                        index: 1,
+                        label: l10n.navJobs,
+                        icon: Icons.view_list_outlined,
+                        selectedIcon: Icons.view_list,
+                      ),
+                      const Spacer(),
+                      _destination(
+                        context,
+                        index: 2,
+                        label: l10n.navSettings,
+                        icon: Icons.tune_outlined,
+                        selectedIcon: Icons.tune,
+                      ),
+                      const SizedBox(height: 8),
+                      Divider(color: colors.outlineVariant, height: 16),
+                      _tile(
+                        context,
+                        key: const ValueKey<String>('sidebar-label-toggle'),
+                        label: toggleLabel,
+                        icon: labelsPreferred
+                            ? Icons.keyboard_double_arrow_left
+                            : Icons.keyboard_double_arrow_right,
+                        toggled: labelsPreferred,
+                        onTap: onToggleLabels,
+                      ),
+                    ],
+                  ),
+                ),
               ),
-              const SizedBox(height: 12),
-              _destination(
-                context,
-                index: 0,
-                label: l10n.navWorkbench,
-                icon: Icons.video_library_outlined,
-                selectedIcon: Icons.video_library,
-              ),
-              const SizedBox(height: 6),
-              _destination(
-                context,
-                index: 1,
-                label: l10n.navJobs,
-                icon: Icons.view_list_outlined,
-                selectedIcon: Icons.view_list,
-              ),
-              const Spacer(),
-              _destination(
-                context,
-                index: 2,
-                label: l10n.navSettings,
-                icon: Icons.tune_outlined,
-                selectedIcon: Icons.tune,
-              ),
-              const SizedBox(height: 8),
-              Divider(color: colors.outlineVariant, height: 16),
-              _tile(
-                context,
-                key: const ValueKey<String>('sidebar-label-toggle'),
-                label: toggleLabel,
-                icon: labelsPreferred
-                    ? Icons.keyboard_double_arrow_left
-                    : Icons.keyboard_double_arrow_right,
-                toggled: labelsPreferred,
-                onTap: onToggleLabels,
-              ),
-            ],
+            ),
           ),
         ),
       ),

@@ -23,9 +23,10 @@ class ToolPathsEditor extends StatefulWidget {
 }
 
 class _ToolPathsEditorState extends State<ToolPathsEditor> {
-  late final Map<String, TextEditingController> _fields = <String, TextEditingController>{
-    for (final key in toolPathKeys) key: TextEditingController(),
-  };
+  late final Map<String, TextEditingController> _fields =
+      <String, TextEditingController>{
+        for (final key in toolPathKeys) key: TextEditingController(),
+      };
   bool _initializedFromService = false;
   bool _dirty = false;
   bool _wasSaved = false;

@@ -1,4 +1,4 @@
-// Test-only API and platform fakes. Production app code always uses HttpApiService.
+// 仅供测试的模拟 API 和平台；不能作为真实拖入、播放或生产流程证据。
 import 'package:cha_stabilizer_ui/src/api/api_service.dart';
 import 'package:cha_stabilizer_ui/src/models.dart';
 import 'package:cha_stabilizer_ui/src/platform/media_platform.dart';
@@ -9,6 +9,7 @@ class TestPlatformAdapter implements MediaPlatformAdapter {
   TestPlatformAdapter({
     this.nativePicker = false,
     this.webAvailable = false,
+    this.nativeDrop = false,
     bool nativeDesktop = false,
     this.managedShutdown = false,
     DesktopWindowState windowState = const DesktopWindowState(),
@@ -16,6 +17,33 @@ class TestPlatformAdapter implements MediaPlatformAdapter {
        _windowState = ValueNotifier(windowState);
 
   final bool nativePicker;
+  final bool nativeDrop;
+  String? pickerPath;
+  Future<String?>? pickerGate;
+  bool simulateNativePickerClearsDrop = false;
+  final _nativePickerActive = ValueNotifier(false);
+  @override
+  ValueListenable<bool> get nativePickerActive => _nativePickerActive;
+  final dropTargets = <MediaDropTarget?>[];
+  ValueChanged<String>? dropHandler;
+  Object? dropError;
+  int activePreviews = 0;
+  int maxActivePreviews = 0;
+  final previewUris = <Uri>[];
+
+  @override
+  bool get supportsNativeMediaDrop => nativeDrop;
+  @override
+  Future<void> configureMediaDrop(
+    MediaDropTarget? target, {
+    ValueChanged<String>? onDrop,
+  }) async {
+    dropTargets.add(target);
+    dropHandler = target == null ? null : onDrop;
+    if (target != null && dropError != null) throw dropError!;
+  }
+
+  void simulateDrop(String path) => dropHandler?.call(path);
   final bool webAvailable;
   @override
   final bool isNativeDesktop;
@@ -99,7 +127,21 @@ class TestPlatformAdapter implements MediaPlatformAdapter {
   bool get supportsNativePicker => nativePicker;
 
   @override
-  Future<String?> pickLocalPath(String kind) async => null;
+  Future<String?> pickLocalPath(String kind) async {
+    if (_nativePickerActive.value)
+      throw StateError('native_picker_unavailable');
+    _nativePickerActive.value = true;
+    try {
+      if (simulateNativePickerClearsDrop) {
+        // 模拟原生 owner WM_ENABLE(FALSE) 清空配置，不另发焦点或几何变化。
+        dropTargets.add(null);
+        dropHandler = null;
+      }
+      return pickerGate == null ? pickerPath : await pickerGate;
+    } finally {
+      if (!_disposed) _nativePickerActive.value = false;
+    }
+  }
 
   @override
   bool get canOpenWeb => webAvailable;
@@ -135,10 +177,53 @@ class TestPlatformAdapter implements MediaPlatformAdapter {
     if (_disposed) return;
     _disposed = true;
     _windowState.dispose();
+    _nativePickerActive.dispose();
   }
 
   @override
-  Widget buildVideoPreview(Uri contentUri) =>
+  Widget buildVideoPreview(Uri contentUri) => _TestVideoPreview(
+    key: ValueKey(contentUri),
+    platform: this,
+    uri: contentUri,
+  );
+}
+
+class _TestVideoPreview extends StatefulWidget {
+  const _TestVideoPreview({
+    required this.platform,
+    required this.uri,
+    super.key,
+  });
+  final TestPlatformAdapter platform;
+  final Uri uri;
+  @override
+  State<_TestVideoPreview> createState() => _TestVideoPreviewState();
+}
+
+class _TestVideoPreviewState extends State<_TestVideoPreview> {
+  bool _leased = false;
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _leased = true;
+      final platform = widget.platform;
+      platform.activePreviews++;
+      if (platform.activePreviews > platform.maxActivePreviews)
+        platform.maxActivePreviews = platform.activePreviews;
+      platform.previewUris.add(widget.uri);
+    });
+  }
+
+  @override
+  void dispose() {
+    if (_leased) widget.platform.activePreviews--;
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) =>
       const ColoredBox(color: Color(0xFF202020));
 }
 
@@ -160,6 +245,17 @@ class TestApiService implements ApiService {
   final submittedRequests = <(String, Map<String, dynamic>)>[];
   final preferencePatches = <Map<String, dynamic>>[];
   int _nextId = 1;
+  int listCalls = 0;
+  int detailCalls = 0;
+  int createCalls = 0;
+  int cancelCalls = 0;
+  Future<List<JobSummary>> Function()? listHandler;
+  Future<JobSummary> Function(String)? detailHandler;
+  Future<JobSummary> Function(String, Map<String, dynamic>)? createHandler;
+  Future<JobSummary> Function(String)? cancelHandler;
+  Future<MediaInfo> Function(String)? inspectHandler;
+  Future<String?> Function(String)? pickHandler;
+  final openedArtifacts = <String>[];
 
   @override
   Uri? get origin => Uri.parse('http://127.0.0.1:8765');
@@ -206,18 +302,29 @@ class TestApiService implements ApiService {
   }
 
   @override
-  Future<List<JobSummary>> getJobs() async => List<JobSummary>.of(jobs);
+  Future<List<JobSummary>> getJobs() async {
+    listCalls++;
+    return listHandler == null
+        ? List<JobSummary>.of(jobs)
+        : await listHandler!();
+  }
 
   @override
-  Future<JobSummary> getJob(String id) async =>
-      jobs.firstWhere((job) => job.id == id);
+  Future<JobSummary> getJob(String id) async {
+    detailCalls++;
+    return detailHandler == null
+        ? jobs.firstWhere((job) => job.id == id)
+        : await detailHandler!(id);
+  }
 
   @override
   Future<JobSummary> createJob(
     String kind,
     Map<String, dynamic> request,
   ) async {
+    createCalls++;
     submittedRequests.add((kind, Map<String, dynamic>.from(request)));
+    if (createHandler != null) return createHandler!(kind, request);
     final job = JobSummary.fromJson(<String, dynamic>{
       'id': 'test-job-${_nextId++}',
       'kind': kind,
@@ -234,7 +341,9 @@ class TestApiService implements ApiService {
 
   @override
   Future<JobSummary> cancelJob(String id) async {
-    final old = await getJob(id);
+    cancelCalls++;
+    if (cancelHandler != null) return cancelHandler!(id);
+    final old = jobs.firstWhere((job) => job.id == id);
     final cancelled = JobSummary(
       id: old.id,
       kind: old.kind,
@@ -252,27 +361,32 @@ class TestApiService implements ApiService {
   }
 
   @override
-  Future<MediaInfo> inspectMedia(String path) async => MediaInfo(
-    path: path,
-    name: 'test-only media',
-    width: 1920,
-    height: 1080,
-    fps: 30,
-    frames: 300,
-    duration: 10,
-    videoCodec: 'h264',
-    audioCodec: 'aac',
-  );
+  Future<MediaInfo> inspectMedia(String path) async => inspectHandler != null
+      ? await inspectHandler!(path)
+      : MediaInfo(
+          path: path,
+          name: 'test-only media',
+          width: 1920,
+          height: 1080,
+          fps: 30,
+          frames: 300,
+          duration: 10,
+          videoCodec: 'h264',
+          audioCodec: 'aac',
+        );
 
   @override
-  Future<String?> pickMedia(String kind) async => null;
+  Future<String?> pickMedia(String kind) async =>
+      pickHandler == null ? null : await pickHandler!(kind);
 
   @override
   Future<List<PresetRecord>> discoverPresets(String experimentRoot) async =>
       presets;
 
   @override
-  Future<void> openArtifact(String id) async {}
+  Future<void> openArtifact(String id) async {
+    openedArtifacts.add(id);
+  }
 }
 
 AppPreferences _testPreferences() => const AppPreferences(

@@ -98,6 +98,180 @@ abstract class AppLocalizations {
     Locale('zh'),
   ];
 
+  /// Worker 组件版本：{version}
+  String workerComponentVersion(Object version);
+
+  /// 导入原片
+  String get importOriginal;
+
+  /// GF 导出已通过声明范围内的检查，请查看实际验证范围。
+  String get gyroflowDeclaredChecksPassed;
+
+  /// 已请求取消，正在等待自有处理停止。
+  String get cancellationRequested;
+
+  /// 目前没有已验证的合法无人值守 CTB 导出器，需要人工处理；尚未完成自动导出。
+  String get ctbExecutorUnavailable;
+
+  /// 尚未验证全源逐帧内容对应关系。任务保持 needs_review 并保留诊断。
+  String get fullContentCorrespondenceUnverified;
+
+  /// 原片保持只读，中间产物由工作流程管理。
+  String get originalImportSubtitle;
+
+  /// 推荐配置 · recommended-v1
+  String get recommendedProfile;
+
+  /// 版本化的可靠起点，不是对任意素材效果的保证。
+  String get recommendedProfileSubtitle;
+
+  /// 处理完整原片，依次进行来源验收、能力预检、CTB、GF、新测量、刚性融合与最终验证。
+  String get fullOriginalWorkflow;
+
+  /// 自动流程仍在验证
+  String get automaticWorkflowLimit;
+
+  /// 目前没有已验证的合法无人值守 CTB 导出器。开始后会以 needs_manual 如实记录阻塞；人工续跑不算自动稳像。测量门禁未通过仍保留 needs_review。
+  String get automaticWorkflowLimitMessage;
+
+  /// 高级参数
+  String get stabilizeAdvancedParameters;
+
+  /// 请输入显示范围内的有限数值；质量门禁不能关闭。
+  String get stabilizeParametersInvalid;
+
+  /// 此 Worker 未报告 stabilize-v1 能力；高级研究路径仍可使用。
+  String get stabilizeWorkerUnsupported;
+
+  /// 开始稳像
+  String get startStabilize;
+
+  /// 高级研究 · 显式输入与历史复现
+  String get advancedResearchTitle;
+
+  /// 三路融合、历史预设及独立处理阶段。
+  String get advancedResearchSubtitle;
+
+  /// 以下是独立研究操作，不是单原片自动流程。上方原片共用；CTB／参考输入、人工区间与历史缓存复现保留原有含义。
+  String get advancedResearchWarning;
+
+  /// 配准 tau
+  String get alignmentTauName;
+
+  /// 最小权重过渡
+  String get weightTransitionName;
+
+  /// 权重角点速度
+  String get weightCornerSpeedName;
+
+  /// 锚定角点速度
+  String get anchorCornerSpeedName;
+
+  /// 静稳 sigma（秒）· 0 < 数值 ≤ 10
+  String get parameterQuietSigma;
+
+  /// 参考分析 FOV · 1–4 倍
+  String get parameterReferenceFov;
+
+  /// 配准 tau（秒）· 0.01–2
+  String get parameterAlignmentTau;
+
+  /// 最小权重过渡（秒）· 0.04–5
+  String get parameterTransition;
+
+  /// 权重角点速度（1280 宽分析像素／秒）· 0 < 数值 ≤ 100
+  String get parameterWeightSpeed;
+
+  /// 锚定角点速度（1280 宽分析像素／秒）· 0 < 数值 ≤ 100
+  String get parameterAnchorSpeed;
+
+  /// 将单个本地媒体文件拖入此处导入路径；文件和媒体流仍须由 Worker 验收。
+  String get dropSingleOriginalHint;
+
+  /// 当前无法使用原生拖入，请使用本机选择器或输入绝对路径。
+  String get nativeDropUnavailable;
+
+  /// 浏览器无法从资源管理器拖入取得本机绝对路径。请使用可用的本地服务选择器或手输路径；不会使用 fakepath，也不会上传媒体。
+  String get browserLocalPathNotice;
+
+  /// 任务仍在创建，请等待完成后再开始其他任务。
+  String get jobCreatePending;
+
+  /// 原片稳像
+  String get jobKindStabilize;
+
+  /// 人工 CTB 关联续跑
+  String get jobKindStabilizeContinue;
+
+  /// 使用人工 CTB 继续
+  String get manualContinueTitle;
+
+  /// 人工 CTB 视频
+  String get manualCtbPath;
+
+  /// CTB 对应原片起点（秒，≥ 0）
+  String get manualCtbOrigin;
+
+  /// 我声明此 CTB 文件由同一原片人工导出。
+  String get declareManualCtb;
+
+  /// 创建关联续跑任务
+  String get createContinuationJob;
+
+  /// 人工 CTB 导入会创建关联的新任务并重新验收。父任务仍保留阻塞，不计为无人值守 CTB 导出。
+  String get manualContinuationProvenance;
+
+  /// 工作流配置：{profile}
+  String workflowProfile(Object profile);
+
+  /// 工作流尝试：{attempt}
+  String workflowAttempt(Object attempt);
+
+  /// 父任务：{id}
+  String workflowParent(Object id);
+
+  /// {stage}：{state}
+  String workflowStageStatus(Object stage, Object state);
+
+  /// 成片预览：{state}
+  String workflowPreviewStatus(Object state);
+
+  /// 打开预览任务
+  String get openWorkflowPreviewJob;
+
+  /// 尚未开始
+  String get workflowPending;
+
+  /// 预览已就绪
+  String get workflowReady;
+
+  /// 已通过声明范围检查
+  String get workflowPassed;
+
+  /// 未请求
+  String get workflowNotRequested;
+
+  /// 来源验收
+  String get stageSourceAcceptance;
+
+  /// 能力预检
+  String get stageCapabilityPreflight;
+
+  /// CTB 导出
+  String get stageCtb;
+
+  /// GF 导出
+  String get stageGf;
+
+  /// 时间与内容对应检查
+  String get stageCorrespondence;
+
+  /// 新测量
+  String get stageFreshMeasurement;
+
+  /// 最终验证
+  String get stageFinalValidation;
+
   /// No description provided for @appTitle.
   ///
   /// In en, this message translates to:
@@ -440,10 +614,7 @@ abstract class AppLocalizations {
   /// **'Stabilization workspace'**
   String get screenWorkbenchTitle;
 
-  /// No description provided for @screenWorkbenchSubtitle.
-  ///
-  /// In en, this message translates to:
-  /// **'Three local sources, explicit intervals, real worker jobs.'**
+  /// 导入原片、开始任务，查看真实阶段与输出。
   String get screenWorkbenchSubtitle;
 
   /// No description provided for @refreshLocalJobs.

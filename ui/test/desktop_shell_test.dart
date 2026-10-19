@@ -84,12 +84,17 @@ void main() {
       expect(_sidebar(tester).expanded, isFalse);
       expect(_sidebar(tester).labelsPreferred, isFalse);
 
-      for (final width in <double>[900, 390, 1600]) {
+      for (final width in <double>[799, 800, 801, 900, 1100, 1440]) {
         tester.view.physicalSize = Size(width, 1000);
         await _settle(tester);
-        expect(_sidebar(tester).expanded, isFalse);
-        expect(_sidebar(tester).labelsPreferred, isFalse);
-        expect(find.byType(NavigationBar), findsNothing);
+        if (width < 800) {
+          expect(find.byType(DesktopSidebar), findsNothing);
+          expect(find.byType(NavigationBar), findsOneWidget);
+        } else {
+          expect(_sidebar(tester).expanded, isFalse);
+          expect(_sidebar(tester).labelsPreferred, isFalse);
+          expect(find.byType(NavigationBar), findsNothing);
+        }
       }
       await _shortcut(tester, LogicalKeyboardKey.digit2);
       expect(_sidebar(tester).selectedIndex, 1);
@@ -100,16 +105,15 @@ void main() {
       expect(find.byTooltip('显示导航文字'), findsOneWidget);
       expect(_sidebar(tester).labelsPreferred, isFalse);
 
-      tester.view.physicalSize = const Size(390, 1000);
+      tester.view.physicalSize = const Size(900, 1000);
       await _settle(tester);
       await tester.tap(_key('sidebar-label-toggle'));
       await tester.pump();
       expect(_sidebar(tester).labelsPreferred, isTrue);
-      expect(
-        _sidebar(tester).expanded,
-        isFalse,
-        reason: 'Compact mode does not erase user intent',
-      );
+      expect(_sidebar(tester).expanded, isTrue);
+      tester.view.physicalSize = const Size(799, 1000);
+      await _settle(tester);
+      expect(find.byType(DesktopSidebar), findsNothing);
       tester.view.physicalSize = const Size(1600, 1000);
       await _settle(tester);
       expect(_sidebar(tester).expanded, isTrue);
@@ -442,8 +446,8 @@ void main() {
       expect(platform.configureCalls.first, isNotNull);
       expect(platform.configureCalls.last, isNull);
       expect(find.byTooltip('Maximize'), findsNothing);
-      expect(find.byType(DesktopSidebar), findsOneWidget);
-      expect(find.byType(NavigationBar), findsNothing);
+      expect(find.byType(DesktopSidebar), findsNothing);
+      expect(find.byType(NavigationBar), findsOneWidget);
       expect(
         tester.widget<PopScope<Object?>>(find.byType(PopScope<Object?>)).canPop,
         isFalse,
@@ -497,8 +501,8 @@ void main() {
       await _pumpApp(tester, platform: platform, size: const Size(390, 900));
       expect(platform.configureCalls, isEmpty);
       expect(find.byTooltip('Maximize'), findsNothing);
-      expect(find.byType(DesktopSidebar), findsOneWidget);
-      expect(find.byType(NavigationBar), findsNothing);
+      expect(find.byType(DesktopSidebar), findsNothing);
+      expect(find.byType(NavigationBar), findsOneWidget);
       final result = platform.closeRequestHandler!();
       await _settle(tester);
       await tester.tap(
@@ -625,17 +629,10 @@ void main() {
       await _pumpApp(tester, platform: platform);
       await _shortcut(tester, LogicalKeyboardKey.digit3);
       await _revealSetting(tester, _key('settings-exit'));
-      final settingsExit = tester
-          .widget<ListTile>(_key('settings-exit'))
-          .onTap!;
       final request = platform.closeRequestHandler!;
-      final captionClose = tester
-          .widget<IconButton>(_captionButton('Close'))
-          .onPressed!;
+      await tester.tap(_key('settings-exit'));
       final first = request();
       final duplicate = request();
-      captionClose();
-      settingsExit();
       expect(identical(first, duplicate), isTrue);
       await _settle(tester);
       expect(find.byType(AlertDialog), findsOneWidget);
@@ -653,8 +650,7 @@ void main() {
       );
       await _settle(tester);
       final duringShutdown = request();
-      captionClose();
-      settingsExit();
+      await tester.tap(_captionButton('Close'));
       expect(identical(retry, duringShutdown), isTrue);
       expect(platform.shutdownCount, 1);
       expect(find.byType(AlertDialog), findsNothing);
@@ -778,7 +774,7 @@ void main() {
             api: api,
             size: const Size(360, 1000),
           );
-          for (final width in <double>[360, 390, 800, 900, 1440, 1600]) {
+          for (final width in <double>[360, 799, 800, 801, 900, 1100, 1440]) {
             tester.view.physicalSize = Size(width, 1000);
             await _shortcut(tester, LogicalKeyboardKey.digit3);
             await _settle(tester);
@@ -795,7 +791,7 @@ void main() {
             );
             expect(
               find.byType(NavigationBar),
-              native || width >= 800 ? findsNothing : findsOneWidget,
+              width >= 800 ? findsNothing : findsOneWidget,
             );
             await _shortcut(tester, LogicalKeyboardKey.digit1);
             expect(
