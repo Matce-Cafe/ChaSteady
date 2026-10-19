@@ -39,6 +39,12 @@ Caller 清理现按完整 registry 无条件执行 terminate_all／assert_quiesc
 
 窗口专项诊断仍保留预装工具、零下载语义：其当前解释器必须已经可信并匹配隔离 x64 CPython 3.15.0／私有 Popen 契约，否则在 PS/native 工具运行前明确 BLOCKED；不自动下载代替前置条件，也不制造 PASS。
 
+### UI guard 测试夹具的后续失败与修复
+
+UI 检查 [39225218101](https://github.com/Matce-Cafe/ChaSteady/actions/runs/39225218101) 绑定源码 1e1fa0e6c4c2e7b7eadc33b914f749fc7e0ac4b7、attempt 1，真实失败在 CI guard 单测，尚未进入 fresh 运行时交接、Flutter SDK 或 UI 检查，也没有产品包。92 项 CI helper 测试中出现 4 failure／11 error：正向 SDK／Cmd 夹具使用的临时路径未规范化，被有限 BAT 桥的生产路径守卫拒绝，后续 mock 调用断言连锁失败。日志没有输出实际路径，不能推断具体含有哪种别名或字符，也不是先前 Python 3.12／3.15 适配器错误的重现。
+
+修复只改测试文件：优先选用已存在并 resolve 后的 RUNNER_TEMP，规范化新建夹具根，再实际验证原有有限路径语法；canonical 不自动等于语法合规。新增回归覆盖 raw spelling 与 canonical 不同时的父目录选择及正向 SDK／Cmd 参数，诊断只输出固定布尔和长度。原空格、引号、百分号、感叹号等负例保留；生产桥、运行时、窗口专项零下载策略与数学绑定均未改。真实 red 1 项失败保留，green 1 项及 CI helper 93/93 通过，0 skip、没有实际子进程；这仍是本机纯测试，后续云端检查必须绑定新提交，不重试旧失败版本碰通过。
+
 ### Early executable identity gate
 
 The workflow provisions the Worker runtime, font and pinned Flutter archive **before** the long Visual Studio/Windows SDK update. It binds the fresh audited Worker CPython 3.15.0 receipt, executable/hash and path configuration before SDK download; the runner's PATH Python remains bootstrap-only. It then invokes the restricted `--preflight-flutter-only` mode with the Flutter provision result, scratch root, a new isolated `--preflight-stage`, and the helper-runtime manifest/result/digest handoff. That mode reuses the pinned receipt/path checks, child-only environment and strict executable-version gate; it does not require a Microsoft toolchain report and cannot accept an artifact directory or other full-build inputs. Its receipt is explicitly identity-only, not native compilation, Worker testing, mathematical reproduction or runtime acceptance.

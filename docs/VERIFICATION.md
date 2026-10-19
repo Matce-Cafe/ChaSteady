@@ -206,4 +206,11 @@ job ID：`4f8c1ffb-a98e-49f6-b16a-f13f2c1dbd7a`。
 - 初版相关测试分为 156 项纯 Python／static 及 3 项固定 PowerShell 的隔离数据解析，均实际通过；此前长 TEMP 和禁止子进程导致的 159 项失败批保留。随后 COMSPEC 及 owner 清理各自保留红绿并通过对应 88／92 项 CI helper 回归，不把分批结果说成一次全套运行。
 - Main 另实测自写 ASCII BAT 的 bootstrap/version 两例，固定系统 Cmd、参数及 child COMSPEC 均正确，传入环境不变；原进程对象 signaled、实际 Job 归零、终止计数为 0，约 0.228 秒。测试只执行自有回显脚本，不是 Flutter SDK、真实产品或云构建验收；空 Job 仍遵循既有 TerminateJobObject 策略，未伪称从未调用该 API。私有入口的一字摘要转录错误在零子进程预检被拦截，按既有最终 manifest 核实后纠正，原失败与源码保留。
 
+### UI guard 失败与测试夹具的独立跟进
+
+- 上述 CI 运行时／BAT／清理修复已普通追加为第 27 条提交，远端回读为 1e1fa0e6c4c2e7b7eadc33b914f749fc7e0ac4b7，没有再次改写历史。随后唯一 UI-only 检查 39225218101／attempt 1 真实失败于 CI guard 测试；尚未进入 fresh 运行时交接、Flutter SDK、UI 检查或打包。这次不是旧 3.15 契约错误重现，也没有新 Windows 包。
+- 失败批中 provisioning 13 项、assets 12 项、build helper 24 项通过；CI helper 92 项出现 4 failure／11 error。正向临时夹具路径被未改的有限 BAT 路径校验拒绝，后续 mock 断言连锁失败；原日志没有实际路径，不猜具体拼写或字符。
+- 仅修改测试文件，优先使用已存在且规范化的 RUNNER_TEMP，再对新夹具根 resolve(strict=True) 并实际检查有限语法。新增回归证明 raw≠canonical 时正向 SDK／Cmd 使用 canonical，诊断仅固定布尔和长度；原负例、生产路径守卫、window-only 零下载语义、Worker 及数学摘要保持不变。
+- 真实红测 1 项失败、绿测 1 项通过，随后 CI helper 完整 93/93 通过，0 skip、0 实际子进程，新增测试共约 2.239 秒。旧失败和证据保留；这些结果不是实际 Flutter、云端成功、真实 GUI 或产品验收。新源码的云端结果另行记录。
+
 本轮后续新报告继续区分源码／unit、真实 GUI、真实引擎、媒体完整性、内容对应和感知范围；没有实际执行的层级不写“通过”。

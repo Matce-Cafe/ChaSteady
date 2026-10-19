@@ -25,9 +25,56 @@ from cha_stabilizer import owned_processes as owned
 
 class CiBuildWindowsTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="ci-build-helper-tests-")
+        runner_temp = os.environ.get("RUNNER_TEMP")
+        parent = Path(runner_temp).resolve(strict=True) if runner_temp else None
+        if parent is not None:
+            self.assertTrue(parent.is_dir(), "CI test temporary parent must be an existing directory")
+            ci._unquoted_ci_path(parent / "fixture")
+        self.temp = tempfile.TemporaryDirectory(prefix="ci-build-helper-tests-", dir=parent)
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        # 优先使用本次 runner 临时父目录；规范化并实际验证有限 grammar，不把两者混为一谈。
+        self.root = Path(self.temp.name).resolve(strict=True)
+        ci._unquoted_ci_path(self.root / "fixture")
+
+    def test_positive_fixture_root_uses_canonical_directory_when_raw_spelling_differs(self):
+        canonical = self.root.resolve(strict=True)
+        spelling = canonical / "spelling"
+        spelling.mkdir()
+        raw = spelling / ".."
+        temporary = SimpleNamespace(name=str(raw), cleanup=mock.Mock())
+        probe = type(self)(self._testMethodName)
+        with mock.patch.dict(os.environ, {"RUNNER_TEMP": str(raw)}), \
+                mock.patch.object(tempfile, "TemporaryDirectory", return_value=temporary) as allocated:
+            probe.setUp()
+        try:
+            grammar_matches = False
+            try:
+                grammar_matches = ci._unquoted_ci_path(probe.root / "fixture") == str(probe.root / "fixture")
+            except ci.ValidationError:
+                pass
+            # 只输出固定属性，不能把 runner 原始路径带入公开诊断。
+            diagnostic = {"raw_differs_from_canonical": str(raw) != str(canonical),
+                          "raw_characters": len(str(raw)), "canonical_characters": len(str(canonical)),
+                          "positive_root_is_canonical": probe.root == canonical,
+                          "positive_root_satisfies_ci_grammar": grammar_matches,
+                          "canonical_runner_temp_parent_selected": allocated.call_args.kwargs.get("dir") == canonical}
+            print("ChaSteady test fixture path diagnostic " + json.dumps(diagnostic, sort_keys=True))
+            self.assertTrue(diagnostic["raw_differs_from_canonical"])
+            self.assertTrue(diagnostic["positive_root_is_canonical"])
+            self.assertTrue(diagnostic["positive_root_satisfies_ci_grammar"])
+            self.assertTrue(diagnostic["canonical_runner_temp_parent_selected"])
+            sdk, cmd = probe.cmd_fixture()
+            self.assertTrue(sdk == canonical / "sdk/flutter")
+            self.assertTrue(cmd == canonical / "System32/cmd.exe")
+            with mock.patch.object(ci, "_system_cmd_executable", return_value=cmd), \
+                    mock.patch.object(ci, "spawn_owned_process") as spawn:
+                command = ci.flutter_ci_command("bootstrap", sdk, ["--version"])
+            self.assertTrue(command[0] == str(cmd))
+            self.assertTrue(command[5] == str(sdk / "bin/flutter.bat"))
+            spawn.assert_not_called()
+        finally:
+            probe.doCleanups()
+        temporary.cleanup.assert_called_once_with()
 
     def pubspec_source(self, source=None, version="0.2.0+2"):
         source = self.root if source is None else source
