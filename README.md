@@ -1,98 +1,109 @@
 # ChaSteady
 
-本地优先的视频增稳工作台。ChaSteady 是暂用名称，不是已经确定的最终品牌。
+基于 Flutter 的 Windows 本地视频增稳工作台，整合原片导入、任务管理、处理状态和预览，并保留本机 Web 界面。
 
-**目标形态：Flutter Windows x64 原生程序＋自包含 Worker＋保留的本机 Web 界面。** 本项目仍处于实验阶段：构建成功不等于原生播放器、完整操作流程或感知增稳质量已经通过验收，请以产物中的 `BUILD_STATUS.json` 为准。
+**当前开发版本：0.2.0+2，尚未完成本轮发布验收。** 源码中的日常入口已简化为单原片任务；CTB 自动导出和严格全长 fresh V9 仍有实质阻塞，不能称为完整一键增稳。构建成功、文件检查、真实界面操作和增稳质量是不同验收层，分别以实际记录为准。
 
-原创代码采用 [MIT](LICENSE)。第三方依赖、字体及媒体工具保留各自许可证，见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。MIT 不会将这些依赖重新许可。
+## 快速开始
 
-## 界面与工作方式
+1. 获取完整 Windows x64 目录包，运行其中的 **ChaSteady.exe**，不要只复制一个 EXE，也不要把 Worker.exe 当作图形界面。
+2. 如果旧版仍在运行，先正常退出旧版；默认启动共享同一 Windows 用户的数据根和单实例约束，不会热替换旧窗口。
+3. 首次在侧栏／底栏的**设置**中配置已有的 FFmpeg、ffprobe、Gyroflow 等工具。Sony 软件仍需正常安装、登录和取得相应许可。应用不会绕过厂商授权。
+4. 在**工作台**选择或拖入原片，使用推荐配置，按需展开高级参数，然后开始任务。
+5. 在宽工作区右侧或**任务**页查看实际阶段、错误、取消操作和产物。遇到 `needs_manual` 或 `needs_review`，按具体原因处理，不能把它当作已验证成片。
 
-- 原创 Flutter / Material 3 界面，适应窄窗口与桌面布局，支持明暗主题。
-- 简体中文和 English，默认跟随系统；不支持的系统语言回退 English。
-- 首页不显示遮挡内容的任务活动浮窗。任务状态、进度和取消操作在独立“任务”页面。
-- 左侧导航可切换仅图标／图标加本地化文字，“设置”入口固定在侧栏底部；原“文件／视图／帮助”菜单功能已集中到设置。
-- 在设置中打开同一 Worker 提供的 Web 会话、切换语言、查看关于／许可证或正常退出；两端共享设置和单任务队列。
-- 桌面进程拥有 Worker 生命周期；关闭桌面程序会使对应 Web 会话断开。
-- 原生播放器采用原创 Windows Media Foundation / D3D11 / Flutter Texture 接线，不使用 libmpv、MDK 或 WebView 套壳。当前观看预览目标为 H.264 8-bit / AAC，初始静音、不自动播放；不承诺直接播放所有 HEVC、10-bit 或 HDR 原片。
+0.2.0 的交互正在验证中；本文描述该开发候选的使用目标与边界，不表示已有可下载且完整验收的 0.2.0 发行包。
 
-设计只参考通用 Material You 与连续交互原则，没有复制 FlClash 的 GPL 代码、资源或页面布局。
+## 界面与任务
 
-## 端到端自动导出目标
+- 小于 800 逻辑像素使用底部导航，其余使用侧栏；侧栏文字按用户选择显示或隐藏，宽窄切换保留草稿和选择。
+- 原“文件／视图／帮助”操作集中在设置，支持关于、许可证、语言、正常退出和用户主动打开 Web 会话。
+- 宽工作区按扣除侧栏后的实际空间显示内嵌任务列；不恢复遮挡内容的首页活动浮窗。
+- 界面支持跟随系统、简体中文与 English；语言更改独立即时保存，不要求先补齐工具路径。
+- Windows 文件拖入采用原生 OLE，只复制文件引用，不移动或修改原片。选择、手输、拖入共享输入变更和媒体验收流程。
+- 浏览器不能凭文件名取得任意本机绝对路径。Web 保留已声明的本机选择／路径能力，不使用 `fakepath`，不暗中上传视频。
+- 同一选中任务只允许一个原生预览会话；切页和布局变化必须正确释放旧租约。
 
-目标是选择原片后，由工具自行合法调用 CTB 与 GF 完成各自导出，校验输出与原片的帧／时间对应关系，再接入 V9 融合并输出带音频的成片。GF 读取原片，不读取 CTB 输出；不能先切掉 Sony 陀螺元数据后将短片冒充完整输入。
+窗口栏是原创 Win32／Flutter 接线；只参考通用 Material 设计和自适应交互，不复制 FlClash 的 GPL 源码、logo 或资源。最大化、拖放和窗口生命周期必须以真实输入验收，不能只凭图标或方法级测试宣称可用。
 
-**当前尚未达到此目标：**CTB 执行器仍需人工步骤，GF 短段导出尚有帧数／内容对应问题。已有 CTB/GF 文件的融合能力、能够启动外部软件、单独的数值回归或 Windows 打包成功，都不等于端到端自动导出已完成。自动化先在独立小范围真实导出中验证，再接入应用；不通过修改“已验证”标志跳过实际执行与媒体检查。
+## 单原片处理与当前阻塞
 
-## 当前增稳路线
+目标是只导入原片，由应用生成、核验和管理 CTB、GF、轨迹及成片，不要求每个任务手填中间文件目录。推荐配置和实际参数应冻结到作业记录，后续默认值升级不能悄悄改变旧任务。
 
-当前 V9 实验路线只使用 **CTB 像素**；GF 只作为同一时刻的整体运动参考，不混合 GF 的 RGB 画面。
+流程设计为：
 
-- 融合中心位移和旋转，使用双锚点刚性 SE(2) 控制。
-- 不施加逐帧估计缩放、局部网格、插帧或动态裁切。
-- 允许黑边，以恒定画布容纳变换后的当前 CTB 输入矩形。
-- 人工指定的已知区间与严格新测量分开记录；自动 RAW 陀螺分类保持禁用。
-- 缓存复现需要显式发现并通过来源绑定和摘要校验，不能将任意文件冒充批准缓存。
-- 跟踪、配准或时间戳闸门不通过时保留诊断并标记 `needs_review`，不能用虚构测量冒充成功。
+**原片检查 → 引擎能力预检 → CTB → GF → 时间／内容对应检查 → fresh 测量 → 刚性融合 → 渲染 → 最终验证 → 独立预览。**
 
-**边界：**上游 CTB/GF 已丢失的视场、位深或细节不能恢复。当前输入角点、帧数、PTS 和音轨通过，不等于原片全视场、4K/10-bit 母版、无果冻或感知效果胜出的认证。
+CTB 与 GF 都读取同一原片；GF 不读取 CTB 输出，也不能先切掉 Sony 陀螺元数据后把短片冒充完整输入。
 
-## 外部媒体工具
+当前仍有以下边界：
 
-在设置中选择已有的本地 FFmpeg、ffprobe、Gyroflow 可执行程序及需要的导出模板。参考视频与 `.gyroflow` 项目模板是不同输入。
+- **CTB 自动导出为 0。** 已测试的标准 UIA／MSAA 只有根对象，当前没有合法可靠的无人值守执行器。不会使用盲坐标、猜快捷键、私有 Qt、注入或授权绕过。
+- **GF 完整自动导出已有真实成功。** C7037 的独立完整帧数、PTS 和 AV 解码检查通过；内容对应证据仍只是有限抽样，生产身份／模板管理等接线不能因此视为已经完成。本轮本机进程身份检查仍有无法确认项，保持阻塞，不通过猜测系统进程或提权来放行。
+- **strict 全长 fresh V9 尚未通过。** 固定测量门禁下的不可观测区间保留失败，不补 identity、不删插帧、不放阈值或更换 golden。
+- 人工导出 CTB 后的 continuation 是明确的新任务，保留父任务失败／人工状态和来源。它减少重复路径操作，但**不是 CTB 自动生产**。
+- 旧三路融合和 C7037 历史复现保留在高级验证范围，不能将任意新 CTB／GF 直接套旧轨迹。
 
-本项目不默认分发外部 FFmpeg/ffprobe、Gyroflow 或 Sony Catalyst 的可执行程序。Python 科学依赖可能自带第三方原生库，其许可另行保留。
+因此，本轮界面简化与单原片编排基础，不等于真正的一键自动管线已经完成。
 
-Sony Catalyst Browse 继续采用正常 UI 的人工导出流程；不绕过账号、激活、Prepare entitlement 或厂商许可。GF 自动导出需要实际能力和时间映射校验，不能仅因进程退出码为 0 就视为成功。
+## 增稳路线与输出含义
 
-## 构建与产物
+当前 V9 路线只使用 **CTB 像素**，GF 仅提供同时间全局运动参考；采用双锚点刚性旋转／平移，不混合 GF 的 RGB。
 
-仓库：[Matce-Cafe/ChaSteady](https://github.com/Matce-Cafe/ChaSteady)
+- 要求无裁切、允许黑边，以恒定画布容纳当前 CTB 输入矩形。
+- 不使用局部 mesh、逐帧 scale、动态裁切、插帧或冻结视频帧制造稳定。
+- 已知人工窗口与新测量分开，自动 RAW 分类保持禁用。
+- 静稳保持／运镜释放已做两轮独立有界试验，但没有方案通过晋升，默认不启用未获证据支持的新模式。应保留真实摇移与光学变焦，不能以压低指标为由冻住运动内容。
+- 上游 CTB／GF 已丢失的视场、位深或细节不能恢复。当前矩形角点、帧数和 PTS 通过，不等于原片完整 FOV、原生 4K10-bit 母版或主观质量认证。
 
-Windows 云构建按手动触发方式准备，不因每次 push 自动发布，也不自动创建 GitHub Release。目标是官方稳定工具链；SDK 内部精确锁定的依赖保留官方配套版本，不以强制 override 冒充“全部最新”。实际版本、源码摘要和构建结果随产物记录。
+现有 Worker 观看预览以 H.264 8-bit／AAC 为目标，不承诺直接播放所有 HEVC、10-bit 或 HDR 原片；默认静音、不自动播放。预览与最终处理的验证范围分别记录，不通过改标签取得原生播放资格。
 
-完整目录包的目标结构：
+## 运行依赖与数据
 
-```text
-ChaSteady/
-  ChaSteady.exe
-  flutter_windows.dll
-  data/
-  Worker/
-    Worker.exe
-    ...
-  web/
-  licenses/
-  README.md
-  BUILD_STATUS.json
-```
+完整包包含 Flutter 运行资源和 Python Worker，不要求最终用户安装 Flutter、Python、Visual Studio 或开发工具。**尚未保证完全缺少 VC++ 运行库的干净 Windows 可直接运行。**
 
-这不是单文件 EXE。必须保留整个目录；不能将 Worker.exe 单独当作 GUI 主程序。完整包不要求最终使用者安装 Python、Flutter、Visual Studio 或开发工具，外部媒体工具仍需按需配置。
+外部 FFmpeg／ffprobe、Gyroflow 和 Sony Catalyst 不默认随 ChaSteady 分发。VS Code 播放器是独立项目，其内置 FFmpeg 不表示本应用已经捆绑同一后端。
 
-构建包默认未签名，且可能仅完成构建与文件完整性检查，尚未进行原生运行验收。遇到系统安全提示时核对来源与摘要，不要关闭 Defender / SmartScreen，也不要把“能运行”当作发布安全认证。
+- 素材在本机引用，不发送到外部增稳处理服务；原片不写、不移动、不覆盖。
+- 中间产物、任务日志和参数属于应用可写数据；程序资源根与数据根分离。
+- 默认用户数据根通过 Windows Known Folder 和 SID 确定；更改 `LOCALAPPDATA` 或解压目录不构成隔离。
+- 本机 Web 服务只监听 `127.0.0.1`，使用随机端口和会话凭据。桌面拥有 Worker 生命周期，正常退出后其 Web 会话断开；不要共享会话链接或暴露到局域网／反向代理。
+- 媒体、缓存、profiles、凭据、私有配置和原始本机诊断不上公共仓库或 CI。
 
-## 数据与安全
-
-- 素材在本机通过路径引用，不上传到外部增稳处理服务。
-- 公开仓库和云构建不包含用户视频、实验缓存、profile、凭据、私有开发配置或整个 `private` 目录。
-- 本机服务只监听 `127.0.0.1`，使用随机端口、会话 Bearer 与只读媒体 cookie。不要共享会话链接，也不要通过反向代理或局域网暴露端口。
-- 资源目录与可写用户数据目录分离，不能把“目录名叫 private”当作操作系统级隔离保证。
-- 新输出使用独立目录，不覆盖原片或已有导出，只清理本任务拥有的子进程。
+开发候选新增的 `--new-profile-root` 仅供显式创建隔离实例：目标必须是新的、绝对且私有的目录，与生产数据根和程序资源根不相交；无效即失败，不回退默认数据根。它不关闭认证、质量或许可检查。仅在对应版本真正构建并验收后使用，细节见便携指南。
 
 ## 状态含义
 
-- `queued` / `running`：等待或处理中。
-- `needs_manual`：需要外部软件的正常人工操作。
-- `needs_review`：测量或媒体闸门未通过，不是验证成功。
-- `failed` / `cancelled`：失败或取消。
-- `verified_media`：报告范围内媒体证据通过，不是原片全视场或主观质量证书。
+| 状态 | 含义 |
+| --- | --- |
+| `queued` / `running` | 等待或处理中，数值进度不可得时使用不定进度 |
+| `needs_manual` | 需要外部软件的正常人工步骤，不是自动成功 |
+| `needs_review` | 测量、对应或媒体门禁未通过／证据不足 |
+| `failed` / `cancelled` | 失败或取消，保留真实历史 |
+| `verified_media` | 报告所声明范围内的媒体检查通过，不是完整 FOV 或感知质量证书 |
 
-无法取得真实数值进度时使用不定进度，不显示虚构质量分。
+## 构建、验证与维护
+
+公开源码仓库：[Matce-Cafe/ChaSteady](https://github.com/Matce-Cafe/ChaSteady)。Actions 手动触发，不因每次 push 自动发布，也不自动创建 GitHub Release。失败历史不被后续成功改绿；专项检查成功不等于生成完整包。
+
+产品版本以 [ui/pubspec.yaml](ui/pubspec.yaml) 为准；Worker 组件版、通信协议及 Python 运行时版分别标记。未签名、构建或文件审计成功不等于完整本机验收。核对来源和摘要，不关闭 Defender／SmartScreen。
+
+本轮当前源码的本地后台回归为 234 项（233 项执行通过、1 项既有平台跳过，0 失败／错误），原三案例数学 golden 按原阈值通过并生成新来源摘要。界面回归 77 项通过，但最大化修复和同包真实 GUI 验收尚未完成；这些测试不代表自动 CTB／GF／fresh V9 全流程通过，详细范围见 [验证记录](docs/VERIFICATION.md)。
+
+- [更新日志](CHANGELOG.md)
+- [维护与 Git 规范](CLAUDE.md)
+- [验证范围](docs/VERIFICATION.md)
+- [Windows 便携指南](docs/WINDOWS_PORTABLE_GUIDE.md)
+- [云构建说明](docs/CI_BUILD.md)
+
+## 许可证
+
+原创代码采用 [MIT](LICENSE)。第三方依赖、字体及媒体工具保留各自许可证，见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。MIT 不会重新许可这些依赖，进程隔离也不是自动取得第三方分发许可的理由。
 
 ## English
 
-ChaSteady is an experimental local-first stabilization workbench targeting a native Flutter Windows x64 app, a self-contained processing worker and a retained offline Web interface. The name is provisional.
+ChaSteady is an experimental local-first Windows stabilization workbench built with Flutter and a self-contained Python worker, with a retained local Web interface. Version 0.2.0+2 is under implementation and acceptance, not a completed automatic pipeline release.
 
-The current V9 route uses CTB pixels with same-time GF global-motion references, not RGB blending. It uses rigid rotation/translation, allows black borders and avoids dynamic cropping or estimated-scale application. Upstream crop and bit-depth losses cannot be reversed.
+The intended default workflow imports one original source and manages intermediate artifacts internally. CTB automation and strict full-length fresh V9 remain blocked. The current route uses CTB pixels with same-time GF global-motion references, rigid translation/rotation and a constant padded canvas, not RGB blending, dynamic cropping or frame duplication. Upstream FOV and bit-depth losses cannot be restored.
 
-Media, experiment caches, profiles and credentials do not belong in this repository or cloud builds. Original code is MIT; dependencies and external media applications retain their own terms. A build-only, unsigned ZIP is not evidence of native playback, perceptual superiority or complete redistribution clearance. Consult the artifact's build status and retained third-party notices.
+Original code is MIT; third-party terms remain applicable. User media, profiles, caches and credentials are not part of the public repository or CI. Build, runtime, media and perceptual claims must remain separate.

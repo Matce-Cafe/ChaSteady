@@ -26,6 +26,12 @@ class CiBuildWindowsTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
+    def pubspec_source(self, source=None, version="0.2.0+2"):
+        source = self.root if source is None else source
+        source.mkdir(parents=True, exist_ok=True)
+        (source / "pubspec.yaml").write_text("name: fixture\nversion: " + version + "\n", encoding="utf-8")
+        return source
+
     def test_flutter_only_cli_routes_without_full_build_inputs(self):
         argv = ["--preflight-flutter-only", "--flutter-result", str(self.root / "flutter-result.json"),
                 "--flutter-scratch", str(self.root / "scratch"), "--preflight-stage", str(self.root / "new-stage")]
@@ -151,7 +157,8 @@ class CiBuildWindowsTests(unittest.TestCase):
         with mock.patch.object(ci, "ROOT", self.root), \
                 mock.patch.object(ci, "validate_flutter_result", return_value=provision), \
                 mock.patch.object(ci, "validate_font_result", return_value={"font_path_for_ephemeral_build_only": font}), \
-                mock.patch.object(ci, "stage_flutter_source", return_value=args.preflight_stage / "ui") as staged, \
+                mock.patch.object(ci, "stage_flutter_source",
+                                  side_effect=lambda _root, stage, _font: self.pubspec_source(stage / "ui")) as staged, \
                 mock.patch.object(ci, "create_flutter_environment", return_value={}), \
                 mock.patch.object(ci, "flutter_version_check", return_value=identity), \
                 mock.patch.object(ci, "run_flutter", return_value=b"") as run, \
@@ -162,6 +169,9 @@ class CiBuildWindowsTests(unittest.TestCase):
             self.assertEqual([call.args[0] for call in run.call_args_list], ["pub", "l10n", "analyze", "test"])
             self.assertEqual(result["scope"], "pinned_flutter_identity_and_ui_checks_only")
             self.assertTrue(all(result["ui_checks"].values()))
+            self.assertEqual(result["pubspec_version"], "0.2.0+2")
+            self.assertIn("--dart-define=CHASTEADY_PRODUCT_VERSION=0.2.0", run.call_args_list[-1].args[2])
+            self.assertIn("--dart-define=CHASTEADY_BUILD_NUMBER=2", run.call_args_list[-1].args[2])
             self.assertFalse(result["native_build_executed"])
             self.assertFalse(result["runtime_acceptance_verified"])
             self.assertEqual(ci.read_json(args.preflight_stage / "flutter-ui-preflight.json"), result)
@@ -173,6 +183,7 @@ class CiBuildWindowsTests(unittest.TestCase):
             self.assertFalse(args.preflight_stage.exists())
 
     def test_ui_checks_only_stop_on_analysis_failure_and_never_report_success(self):
+        self.pubspec_source()
         def fail_analysis(label, *_args, **_kwargs):
             if label == "analyze":
                 raise ci.ValidationError("Flutter analyze exited unsuccessfully; raw runner-local logs are not uploaded")
@@ -196,6 +207,52 @@ class CiBuildWindowsTests(unittest.TestCase):
             self.assertIn("if: ${{ !inputs.ui_checks_only && !inputs.window_fixture_only }}", step)
         upload = workflow[workflow.index("- name: Upload only the app ZIP"):]
         self.assertIn("if: ${{ success() && !inputs.ui_checks_only && !inputs.window_fixture_only }}", upload)
+
+    def test_workflow_run_title_uses_real_precheckout_context_and_version_is_read_after_checkout(self):
+        workflow = (Path(ci.ROOT) / ".github/workflows/build-windows.yml").read_text(encoding="utf-8")
+        title = workflow[workflow.index("run-name:"):workflow.index("\non:")]
+        for text in ("'Full Windows build'", "'UI checks'", "'Window diagnostic'", "github.ref_name",
+                     "github.sha", "github.run_attempt"):
+            self.assertIn(text, title)
+        for unavailable in ("steps.", "product_version", "pubspec", "github.version"):
+            self.assertNotIn(unavailable, title)
+        version = workflow.index("- name: Read bounded product version from the source pubspec")
+        self.assertLess(workflow.index("- name: Checkout reviewed source"), version)
+        self.assertLess(workflow.index("- name: Verify runner Python"), version)
+        step = workflow[version:].split("      - name:", 1)[0]
+        for text in ("-I -B", "tools/build_windows.py", "--version-summary", "GITHUB_OUTPUT",
+                     "GITHUB_STEP_SUMMARY", "product.product_version", "product.build_number", "product.pubspec_version"):
+            self.assertIn(text, step)
+        upload = workflow[workflow.index("- name: Upload only the app ZIP"):]
+        self.assertIn("name: ${{ steps.product-version.outputs.package_stem }}-", upload)
+        for name in ("ChaSteady-Windows-x64.zip", "ChaSteady-Windows-x64.zip.sha256",
+                     "ChaSteady-Windows-x64.manifest.json"):
+            self.assertIn("/artifacts/" + name, upload)
+        self.assertIn("if: ${{ success() && !inputs.ui_checks_only && !inputs.window_fixture_only }}", upload)
+
+    def test_workflow_conventions_are_read_only_guards_before_the_full_build(self):
+        workflow = (Path(ci.ROOT) / ".github/workflows/build-windows.yml").read_text(encoding="utf-8")
+        self.assertIn("'tools/test_build_windows.py'", workflow)
+        self.assertIn("'tools/test_project_conventions.py'", workflow)
+        index = workflow.index("- name: Check reviewed HEAD conventions and maintenance documents")
+        self.assertLess(index, workflow.index("- name: Create fresh Worker runtime"))
+        step = workflow[index:].split("      - name:", 1)[0]
+        for text in ("if: ${{ !inputs.ui_checks_only && !inputs.window_fixture_only }}", "-I -B",
+                     "tools/check_project_conventions.py", "--root $repo --check-head --check-docs"):
+            self.assertIn(text, step)
+        self.assertNotIn("--write", step)
+        self.assertEqual(workflow.count("CHASTEADY_CI_FONT_GITHUB_TOKEN:"), 1)
+        self.assertIn("permissions:\n  contents: read", workflow)
+
+    def test_workflow_selects_exactly_one_canonical_dated_sidecar_without_latest_fallback(self):
+        workflow = (Path(ci.ROOT) / ".github/workflows/build-windows.yml").read_text(encoding="utf-8")
+        selection = workflow[workflow.index("- name: Select the single approved sanitized local math sidecar"):]
+        selection = selection.split("      - name:", 1)[0]
+        for text in ("-Filter 'worker_math_golden_summary_*.json'", "$sidecars.Count -ne 1",
+                     "[0-9]{8}", "[0-9a-f]{32}", "TryParseExact", "'yyyyMMdd'", "InvariantCulture"):
+            self.assertIn(text, selection)
+        for text in ("20261015", "LastWriteTime", "Sort-Object", "Select-Object -First", "Select-Object -Last"):
+            self.assertNotIn(text, selection)
 
     def test_flutter_startup_diagnostic_reports_fixed_markers_and_explicit_known_codes_only(self):
         stderr = self.root / "stderr.log"
@@ -763,6 +820,40 @@ class CiBuildWindowsTests(unittest.TestCase):
         for relative in paths:
             (self.root / relative).write_bytes(b"# one\nvalue = 1\n")
         self.assertEqual(ci.source_inventory(self.root)["inventory_sha256"], first)
+
+    def test_math_sidecar_names_require_valid_calendar_dates_and_canonical_uuid_shapes(self):
+        identifier = "6cc0d9b43f7c44c39550dc81791534ac"
+        for date in ("20261015", "20261019", "20240229"):
+            for value in (identifier, "6cc0d9b4-3f7c-44c3-9550-dc81791534ac"):
+                with self.subTest(date=date, value=value):
+                    ci.validate_math_sidecar_name("worker_math_golden_summary_" + date + "_" + value + ".json")
+        invalid = ("20260229_" + identifier, "20261301_" + identifier, "20260001_" + identifier,
+                   "00000101_" + identifier, "2026101_" + identifier, "20261019_" + identifier.upper(),
+                   "20261019_" + "-" * 32, "20261019_" + "1" * 33,
+                   "20261019_6cc0d9b4-3f7c44c3-9550-dc81791534ac")
+        for suffix in invalid:
+            with self.subTest(suffix=suffix), self.assertRaises(ci.ValidationError):
+                ci.validate_math_sidecar_name("worker_math_golden_summary_" + suffix + ".json")
+        for name in (None, "../worker_math_golden_summary_20261019_" + identifier + ".json",
+                     "worker_math_golden_summary_20261019_" + identifier + ".json\n"):
+            with self.subTest(name=name), self.assertRaises(ci.ValidationError):
+                ci.validate_math_sidecar_name(name)
+
+    def test_new_dated_math_sidecar_keeps_original_content_runtime_and_threshold_guards(self):
+        data, runtime, sources = self.sidecar_fixture()
+        docs = self.root / "docs"
+        docs.mkdir()
+        path = docs / "worker_math_golden_summary_20261019_6cc0d9b43f7c44c39550dc81791534ac.json"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        with mock.patch.object(ci, "source_inventory", return_value=sources), \
+                mock.patch.object(ci, "_worker_pins", return_value=self.fake_wheels()):
+            result = ci.validate_math_sidecar(path, self.root, runtime)
+            self.assertEqual(result["sidecar_sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+            self.assertFalse(result["private_goldens_rerun_in_ci"])
+            data["thresholds"]["matrix_max_absolute_error"] = 1e-8
+            path.write_text(json.dumps(data), encoding="utf-8")
+            with self.assertRaises(ci.ValidationError):
+                ci.validate_math_sidecar(path, self.root, runtime)
 
     def test_math_sidecar_accepts_dynamic_actual_counts_and_binds_all_identities(self):
         data, runtime, sources = self.sidecar_fixture()
@@ -1414,20 +1505,101 @@ class CiBuildWindowsTests(unittest.TestCase):
                 self.assertIn("code=CI_VALIDATION_FAILED", redacted)
                 self.assertNotIn("not-public", redacted)
 
+    def test_ci_missing_or_invalid_staged_pubspec_stops_before_all_flutter_commands(self):
+        for content in (None, "version: 0.2.0+2\nversion: 0.3.0+3\n", "version: 0.2.0+2;exit\n"):
+            path = self.root / "pubspec.yaml"
+            if content is not None:
+                path.write_text(content, encoding="utf-8")
+            for function, extra in ((ci.run_flutter_ui_checks, ()), (ci.run_flutter_ui_build, ({},))):
+                args = SimpleNamespace()
+                with self.subTest(content=content, function=function.__name__), \
+                        mock.patch.object(ci, "run_flutter") as run, redirect_stdout(io.StringIO()), \
+                        self.assertRaises(ci.ValidationError) as failure:
+                    function(args, self.root, self.root, {}, self.root, *extra)
+                run.assert_not_called()
+                self.assertIn("code=CI_PRODUCT_VERSION_INPUT stage=product_version",
+                              ci.ci_failure_diagnostic(failure.exception, args._ci_stage))
+
+    def test_ci_pe_version_wrapper_uses_shared_static_guard_and_redacts_failures(self):
+        version = build_windows.parse_product_version("0.2.0+2")
+        summary = {"scope": "mocked_static_resource_only", "runtime_acceptance_verified": False}
+        with mock.patch.object(build_windows, "verify_windows_product_version", return_value=summary) as verify:
+            self.assertIs(ci.verify_ui_pe_version(self.root, version), summary)
+        verify.assert_called_once_with(self.root, version)
+        with mock.patch.object(build_windows, "verify_windows_product_version", side_effect=build_windows.ProductVersionError(
+                r"D:\private\profile.json bearer=never-public")), self.assertRaises(ci.ValidationError) as failure:
+            ci.verify_ui_pe_version(self.root, version)
+        diagnostic = ci.ci_failure_diagnostic(failure.exception, "native_product_version")
+        self.assertIn("code=CI_PRODUCT_VERSION_PE stage=native_product_version", diagnostic)
+        self.assertNotIn("never-public", diagnostic)
+        self.assertNotIn("profile.json", diagnostic)
+
+    def test_ci_real_build_binds_version_metadata_and_pe_check_before_public_artifacts(self):
+        module = ast.parse(Path(ci.__file__).read_text(encoding="utf-8"))
+        run_build = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == "run_build")
+        assignment = next(node for node in run_build.body if isinstance(node, ast.Assign)
+                          and any(isinstance(target, ast.Name) and target.id == "product_version" for target in node.targets))
+        self.assertEqual(ast.unparse(assignment.value), "read_ui_product_version(flutter_source)")
+        build = next(node for node in ast.walk(run_build) if isinstance(node, ast.Call)
+                     and isinstance(node.func, ast.Name) and node.func.id == "run_flutter_ui_build")
+        self.assertLess(assignment.lineno, build.lineno)
+        self.assertIn(("product_version", "product_version"),
+                      [(keyword.arg, ast.unparse(keyword.value)) for keyword in build.keywords])
+        pe = next(node for node in ast.walk(run_build) if isinstance(node, ast.Call)
+                  and isinstance(node.func, ast.Name) and node.func.id == "verify_ui_pe_version")
+        self.assertEqual([ast.unparse(argument) for argument in pe.args], ["app_stage", "product_version"])
+        copies = [node for node in ast.walk(run_build) if isinstance(node, ast.Call)
+                  and ast.unparse(node.func) == "build_windows.copy_directory"
+                  and node.args and ast.unparse(node.args[0]) == "compiled"]
+        self.assertEqual(len(copies), 1)
+        self.assertLess(copies[0].lineno, pe.lineno)
+        for function in ("build_worker", "assert_public_bundle", "write_zip"):
+            call = next(node for node in ast.walk(run_build) if isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Name) and node.func.id == function)
+            self.assertLess(pe.lineno, call.lineno)
+        for name in ("build_status", "manifest"):
+            record = next(node.value for node in run_build.body if isinstance(node, ast.Assign)
+                          and any(isinstance(target, ast.Name) and target.id == name for target in node.targets))
+            self.assertIsInstance(record, ast.Dict)
+            self.assertTrue(any(key is None and ast.unparse(value) == "product_version.metadata()"
+                                for key, value in zip(record.keys, record.values)))
+            keys = {key.value: value for key, value in zip(record.keys, record.values) if isinstance(key, ast.Constant)}
+            self.assertEqual(ast.unparse(keys["windows_pe_version"]), "pe_version")
+            scope = keys["validation"] if name == "manifest" else record
+            scoped = {key.value: value for key, value in zip(scope.keys, scope.values) if isinstance(key, ast.Constant)}
+            for key in ("signed", "public_distribution_cleared", "legal_certification"):
+                self.assertIs(scoped[key].value, False)
+            runtime = "native_application_runtime_verified" if name == "manifest" else "runtime_acceptance_verified"
+            self.assertIs(scoped[runtime].value, False)
+        for name in ("run_flutter_ui_checks", "run_flutter_ui_build"):
+            function = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == name)
+            calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)
+                     and ast.unparse(node.func) == "build_windows.flutter_commands"]
+            self.assertEqual(len(calls), 1)
+            self.assertIn(("product_version", "product_version"),
+                          [(keyword.arg, ast.unparse(keyword.value)) for keyword in calls[0].keywords])
+
     def test_ci_runs_analysis_and_tests_before_both_release_builds(self):
         args = SimpleNamespace()
         sdk, source, stage = (self.root / name for name in ("sdk", "ui", "stage"))
+        self.pubspec_source(source, "3.4.5+6")
+        version = build_windows.read_product_version(source / "pubspec.yaml")
         toolchain, observed = {"fixture": "preflight"}, {"fixture": "actual"}
         output = io.StringIO()
         with mock.patch.object(ci, "run_flutter", return_value=b"") as run, \
                 mock.patch.object(ci, "validate_flutter_windows_toolchain", return_value=observed) as validate, \
                 redirect_stdout(output):
             actual, checks = ci.run_flutter_ui_build(args, sdk, source, {}, stage, toolchain)
-        commands = build_windows.flutter_commands(build_only=False)
+        commands = build_windows.flutter_commands(build_only=False, product_version=version)
         self.assertEqual([label for label, _command in commands],
                          ["pub", "l10n", "analyze", "test", "windows", "web"])
+        defines = ["--dart-define=CHASTEADY_PRODUCT_VERSION=3.4.5", "--dart-define=CHASTEADY_BUILD_NUMBER=6"]
         self.assertEqual(commands[2:4], [("analyze", ["analyze", "--no-pub"]),
-                                        ("test", ["test", "--no-pub", "--reporter", "expanded"])])
+                                        ("test", ["test", "--no-pub", "--reporter", "expanded"] + defines)])
+        for label, command in commands[4:]:
+            self.assertIn("--build-name=3.4.5", command)
+            self.assertIn("--build-number=6", command)
+            self.assertEqual(command[-2:], defines)
         self.assertEqual(run.call_args_list, [
             mock.call(label, sdk, command, source, {}, stage,
                       timeout=3600 if label in ("windows", "web") else 1200)
@@ -1443,6 +1615,7 @@ class CiBuildWindowsTests(unittest.TestCase):
                         output.getvalue().index("stage=flutter_windows"))
 
     def test_ci_ui_check_failure_stops_before_native_build_and_is_safely_reported(self):
+        self.pubspec_source()
         for failed_label in ("analyze", "test"):
             with self.subTest(label=failed_label):
                 args = SimpleNamespace()
@@ -1467,6 +1640,7 @@ class CiBuildWindowsTests(unittest.TestCase):
                 self.assertNotIn("do-not-print", diagnostic)
 
     def test_ci_does_not_accept_omitted_ui_checks_as_a_successful_build(self):
+        self.pubspec_source()
         commands = build_windows.flutter_commands(build_only=True)
         with mock.patch.object(build_windows, "flutter_commands", return_value=commands), \
                 mock.patch.object(ci, "run_flutter", return_value=b""), \

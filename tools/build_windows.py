@@ -1,11 +1,13 @@
 """Build native Flutter and stage a fresh relocatable Windows application bundle."""
 import argparse
+from dataclasses import dataclass
 import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -111,23 +113,190 @@ def verify_worker_inventory(directory, report):
             "native_application_runtime_verified": False}
 
 
-def flutter_commands(build_only=False):
+class ProductVersionError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class ProductVersion:
+    major: int
+    minor: int
+    patch: int
+    build: int
+
+    def __post_init__(self):
+        if any(type(part) is not int or not 0 <= part <= 65535 for part in self.windows_version):
+            raise ProductVersionError("Product version must contain four uint16 components")
+
+    @property
+    def windows_version(self):
+        return self.major, self.minor, self.patch, self.build
+
+    @property
+    def version(self):
+        return ".".join(map(str, self.windows_version[:3]))
+
+    @property
+    def build_number(self):
+        return str(self.build)
+
+    @property
+    def pubspec_version(self):
+        return self.version + "+" + self.build_number
+
+    @property
+    def package_stem(self):
+        return "ChaSteady-" + self.pubspec_version + "-Windows-x64"
+
+    def metadata(self):
+        return {"product_version": self.version, "build_number": self.build_number,
+                "pubspec_version": self.pubspec_version, "version_source": "ui/pubspec.yaml",
+                "package_stem": self.package_stem}
+
+
+def parse_product_version(value):
+    # 四段均受 PE 的 WORD 上限约束；不接受预发布、前导零或可注入参数的字符。
+    component = r"(0|[1-9][0-9]{0,4})"
+    if type(value) is not str or not re.fullmatch(
+            component + r"\." + component + r"\." + component + r"\+" + component, value):
+        raise ProductVersionError("Product version must be canonical major.minor.patch+build")
+    return ProductVersion(*(int(part) for part in re.split(r"[.+]", value)))
+
+
+def read_product_version(pubspec):
+    # 只接受有界 pubspec 的规范顶层映射子集，避免引入 YAML 执行器或歧义键。
+    pubspec = Path(pubspec)
+    try:
+        _assert_no_reparse_components(pubspec)
+        if not pubspec.is_file() or not 0 < pubspec.stat().st_size <= 65536:
+            raise ProductVersionError("Product pubspec must be a bounded regular UTF-8 file")
+        with pubspec.open("rb") as stream:
+            raw = stream.read(65537)
+        if len(raw) > 65536:
+            raise ProductVersionError("Product pubspec must be a bounded regular UTF-8 file")
+        text = raw.decode("utf-8").replace("\r\n", "\n")
+    except (OSError, UnicodeError, ValueError) as error:
+        raise ProductVersionError("Product pubspec must be a bounded regular UTF-8 file") from error
+    if any(ord(character) < 32 and character != "\n" for character in text):
+        raise ProductVersionError("Product pubspec must use unique canonical top-level keys and one plain version")
+    seen, version, current_key = set(), None, None
+    for line in text.split("\n"):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if line.startswith(" "):
+            # YAML 的缩进续行会改变实际版本标量，不能只截取第一行接受。
+            if current_key == "version":
+                raise ProductVersionError("Product pubspec must use unique canonical top-level keys and one plain version")
+            continue
+        match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_-]*):(?: +(.*))?", line.rstrip(" "))
+        if match is None or match[1] in seen:
+            raise ProductVersionError("Product pubspec must use unique canonical top-level keys and one plain version")
+        current_key = match[1]
+        seen.add(current_key)
+        if current_key == "version":
+            value = (match[2] or "").split(" #", 1)[0].rstrip(" ")
+            version = parse_product_version(value)
+    if version is None:
+        raise ProductVersionError("Product pubspec must use unique canonical top-level keys and one plain version")
+    return version
+
+
+def parse_fixed_file_info(raw):
+    # VS_FIXEDFILEINFO 固定为 13 个小端 DWORD，不依赖本机 ctypes 结构对齐。
+    if type(raw) is not bytes or len(raw) != 52:
+        raise ProductVersionError("Windows fixed version resource is invalid")
+    fields = struct.unpack("<13I", raw)
+    if fields[0] != 0xFEEF04BD or fields[1] != 0x00010000:
+        raise ProductVersionError("Windows fixed version resource is invalid")
+    def components(high, low):
+        return high >> 16, high & 65535, low >> 16, low & 65535
+    return {"file_version": components(fields[2], fields[3]),
+            "product_version": components(fields[4], fields[5])}
+
+
+def _read_windows_fixed_file_info(executable):
+    if os.name != "nt":
+        raise ProductVersionError("Windows product version resource requires the Windows system API")
+    import ctypes
+    from ctypes import wintypes
+
+    # 只从 System32 加载系统版本 API；读取资源，不加载或启动待验应用。
+    api = ctypes.WinDLL("version.dll", use_last_error=True, winmode=0x00000800)
+    api.GetFileVersionInfoSizeW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD)]
+    api.GetFileVersionInfoSizeW.restype = wintypes.DWORD
+    api.GetFileVersionInfoW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
+    api.GetFileVersionInfoW.restype = wintypes.BOOL
+    api.VerQueryValueW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR,
+                                  ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.UINT)]
+    api.VerQueryValueW.restype = wintypes.BOOL
+    ignored = wintypes.DWORD()
+    size = api.GetFileVersionInfoSizeW(str(executable), ctypes.byref(ignored))
+    if not 52 <= size <= 16 * 1024 * 1024:
+        raise ProductVersionError("Windows product version resource could not be read safely")
+    buffer = ctypes.create_string_buffer(size)
+    if not api.GetFileVersionInfoW(str(executable), 0, size, buffer):
+        raise ProductVersionError("Windows product version resource could not be read safely")
+    pointer, length = ctypes.c_void_p(), wintypes.UINT()
+    if not api.VerQueryValueW(buffer, "\\", ctypes.byref(pointer), ctypes.byref(length)):
+        raise ProductVersionError("Windows product version resource could not be read safely")
+    start = ctypes.addressof(buffer)
+    if length.value != 52 or pointer.value is None or not start <= pointer.value <= start + size - 52:
+        raise ProductVersionError("Windows product version resource could not be read safely")
+    return ctypes.string_at(pointer, 52)
+
+
+def verify_windows_product_version(directory, product_version):
+    # 调用方只交付受控输出目录，固定读取其中的 ChaSteady.exe。
+    directory = Path(directory)
+    try:
+        _assert_no_reparse_components(directory)
+        executable = directory / "ChaSteady.exe"
+        _assert_no_reparse_components(executable)
+        if not directory.is_absolute() or not executable.is_file():
+            raise ProductVersionError("Windows product version input must be a controlled regular application output")
+        executable = executable.resolve(strict=True)
+        if executable.parent != directory.resolve(strict=True):
+            raise ProductVersionError("Windows product version input must be a controlled regular application output")
+        fixed = parse_fixed_file_info(_read_windows_fixed_file_info(executable))
+    except (OSError, ValueError) as error:
+        raise ProductVersionError("Windows product version resource could not be read safely") from error
+    if any(value != product_version.windows_version for value in fixed.values()):
+        raise ProductVersionError("Windows file or product version differs from the product pubspec")
+    # 字符串资源可能不含 build；以两个固定四段数值为准，不做原始字符串相等判断。
+    return {"fixed_file_version": ".".join(map(str, fixed["file_version"])),
+            "fixed_product_version": ".".join(map(str, fixed["product_version"])),
+            "matches_pubspec": True, "scope": "static_windows_version_resource_only",
+            "executable_executed": False, "runtime_acceptance_verified": False}
+
+
+def flutter_commands(build_only=False, product_version=None):
+    defines, build_version = [], []
+    if product_version is not None:
+        if type(product_version) is not ProductVersion:
+            raise ProductVersionError("Flutter product version must be a validated ProductVersion")
+        defines = ["--dart-define=CHASTEADY_PRODUCT_VERSION=" + product_version.version,
+                   "--dart-define=CHASTEADY_BUILD_NUMBER=" + product_version.build_number]
+        build_version = ["--build-name=" + product_version.version,
+                         "--build-number=" + product_version.build_number]
     commands = [
         ("pub", ["pub", "get", "--enforce-lockfile"]),
         ("l10n", ["gen-l10n"]),
     ]
     if not build_only:
         commands.extend([("analyze", ["analyze", "--no-pub"]),
-                         ("test", ["test", "--no-pub", "--reporter", "expanded"])])
+                         ("test", ["test", "--no-pub", "--reporter", "expanded"] + defines)])
     commands.extend([
-        ("windows", ["build", "windows", "--release"]),
-        ("web", ["build", "web", "--release", "--no-web-resources-cdn", "--pwa-strategy=none"]),
+        ("windows", ["build", "windows", "--release"] + build_version + defines),
+        ("web", ["build", "web", "--release", "--no-web-resources-cdn", "--pwa-strategy=none"]
+         + build_version + defines),
     ])
     return commands
 
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--version-summary", action="store_true",
+                        help="Print bounded source product-version JSON only; do not run a build")
     parser.add_argument("--worker-dir", type=Path, help="Verified PyInstaller onedir containing Worker.exe")
     parser.add_argument("--worker-manifest", type=Path, default=ROOT / "docs/worker_runtime.json",
                         help="Build/protocol evidence and exact Worker file hashes")
@@ -135,6 +304,13 @@ def main():
     parser.add_argument("--build-only", action="store_true",
                         help="Build and stage only; skip analyze/tests and leave runtime acceptance unverified")
     args = parser.parse_args()
+    if args.version_summary:
+        try:
+            summary = read_product_version(ROOT / "ui/pubspec.yaml").metadata()
+        except ProductVersionError:
+            parser.error("Product pubspec is missing or invalid")
+        print(json.dumps(summary, ensure_ascii=True))
+        return
     worker = None
     worker_report = None
     worker_evidence = None
@@ -172,7 +348,8 @@ def main():
             environment[key] = str(value)
     environment["PATH"] = str(shim.parent) + os.pathsep + environment.get("PATH", "")
     registry = OwnedProcessRegistry(threading.Event())
-    commands = flutter_commands(args.build_only)
+    product_version = read_product_version(source / "pubspec.yaml")
+    commands = flutter_commands(args.build_only, product_version=product_version)
     try:
         with registry_scope(registry):
             for label, arguments in commands:
@@ -191,10 +368,11 @@ def main():
     compiled = source / "build/windows/x64/runner/Release"
     if not (compiled / "ChaSteady.exe").is_file() or not (compiled / "flutter_windows.dll").is_file():
         raise RuntimeError("No genuine native Windows release output")
-    release = ROOT / "private/releases" / ("windows-x64-" + uuid.uuid4().hex)
+    release = ROOT / "private/releases" / (product_version.package_stem + "-" + uuid.uuid4().hex)
     release.mkdir(parents=True)
     bundle = release / "app"
     copy_directory(compiled, bundle, omit_debug=True)
+    pe_version = verify_windows_product_version(bundle, product_version)
     copy_directory(source / "build/web", bundle / "web")
     worker_present = worker is not None
     if worker_present:
@@ -220,7 +398,8 @@ def main():
     shutil.copyfile(ROOT / "docs/WINDOWS_PORTABLE_GUIDE.md", bundle / "README.md")
     copy_directory(ROOT / "docs/licenses", bundle / "licenses")
     with (bundle / "BUILD_STATUS.json").open("x", encoding="utf-8") as stream:
-        json.dump({"native_compiled": True, "worker_packaged": worker_present,
+        json.dump({**product_version.metadata(), "windows_pe_version": pe_version,
+                   "native_compiled": True, "worker_packaged": worker_present,
                    "build_only": args.build_only, "prebuild_tests_run": not args.build_only,
                    "runtime_acceptance_verified": False, "signed": False,
                    "public_distribution_cleared": False,
@@ -228,6 +407,8 @@ def main():
                    "notice_source_paths": "docs/ paths in THIRD_PARTY_NOTICES refer to source-checkout provenance, not bundled diagnostic logs"},
                   stream, ensure_ascii=False, indent=2)
     manifest = bundle_metadata(bundle, worker_present)
+    manifest.update(product_version.metadata())
+    manifest["windows_pe_version"] = pe_version
     manifest["build_only"] = args.build_only
     manifest["prebuild_tests_run"] = not args.build_only
     manifest["worker_inventory_verification"] = worker_evidence

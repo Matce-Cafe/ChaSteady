@@ -45,7 +45,10 @@ from cha_stabilizer.owned_processes import (  # noqa: E402
 )
 
 
-SIDECAR_NAME = re.compile(r"^worker_math_golden_summary_20261015_[0-9a-fA-F-]{32,36}\.json$")
+SIDECAR_NAME = re.compile(
+    r"worker_math_golden_summary_(?P<date>[0-9]{8})_"
+    r"(?P<uuid>[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.json"
+)
 SOURCE_CANONICALIZATION = "utf-8-lf-v1"
 SOURCE_INVENTORY_PATHS = (
     "tools/freeze_worker.py",
@@ -108,7 +111,7 @@ class ValidationError(RuntimeError):
 
 CI_STAGES = frozenset({
     "checkout", "toolchain_report", "flutter_report", "font_report", "worker_report",
-    "stage_ui", "flutter_environment", "flutter_version", "flutter_pub", "flutter_l10n",
+    "stage_ui", "product_version", "native_product_version", "flutter_environment", "flutter_version", "flutter_pub", "flutter_l10n",
     "flutter_analyze", "flutter_test", "flutter_windows", "native_toolchain", "flutter_web",
     "native_outputs", "native_fixture_configure", "native_fixture_build", "native_fixture_run",
     "native_fixture_probe_report", "native_fixture_probe_source", "native_fixture_probe_toolchain",
@@ -143,6 +146,8 @@ SAFE_VALIDATION_CODES = {
     "Noto Sans SC provenance or OFL license failed its pinned identity": "CI_FONT_LICENSE_IDENTITY",
     "The binary Noto font must not be committed in the public source checkout": "CI_FONT_IN_SOURCE",
     "Locked Flutter UI dependency graph is required": "CI_UI_LOCKFILE_MISSING",
+    "Staged UI product pubspec is missing or invalid": "CI_PRODUCT_VERSION_INPUT",
+    "Native Windows product version does not match the staged UI pubspec": "CI_PRODUCT_VERSION_PE",
     "Required Flutter UI analysis or tests did not execute": "CI_UI_CHECKS_MISSING",
     "Windows fixture output is missing or is not a regular file": "CI_WINDOW_FIXTURE_OUTPUT",
     "Preinstalled window fixture probe report is invalid": "CI_WINDOW_PROBE_REPORT",
@@ -540,9 +545,18 @@ def _validate_math_sidecar(data: dict, root: Path, runtime_report: dict) -> dict
             "authenticity_scope": "unsigned local evidence bound by content hashes; not cryptographic attestation"}
 
 
-def validate_math_sidecar(path: Path, root: Path, runtime_report: dict) -> dict:
-    if not SIDECAR_NAME.fullmatch(path.name):
+def validate_math_sidecar_name(name: str) -> None:
+    match = SIDECAR_NAME.fullmatch(name) if type(name) is str else None
+    if match is None:
         raise ValidationError("Math sidecar filename does not match the approved dated UUID name")
+    try:
+        datetime.strptime(match["date"], "%Y%m%d")
+    except ValueError as error:
+        raise ValidationError("Math sidecar filename does not match the approved dated UUID name") from error
+
+
+def validate_math_sidecar(path: Path, root: Path, runtime_report: dict) -> dict:
+    validate_math_sidecar_name(path.name)
     resolved = path.resolve(strict=True)
     if not resolved.is_relative_to((root / "docs").resolve(strict=True)):
         raise ValidationError("Math sidecar must be a public-safe JSON summary inside docs/")
@@ -1230,7 +1244,12 @@ def run_flutter_preflight(args) -> dict:
     environment = create_flutter_environment(os.environ, stage)
     mark_ci_stage(args, "flutter_version")
     identity = flutter_version_check(sdk_root, source, environment, stage)
-    checks = run_flutter_ui_checks(args, sdk_root, source, environment, stage) if ui_only else None
+    product_version = None
+    if ui_only:
+        mark_ci_stage(args, "product_version")
+        product_version = read_ui_product_version(source)
+    checks = run_flutter_ui_checks(args, sdk_root, source, environment, stage,
+                                   product_version=product_version) if ui_only else None
     mark_ci_stage(args, "flutter_preflight_result")
     receipt = {"schema_version": 1,
                "scope": "pinned_flutter_identity_and_ui_checks_only" if ui_only else "pinned_flutter_executable_identity_only",
@@ -1238,6 +1257,7 @@ def run_flutter_preflight(args) -> dict:
                "strict_machine_json_verified": True, "native_build_executed": False,
                "worker_tests_or_math_executed": False, "runtime_acceptance_verified": False}
     if ui_only:
+        receipt.update(product_version.metadata())
         receipt["ui_checks"] = checks
     _write_json_new(stage / ("flutter-ui-preflight.json" if ui_only else "flutter-preflight.json"), receipt)
     print("Pinned Flutter {} preflight passed; no native or Worker build was run.".format(
@@ -1568,10 +1588,27 @@ def run_native_window_fixture(args, source: Path, environment: dict,
             "multi_monitor_dpi_verified": False}
 
 
+def read_ui_product_version(source: Path):
+    try:
+        return build_windows.read_product_version(source / "pubspec.yaml")
+    except build_windows.ProductVersionError as error:
+        raise ValidationError("Staged UI product pubspec is missing or invalid") from error
+
+
+def verify_ui_pe_version(directory: Path, product_version) -> dict:
+    try:
+        return build_windows.verify_windows_product_version(directory, product_version)
+    except build_windows.ProductVersionError as error:
+        raise ValidationError("Native Windows product version does not match the staged UI pubspec") from error
+
+
 def run_flutter_ui_checks(args, sdk_root: Path, source: Path, environment: dict,
-                          stage: Path) -> dict:
+                          stage: Path, product_version=None) -> dict:
+    if product_version is None:
+        mark_ci_stage(args, "product_version")
+        product_version = read_ui_product_version(source)
     checks = {"flutter_analyze_passed": False, "flutter_tests_passed": False}
-    for label, command in build_windows.flutter_commands(build_only=False):
+    for label, command in build_windows.flutter_commands(build_only=False, product_version=product_version):
         if label in ("windows", "web"):
             continue
         mark_ci_stage(args, "flutter_" + label)
@@ -1586,10 +1623,13 @@ def run_flutter_ui_checks(args, sdk_root: Path, source: Path, environment: dict,
 
 
 def run_flutter_ui_build(args, sdk_root: Path, source: Path, environment: dict,
-                         stage: Path, toolchain_report: dict) -> tuple[dict, dict]:
-    checks = run_flutter_ui_checks(args, sdk_root, source, environment, stage)
+                         stage: Path, toolchain_report: dict, product_version=None) -> tuple[dict, dict]:
+    if product_version is None:
+        mark_ci_stage(args, "product_version")
+        product_version = read_ui_product_version(source)
+    checks = run_flutter_ui_checks(args, sdk_root, source, environment, stage, product_version=product_version)
     actual_windows_toolchain = None
-    for label, command in build_windows.flutter_commands(build_only=False):
+    for label, command in build_windows.flutter_commands(build_only=False, product_version=product_version):
         if label not in ("windows", "web"):
             continue
         mark_ci_stage(args, "flutter_" + label)
@@ -1634,6 +1674,8 @@ def run_build(args) -> dict:
     stage = make_new_directory(toolchains / ("ci-build-" + uuid.uuid4().hex))
     app_stage = stage / "app-stage"
     flutter_source = stage_flutter_source(root, stage, font_path)
+    mark_ci_stage(args, "product_version")
+    product_version = read_ui_product_version(flutter_source)
 
     mark_ci_stage(args, "flutter_environment")
     flutter_env = create_flutter_environment(os.environ, stage)
@@ -1642,7 +1684,7 @@ def run_build(args) -> dict:
     mark_ci_stage(args, "flutter_version")
     version_info = flutter_version_check(sdk_root, flutter_source, flutter_env, stage)
     actual_windows_toolchain, ui_checks = run_flutter_ui_build(
-        args, sdk_root, flutter_source, flutter_env, stage, toolchain_report)
+        args, sdk_root, flutter_source, flutter_env, stage, toolchain_report, product_version=product_version)
     native_window_fixture = run_native_window_fixture(
         args, flutter_source, flutter_env, stage, toolchain_report)
 
@@ -1663,6 +1705,8 @@ def run_build(args) -> dict:
     sidecar_summary = validate_math_sidecar(args.math_sidecar.resolve(strict=True), root, runtime_report)
     mark_ci_stage(args, "stage_app")
     build_windows.copy_directory(compiled, app_stage, omit_debug=True)
+    mark_ci_stage(args, "native_product_version")
+    pe_version = verify_ui_pe_version(app_stage, product_version)
     build_windows.copy_directory(web_root, app_stage / "web")
     mark_ci_stage(args, "worker_build_and_smoke")
     worker_bundle, backend_summary, worker_summary, worker_inventory = build_worker(
@@ -1683,6 +1727,8 @@ def run_build(args) -> dict:
     mark_ci_stage(args, "bundle_metadata")
     build_status = {
         "schema_version": 1,
+        **product_version.metadata(),
+        "windows_pe_version": pe_version,
         "native_compiled": True,
         "worker_packaged": True,
         "web_assets_packaged": True,
@@ -1730,6 +1776,8 @@ def run_build(args) -> dict:
     manifest = {
         "schema_version": 1,
         "product": "ChaSteady",
+        **product_version.metadata(),
+        "windows_pe_version": pe_version,
         "build_scope": "manual_windows_x64_build_only",
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "toolchain": {

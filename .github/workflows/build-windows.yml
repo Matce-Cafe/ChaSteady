@@ -1,4 +1,6 @@
 name: Manual Windows build
+run-name: >-
+  ${{ inputs.ui_checks_only && inputs.window_fixture_only && 'Invalid conflicting modes' || inputs.window_fixture_only && 'Window diagnostic' || inputs.ui_checks_only && 'UI checks' || 'Full Windows build' }} | ${{ github.ref_name }} | ${{ github.sha }} | attempt ${{ github.run_attempt }}
 
 on:
   workflow_dispatch:
@@ -57,11 +59,19 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $docs = Join-Path $env:GITHUB_WORKSPACE 'docs'
-          $matches = @(Get-ChildItem -LiteralPath $docs -File -Filter 'worker_math_golden_summary_20261015_*.json')
-          if ($matches.Count -ne 1) {
+          $sidecars = @(Get-ChildItem -LiteralPath $docs -File -Filter 'worker_math_golden_summary_*.json')
+          if ($sidecars.Count -ne 1) {
             throw 'Exactly one approved dated local math-validation summary must be present in docs/.'
           }
-          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "path=$($matches[0].FullName)" -Encoding utf8
+          $namePattern = '^worker_math_golden_summary_(?<date>[0-9]{8})_(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.json$'
+          if (-not ($sidecars[0].Name -cmatch $namePattern)) {
+            throw 'The math-validation summary must use a canonical dated UUID basename.'
+          }
+          $dateValue = [DateTime]::MinValue
+          if (-not [DateTime]::TryParseExact($Matches['date'], 'yyyyMMdd', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$dateValue)) {
+            throw 'The math-validation summary basename must contain a valid calendar date.'
+          }
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "path=$($sidecars[0].FullName)" -Encoding utf8
 
       - name: Verify runner Python for trusted repository helpers
         id: host-python
@@ -80,6 +90,26 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "path=$($python.Source)" -Encoding utf8
           Write-Output "Using runner-provided Python $version for repository helper scripts."
 
+      # run-name 在 checkout 前求值；实际产品版本只能在此后读取并写入摘要与产物名。
+      - name: Read bounded product version from the source pubspec
+        id: product-version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repo = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
+          $versionJson = & '${{ steps.host-python.outputs.path }}' -I -B (Join-Path $repo 'tools/build_windows.py') --version-summary
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          $product = $versionJson | ConvertFrom-Json
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "package_stem=$($product.package_stem)" -Encoding utf8
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value @(
+            '### ChaSteady source product version',
+            "Product: $($product.product_version); build: $($product.build_number); pubspec: $($product.pubspec_version)",
+            'Source: ui/pubspec.yaml. Worker component/protocol and toolchain versions are separate.',
+            'This source summary is not a PE verification, runtime acceptance, signing, or legal-clearance result.'
+          )
+
       - name: Test CI guards without downloading or running native fixtures
         shell: pwsh
         run: |
@@ -89,8 +119,10 @@ jobs:
           $tests = @(
             'tools/test_ci_provision_flutter.py',
             'tools/test_ci_prepare_assets.py',
+            'tools/test_build_windows.py',
             'tools/test_ci_build_windows.py',
-            'tools/test_ci_toolchain_preflight.py'
+            'tools/test_ci_toolchain_preflight.py',
+            'tools/test_project_conventions.py'
           )
           foreach ($test in $tests) {
             & $python -I (Join-Path $repo $test)
@@ -120,6 +152,18 @@ jobs:
             --window-fixture-only `
             --toolchain-report $report `
             --preflight-stage $stage
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Check reviewed HEAD conventions and maintenance documents before the full build
+        if: ${{ !inputs.ui_checks_only && !inputs.window_fixture_only }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repo = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
+          & '${{ steps.host-python.outputs.path }}' -I -B (Join-Path $repo 'tools/check_project_conventions.py') `
+            --root $repo --check-head --check-docs
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
@@ -274,7 +318,7 @@ jobs:
         if: ${{ success() && !inputs.ui_checks_only && !inputs.window_fixture_only }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: ChaSteady-Windows-x64-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ steps.product-version.outputs.package_stem }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ steps.run-root.outputs.ci_root }}/artifacts/ChaSteady-Windows-x64.zip
             ${{ steps.run-root.outputs.ci_root }}/artifacts/ChaSteady-Windows-x64.zip.sha256
