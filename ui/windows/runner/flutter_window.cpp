@@ -3,11 +3,13 @@
 #include <flutter/plugin_registrar_windows.h>
 
 #include <optional>
+#include <utility>
 
 #include "flutter/generated_plugin_registrant.h"
 
-FlutterWindow::FlutterWindow(const flutter::DartProject& project)
-    : project_(project) {}
+FlutterWindow::FlutterWindow(const flutter::DartProject& project,
+    std::shared_ptr<const chasteady::NativeLaunchConfiguration> launch_configuration)
+    : project_(project), launch_configuration_(std::move(launch_configuration)) {}
 
 FlutterWindow::~FlutterWindow() {}
 
@@ -40,7 +42,7 @@ bool FlutterWindow::OnCreate() {
   SetChildContent(flutter_child);
   native_bridge_ = std::make_unique<chasteady::NativeBridge>(
       GetHandle(), flutter_child, registrar->messenger(),
-      registrar->texture_registrar());
+      registrar->texture_registrar(), launch_configuration_);
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
     this->Show();

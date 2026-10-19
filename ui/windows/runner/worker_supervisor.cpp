@@ -2,6 +2,8 @@
 #define NOMINMAX
 #endif
 #include "worker_supervisor.h"
+#include "native_launch_configuration.h"
+#include "preview_lease_bookkeeping.h"
 
 #include <windows.h>
 #include <aclapi.h>
@@ -543,6 +545,70 @@ bool GetModulePath(std::wstring* output) {
     buffer.resize(std::min<size_t>(buffer.size() * 2, 32767));
   }
 }
+
+std::atomic<uint64_t> g_owned_worker_generation{1};
+
+struct OwnedProcessIdentity final {
+  DWORD pid = 0;
+  uint64_t creation_filetime = 0;
+  std::wstring image;
+};
+
+bool CanonicalProcessImage(const std::wstring& value, std::wstring* output) {
+  std::wstring full;
+  if (!GetFullPath(value, &full)) return false;
+  std::vector<wchar_t> buffer(32768);
+  const DWORD length = GetLongPathNameW(full.c_str(), buffer.data(), static_cast<DWORD>(buffer.size()));
+  if (length == 0 || length >= buffer.size()) return false;
+  output->assign(buffer.data(), length);
+  return true;
+}
+
+bool ReadOwnedProcessIdentity(HANDLE process, OwnedProcessIdentity* identity) {
+  if (!IsValidHandle(process) || identity == nullptr) return false;
+  FILETIME created{}, exited{}, kernel{}, user{};
+  identity->pid = GetProcessId(process);
+  if (identity->pid == 0 || !GetProcessTimes(process, &created, &exited, &kernel, &user)) return false;
+  identity->creation_filetime = (static_cast<uint64_t>(created.dwHighDateTime) << 32) | created.dwLowDateTime;
+  std::vector<wchar_t> image(32768);
+  DWORD length = static_cast<DWORD>(image.size());
+  if (identity->creation_filetime == 0 || !QueryFullProcessImageNameW(process, 0, image.data(), &length)) return false;
+  return CanonicalProcessImage(std::wstring(image.data(), length), &identity->image);
+}
+
+// 此对象只持有本次 CreateProcess 原始对象的 duplicate；Stop 清理线程可安全共享其生命周期。
+struct OwnedProcessWitness final {
+  ScopedHandle process;
+  OwnedProcessIdentity identity;
+  uint64_t generation = 0;
+  std::shared_ptr<std::atomic<bool>> forced_cleanup;
+
+  OwnedWorkerProcessObservation Observe() const {
+    OwnedWorkerProcessObservation result;
+    result.generation = generation;
+    result.pid = identity.pid;
+    result.creation_filetime = identity.creation_filetime;
+    result.image = identity.image;
+    result.identity_verified = true;
+    result.forced_cleanup_requested = forced_cleanup->load(std::memory_order_acquire);
+    if (!IsValidHandle(process.get())) return result;
+    result.original_handle_observed = true;
+    const DWORD wait = WaitForSingleObject(process.get(), 0);
+    if (wait == WAIT_OBJECT_0) {
+      result.wait_state = OwnedWorkerProcessObservation::WaitState::kSignaled;
+      DWORD exit_code = STILL_ACTIVE;
+      result.exit_code_known = GetExitCodeProcess(process.get(), &exit_code) != FALSE;
+      result.exit_code = exit_code;
+    } else if (wait == WAIT_TIMEOUT) {
+      result.wait_state = OwnedWorkerProcessObservation::WaitState::kLive;
+    } else {
+      result.wait_state = OwnedWorkerProcessObservation::WaitState::kFailed;
+    }
+    // 先观测 signaled，再读取强制请求，不能把并发的 Job fallback 误报为自然完成。
+    result.forced_cleanup_requested = forced_cleanup->load(std::memory_order_acquire);
+    return result;
+  }
+};
 
 std::wstring ParentPath(const std::wstring& value) {
   const size_t separator = value.find_last_of(L"\\/");
@@ -1209,6 +1275,10 @@ class WorkerSupervisor::Impl final {
     }
     if (IsValidHandle(output_copy)) CloseHandle(output_copy);
     if (IsValidHandle(process_copy)) CloseHandle(process_copy);
+    const OwnedWorkerProcessObservation observation = ObserveOwnedProcess();
+    if (observation.generation != 0 && !observation.IsVerifiedTerminal() &&
+        !observation.HasReapedStartupFailure()) cleanup_ok = false;
+    forced = forced || observation.forced_cleanup_requested;
 
     WorkerReply reply;
     reply.ok = cleanup_ok;
@@ -1223,6 +1293,25 @@ class WorkerSupervisor::Impl final {
   void SetExitCallback(ExitCallback callback) {
     std::lock_guard<std::mutex> lock(mutex_);
     exit_callback_ = std::move(callback);
+  }
+
+  OwnedWorkerProcessObservation ObserveOwnedProcess() const {
+    std::shared_ptr<OwnedProcessWitness> witness;
+    OwnedWorkerProcessObservation startup_reap;
+    uint64_t generation = 0;
+    {
+      std::lock_guard<std::mutex> lock(handles_mutex_);
+      witness = process_witness_;
+      generation = process_generation_;
+      if (startup_reap_observation_.MatchesReapedStartupFailure(generation, created_worker_pid_,
+          ready_ever_published_.load(std::memory_order_acquire))) startup_reap = startup_reap_observation_;
+    }
+    if (witness) return witness->Observe();
+    OwnedWorkerProcessObservation result;
+    if (startup_reap.HasReapedStartupFailure()) result = std::move(startup_reap);
+    else result.generation = generation;
+    result.forced_cleanup_requested = forced_cleanup_requested_->load(std::memory_order_acquire);
+    return result;
   }
 
   bool IsReady() const noexcept {
@@ -1277,11 +1366,14 @@ class WorkerSupervisor::Impl final {
     HANDLE process = INVALID_HANDLE_VALUE;
     HANDLE job = INVALID_HANDLE_VALUE;
     HANDLE mutex = INVALID_HANDLE_VALUE;
+    std::shared_ptr<OwnedProcessWitness> witness;
+    const auto forced_cleanup = forced_cleanup_requested_;
     {
       std::lock_guard<std::mutex> lock(handles_mutex_);
       process = std::exchange(process_handle_, INVALID_HANDLE_VALUE);
       job = std::exchange(job_handle_, INVALID_HANDLE_VALUE);
       mutex = std::exchange(singleton_mutex_, INVALID_HANDLE_VALUE);
+      witness = process_witness_;
       CloseHandleIfValid(output_read_);
       output_read_ = INVALID_HANDLE_VALUE;
     }
@@ -1290,15 +1382,15 @@ class WorkerSupervisor::Impl final {
           ? options_.graceful_shutdown_timeout_ms
           : std::min<DWORD>(options_.graceful_shutdown_timeout_ms, 2000);
       try {
-        std::thread([process, job, mutex, grace]() {
+        std::thread([process, job, mutex, grace, witness, forced_cleanup]() {
           if (IsValidHandle(process)) WaitForSingleObject(process, grace);
-          // Closing only this supervisor-owned job is the bounded fallback.
-          if (IsValidHandle(job)) CloseHandle(job);
+          // 仍只关闭原有 owned Job；共享 duplicate 不随原始 handle 转移而失效。
+          CloseTransferredJob(job, witness, forced_cleanup);
           if (IsValidHandle(process)) CloseHandle(process);
           if (IsValidHandle(mutex)) CloseHandle(mutex);
         }).detach();
       } catch (...) {
-        if (IsValidHandle(job)) CloseHandle(job);
+        CloseTransferredJob(job, witness, forced_cleanup);
         if (IsValidHandle(process)) CloseHandle(process);
         if (IsValidHandle(mutex)) CloseHandle(mutex);
       }
@@ -1407,6 +1499,45 @@ class WorkerSupervisor::Impl final {
     dispatcher.detach();
   }
 
+  bool InitializeOwnedProcessWitness(DWORD expected_pid, const std::wstring& expected_image) {
+    uint64_t generation = g_owned_worker_generation.load(std::memory_order_relaxed);
+    do {
+      if (generation == 0 || generation == std::numeric_limits<uint64_t>::max()) return false;
+    } while (!g_owned_worker_generation.compare_exchange_weak(generation, generation + 1,
+                                                             std::memory_order_relaxed));
+    {
+      std::lock_guard<std::mutex> lock(handles_mutex_);
+      process_generation_ = generation;
+      process_witness_.reset();
+      startup_reap_observation_ = OwnedWorkerProcessObservation{};
+    }
+    HANDLE original = GetProcessHandle();
+    OwnedProcessIdentity identity;
+    std::wstring canonical_expected;
+    if (!ReadOwnedProcessIdentity(original, &identity) || identity.pid != expected_pid ||
+        !CanonicalProcessImage(expected_image, &canonical_expected) ||
+        CompareStringOrdinal(identity.image.c_str(), -1, canonical_expected.c_str(), -1, TRUE) != CSTR_EQUAL)
+      return false;
+    HANDLE duplicated = INVALID_HANDLE_VALUE;
+    if (!DuplicateHandle(GetCurrentProcess(), original, GetCurrentProcess(), &duplicated,
+                         SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, 0)) return false;
+    ScopedHandle copy(duplicated);
+    OwnedProcessIdentity duplicate_identity;
+    if (!ReadOwnedProcessIdentity(copy.get(), &duplicate_identity) ||
+        duplicate_identity.pid != identity.pid || duplicate_identity.creation_filetime != identity.creation_filetime ||
+        duplicate_identity.image != identity.image) return false;
+    auto witness = std::make_shared<OwnedProcessWitness>();
+    witness->process.reset(copy.release());
+    witness->identity = std::move(identity);
+    witness->generation = generation;
+    witness->forced_cleanup = forced_cleanup_requested_;
+    {
+      std::lock_guard<std::mutex> lock(handles_mutex_);
+      process_witness_ = std::move(witness);
+    }
+    return true;
+  }
+
   void StartWorker() {
     std::wstring executable;
     std::wstring bundle_root;
@@ -1430,11 +1561,20 @@ class WorkerSupervisor::Impl final {
       FailStart(Failure("worker_data_root_unavailable", "nativeWorker.error.dataRoot"));
       return;
     }
-    data_root = BuildPrivateDataRoot(sid_string);
-    if (data_root.empty() || !EnsurePrivateDataRoot(data_root, sid_string,
-          reinterpret_cast<PSID>(sid_buffer.data()))) {
-      FailStart(Failure("worker_data_root_unavailable", "nativeWorker.error.dataRoot"));
-      return;
+    if (options_.launch_configuration && options_.launch_configuration->has_new_profile()) {
+      // 隔离分支绝不调用会创建默认目录的函数，也绝不在失败后回落普通数据根。
+      if (!options_.launch_configuration->Revalidate(bundle_root)) {
+        FailStart(Failure("worker_data_root_unavailable", "nativeWorker.error.dataRoot"));
+        return;
+      }
+      data_root = options_.launch_configuration->profile_root();
+    } else {
+      data_root = BuildPrivateDataRoot(sid_string);
+      if (data_root.empty() || !EnsurePrivateDataRoot(data_root, sid_string,
+            reinterpret_cast<PSID>(sid_buffer.data()))) {
+        FailStart(Failure("worker_data_root_unavailable", "nativeWorker.error.dataRoot"));
+        return;
+      }
     }
     if (!IsDisjoint(bundle_root, data_root)) {
       FailStart(Failure("worker_data_root_unavailable", "nativeWorker.error.dataRoot"));
@@ -1566,6 +1706,8 @@ class WorkerSupervisor::Impl final {
     {
       std::lock_guard<std::mutex> lock(handles_mutex_);
       process_handle_ = process.release();
+      created_worker_pid_ = process_info.dwProcessId;
+      startup_reap_observation_ = OwnedWorkerProcessObservation{};
       job_handle_ = job.release();
       input_write_ = parent_stdin.release();
       output_read_ = parent_stdout.release();
@@ -1573,6 +1715,11 @@ class WorkerSupervisor::Impl final {
     child_stdin.reset();
     child_stdout.reset();
     child_stderr.reset();
+    // 未绑定本次原始对象的 PID/创建时间/映像 duplicate 前，不允许 Worker 进入 ready/媒体服务。
+    if (!InitializeOwnedProcessWitness(process_info.dwProcessId, worker_executable)) {
+      FailStart(Failure("worker_identity_unavailable", "nativeWorker.error.startup"));
+      return;
+    }
 
     if (stop_requested_.load(std::memory_order_acquire) || ResumeThread(primary_thread.get()) == static_cast<DWORD>(-1)) {
       CloseOwnedJob();
@@ -1613,6 +1760,7 @@ class WorkerSupervisor::Impl final {
       if (!startup_was_cancelled) {
         ready_ = ready;
         capability_ = std::move(capability);
+        ready_ever_published_.store(true, std::memory_order_release);
         state_ = State::kRunning;
         callbacks.swap(ready_callbacks_);
       }
@@ -1667,6 +1815,20 @@ class WorkerSupervisor::Impl final {
     return true;
   }
 
+  void RecordReapedStartupFailure(HANDLE original, DWORD actual_wait) {
+    if (actual_wait != WAIT_OBJECT_0 || ready_ever_published_.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::mutex> lock(handles_mutex_);
+    if (!IsValidHandle(original) || original != process_handle_ || process_witness_ ||
+        process_generation_ == 0 || created_worker_pid_ == 0) return;
+    // 原始 handle 仍持有且真实等待成功；此独立证据不伪造完整身份或 lease 终态。
+    startup_reap_observation_ = OwnedWorkerProcessObservation{};
+    startup_reap_observation_.generation = process_generation_;
+    startup_reap_observation_.pid = created_worker_pid_;
+    startup_reap_observation_.original_handle_observed = true;
+    startup_reap_observation_.wait_state = OwnedWorkerProcessObservation::WaitState::kSignaled;
+    startup_reap_observation_.startup_failure_reaped = true;
+  }
+
   void FailStart(WorkerFailure failure) {
     std::vector<ReadyCallback> callbacks;
     {
@@ -1683,7 +1845,10 @@ class WorkerSupervisor::Impl final {
     CloseInputPipe();
     CloseOwnedJob();
     HANDLE process = GetProcessHandle();
-    if (IsValidHandle(process)) WaitForSingleObject(process, INFINITE);
+    if (IsValidHandle(process)) {
+      const DWORD actual_wait = WaitForSingleObject(process, INFINITE);
+      RecordReapedStartupFailure(process, actual_wait);
+    }
     CloseOutputPipe();
     CloseProcessAndMutex();
     for (auto& callback : callbacks) DispatchReady(std::move(callback), false, {}, failure);
@@ -1743,6 +1908,7 @@ class WorkerSupervisor::Impl final {
       }
       if (eof) {
         if (stop_requested_.load(std::memory_order_acquire)) return;
+        stdout_eof_observed_.store(true, std::memory_order_release);
         const bool shutdown_acknowledged = shutdown_acknowledged_.load(std::memory_order_acquire);
         if (IsValidHandle(process) && WaitForSingleObject(process, 0) != WAIT_OBJECT_0 &&
             !shutdown_acknowledged) {
@@ -1993,16 +2159,13 @@ class WorkerSupervisor::Impl final {
     ReplyCallback shutdown_callback;
     ExitCallback exit_callback;
     bool was_started = false;
+    const OwnedWorkerProcessObservation observation = ObserveOwnedProcess();
+    // 会话失败通知不是终态；正常 shutdown 仍须 ACK、真实 stdout EOF 和原对象 signaled。
     const bool process_completed = failure.code == "worker_exited" &&
-        shutdown_acknowledged_.load(std::memory_order_acquire);
-    bool forced_shutdown = shutdown_fallback_requested_.load(std::memory_order_acquire);
-    if (process_completed) {
-      DWORD exit_code = STILL_ACTIVE;
-      HANDLE process = GetProcessHandle();
-      if (!IsValidHandle(process) || !GetExitCodeProcess(process, &exit_code) || exit_code != 0) {
-        forced_shutdown = true;
-      }
-    }
+        shutdown_acknowledged_.load(std::memory_order_acquire) &&
+        stdout_eof_observed_.load(std::memory_order_acquire) && observation.IsVerifiedTerminal();
+    const bool forced_shutdown = shutdown_fallback_requested_.load(std::memory_order_acquire) ||
+        observation.forced_cleanup_requested || (process_completed && !observation.IsGracefulTerminal());
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (state_ == State::kStopped || stopping_) return;
@@ -2056,9 +2219,20 @@ class WorkerSupervisor::Impl final {
     output_read_ = INVALID_HANDLE_VALUE;
   }
 
+  static void CloseTransferredJob(HANDLE job, const std::shared_ptr<OwnedProcessWitness>& witness,
+                                  const std::shared_ptr<std::atomic<bool>>& forced_cleanup) {
+    if (!IsValidHandle(job)) return;
+    // 记录请求而非伪造终态；CloseHandle 失败或进程仍 live 都不能授权清账。
+    if (!witness || !IsValidHandle(witness->process.get()) ||
+        WaitForSingleObject(witness->process.get(), 0) != WAIT_OBJECT_0) {
+      forced_cleanup->store(true, std::memory_order_release);
+    }
+    CloseHandle(job);
+  }
+
   void CloseOwnedJob() {
     std::lock_guard<std::mutex> lock(handles_mutex_);
-    CloseHandleIfValid(job_handle_);
+    CloseTransferredJob(job_handle_, process_witness_, forced_cleanup_requested_);
     job_handle_ = INVALID_HANDLE_VALUE;
   }
 
@@ -2112,7 +2286,7 @@ class WorkerSupervisor::Impl final {
     }
   }
 
-  WorkerSupervisorOptions options_;
+  const WorkerSupervisorOptions options_;
   mutable std::mutex mutex_;
   std::condition_variable condition_;
   State state_ = State::kNew;
@@ -2120,6 +2294,8 @@ class WorkerSupervisor::Impl final {
   bool shutdown_queued_ = false;
   std::atomic<bool> shutdown_acknowledged_{false};
   std::atomic<bool> shutdown_fallback_requested_{false};
+  std::atomic<bool> stdout_eof_observed_{false};
+  std::atomic<bool> ready_ever_published_{false};
   ReplyCallback shutdown_callback_;
   std::chrono::steady_clock::time_point shutdown_deadline_{};
   uint64_t next_request_id_ = 1;
@@ -2132,6 +2308,12 @@ class WorkerSupervisor::Impl final {
   ExitCallback exit_callback_;
 
   mutable std::mutex handles_mutex_;
+  std::shared_ptr<OwnedProcessWitness> process_witness_;
+  uint64_t process_generation_ = 0;
+  DWORD created_worker_pid_ = 0;
+  OwnedWorkerProcessObservation startup_reap_observation_;
+  const std::shared_ptr<std::atomic<bool>> forced_cleanup_requested_ =
+      std::make_shared<std::atomic<bool>>(false);
   HANDLE process_handle_ = INVALID_HANDLE_VALUE;
   HANDLE job_handle_ = INVALID_HANDLE_VALUE;
   HANDLE input_write_ = INVALID_HANDLE_VALUE;
@@ -2159,6 +2341,7 @@ void WorkerSupervisor::ReleaseMedia(const std::string& lease_id, ReplyCallback c
 }
 void WorkerSupervisor::RequestShutdown(ReplyCallback callback) { impl_->RequestShutdown(std::move(callback)); }
 void WorkerSupervisor::SetExitCallback(ExitCallback callback) { impl_->SetExitCallback(std::move(callback)); }
+OwnedWorkerProcessObservation WorkerSupervisor::ObserveOwnedProcess() const { return impl_->ObserveOwnedProcess(); }
 bool WorkerSupervisor::IsReady() const noexcept { return impl_->IsReady(); }
 void WorkerSupervisor::Stop() { impl_->Stop(); }
 

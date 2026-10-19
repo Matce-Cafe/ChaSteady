@@ -9,6 +9,11 @@
 #include <functional>
 #include <memory>
 #include <string>
+#ifdef CHASTEADY_WINDOW_DIAGNOSTICS
+#include <array>
+#include <cstdint>
+#include <vector>
+#endif
 
 namespace chasteady {
 
@@ -64,6 +69,26 @@ class WindowChrome final {
   bool HandleWindowMessage(HWND window, UINT message, WPARAM wparam,
                            LPARAM lparam, LRESULT* result);
 
+#ifdef CHASTEADY_WINDOW_DIAGNOSTICS
+  // 仅诊断目标编译；512 条环形记录，不接受 HWND/PID，也不改变消息路由。
+  struct DiagnosticRecord {
+    uint64_t sequence = 0;
+    uint64_t tick_ms = 0;
+    uint64_t geometry_generation = 0;
+    std::string stage;
+    UINT message = 0;
+    uint64_t wparam = 0;
+    int64_t result = 0;
+    bool maximized = false;
+    bool custom_frame_enabled = false;
+    LONG client_width = 0;
+    LONG client_height = 0;
+    UINT dpi = 0;
+  };
+  void RecordDiagnostic(const char* stage, UINT message = 0, WPARAM wparam = 0, LRESULT result = 0);
+  std::vector<DiagnosticRecord> TakeDiagnostics();
+#endif
+
  private:
   struct ChildSubclassData;
 
@@ -95,6 +120,12 @@ class WindowChrome final {
   bool maximize_button_pressed_ = false;
   bool owner_destroying_ = false;
   bool frame_transition_ = false;
+#ifdef CHASTEADY_WINDOW_DIAGNOSTICS
+  std::array<DiagnosticRecord, 512> diagnostics_{};
+  uint64_t diagnostic_sequence_ = 0;
+  uint64_t geometry_generation_ = 0;
+  size_t diagnostic_count_ = 0;
+#endif
 };
 
 }  // namespace chasteady

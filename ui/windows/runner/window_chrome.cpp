@@ -195,6 +195,10 @@ bool WindowChrome::RestoreStockFrame() {
 
 bool WindowChrome::Configure(bool enabled, const Geometry& geometry,
                              std::string* error) {
+#ifdef CHASTEADY_WINDOW_DIAGNOSTICS
+  ++geometry_generation_;
+  RecordDiagnostic(enabled ? "configure-enabled" : "configure-disabled");
+#endif
   if (error != nullptr) error->clear();
   if (!enabled) {
     if (!custom_frame_enabled_ && child_subclass_ == nullptr) return true;
@@ -353,6 +357,39 @@ void WindowChrome::UpdateHoverFromCursor() {
   }
 }
 
+#ifdef CHASTEADY_WINDOW_DIAGNOSTICS
+void WindowChrome::RecordDiagnostic(const char* stage, UINT message, WPARAM wparam, LRESULT result) {
+  DiagnosticRecord record;
+  record.sequence = ++diagnostic_sequence_;
+  record.tick_ms = GetTickCount64();
+  record.geometry_generation = geometry_generation_;
+  record.stage = stage;
+  record.message = message;
+  record.wparam = static_cast<uint64_t>(wparam);
+  record.result = static_cast<int64_t>(result);
+  record.maximized = IsZoomed(owner_window_) != FALSE;
+  record.custom_frame_enabled = custom_frame_enabled_;
+  RECT client{};
+  if (GetClientRect(owner_window_, &client)) {
+    record.client_width = client.right - client.left;
+    record.client_height = client.bottom - client.top;
+  }
+  record.dpi = GetDpiForWindow(owner_window_);
+  diagnostics_[(record.sequence - 1) % diagnostics_.size()] = std::move(record);
+  diagnostic_count_ = std::min(diagnostic_count_ + 1, diagnostics_.size());
+}
+
+std::vector<WindowChrome::DiagnosticRecord> WindowChrome::TakeDiagnostics() {
+  std::vector<DiagnosticRecord> result;
+  result.reserve(diagnostic_count_);
+  const uint64_t first = diagnostic_sequence_ - diagnostic_count_;
+  for (size_t index = 0; index < diagnostic_count_; ++index)
+    result.push_back(diagnostics_[(first + index) % diagnostics_.size()]);
+  diagnostic_count_ = 0;
+  return result;
+}
+#endif
+
 void WindowChrome::NotifyStateIfChanged() {
   if (frame_transition_) return;
   const State state = GetState();
@@ -364,6 +401,12 @@ void WindowChrome::NotifyStateIfChanged() {
 bool WindowChrome::HandleWindowMessage(HWND window, UINT message, WPARAM wparam,
                                       LPARAM lparam, LRESULT* result) {
   if (window != owner_window_) return false;
+#ifdef CHASTEADY_WINDOW_DIAGNOSTICS
+  if (message == WM_NCHITTEST || message == WM_NCLBUTTONDOWN || message == WM_NCLBUTTONUP ||
+      message == WM_NCLBUTTONDBLCLK || message == WM_SYSCOMMAND || message == WM_SIZE ||
+      message == WM_DPICHANGED || message == WM_CLOSE)
+    RecordDiagnostic("owner-message", message, wparam);
+#endif
   if (message == WM_DESTROY) {
     owner_destroying_ = true;
     custom_frame_enabled_ = false;
@@ -410,6 +453,9 @@ bool WindowChrome::HandleWindowMessage(HWND window, UINT message, WPARAM wparam,
     case WM_NCHITTEST: {
       const POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
       handled_result = HitTest(point);
+#ifdef CHASTEADY_WINDOW_DIAGNOSTICS
+      RecordDiagnostic("owner-hit", message, wparam, handled_result);
+#endif
       break;
     }
     case WM_NCMOUSEMOVE: {
@@ -444,8 +490,14 @@ bool WindowChrome::HandleWindowMessage(HWND window, UINT message, WPARAM wparam,
       // The OWN TOP-LEVEL default procedure gets the real NC messages. It is
       // the sole owner of maximize clicks/Snap, caption double-click/drag,
       // system menu, and border sizing. Flutter never sees a second click.
+#ifdef CHASTEADY_WINDOW_DIAGNOSTICS
+      RecordDiagnostic("nc-default-before", message, wparam);
+#endif
       handled_result = DefWindowProc(window, message, wparam, lparam);
       if (*alive) {
+#ifdef CHASTEADY_WINDOW_DIAGNOSTICS
+        RecordDiagnostic("nc-default-after", message, wparam, handled_result);
+#endif
         maximize_button_pressed_ = false;
         UpdateHoverFromCursor();
         NotifyStateIfChanged();
@@ -508,6 +560,10 @@ LRESULT CALLBACK WindowChrome::ChildSubclassProc(
       // SetWindowSubclass/DefSubclassProc leave Flutter's WNDPROC intact.
       const LRESULT hit = SendMessage(chrome->owner_window_, WM_NCHITTEST,
                                       wparam, lparam);
+#ifdef CHASTEADY_WINDOW_DIAGNOSTICS
+      chrome->RecordDiagnostic(hit != HTCLIENT && hit != HTNOWHERE ? "child-transparent" : "child-defer",
+          message, wparam, hit != HTCLIENT && hit != HTNOWHERE ? HTTRANSPARENT : 0);
+#endif
       if (hit != HTCLIENT && hit != HTNOWHERE) return HTTRANSPARENT;
     } else if (message == WM_MOUSEMOVE || message == WM_LBUTTONUP) {
       if (chrome->maximize_button_hovered_ || chrome->maximize_button_pressed_) {

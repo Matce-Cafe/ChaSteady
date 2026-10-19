@@ -4,6 +4,9 @@
 #include "native_bridge.h"
 
 #include "native_media.h"
+#include "media_drop_target.h"
+#include "native_launch_configuration.h"
+#include "preview_lease_bookkeeping.h"
 #include "window_chrome.h"
 #include "worker_supervisor.h"
 
@@ -51,6 +54,8 @@ constexpr UINT kNativeReplyMessage = WM_APP + 0x4a0;
 constexpr UINT kNativeEventMessage = WM_APP + 0x4a1;
 constexpr UINT_PTR kCloseRequestTimer = 0x4a0;
 constexpr UINT_PTR kShutdownWarningTimer = 0x4a2;
+constexpr UINT_PTR kOwnedProcessObservationTimer = 0x4a3;
+constexpr UINT kOwnedProcessObservationMilliseconds = 100;
 constexpr UINT kCloseRequestTimeoutMilliseconds = 60000;
 constexpr UINT kShutdownWarningTimeoutMilliseconds = 60000;
 constexpr UINT kNativeReplySendTimeoutMilliseconds = 250;
@@ -104,6 +109,21 @@ bool GetFiniteNumber(const EncodableValue* value, double* output) {
   if (!std::isfinite(parsed)) return false;
   *output = parsed;
   return true;
+}
+
+bool GetPositiveGeneration(const EncodableValue* value, int64_t* output) {
+  if (value == nullptr || output == nullptr) return false;
+  if (std::holds_alternative<int64_t>(*value)) *output = std::get<int64_t>(*value);
+  else if (std::holds_alternative<int32_t>(*value)) *output = std::get<int32_t>(*value);
+  else return false;
+  return *output > 0;
+}
+
+WorkerSupervisorOptions SupervisorOptions(
+    std::shared_ptr<const NativeLaunchConfiguration> configuration) {
+  WorkerSupervisorOptions options;
+  options.launch_configuration = std::move(configuration);
+  return options;
 }
 
 bool NoArguments(const EncodableValue* value) {
@@ -395,10 +415,11 @@ class NativeBridge::Impl final {
   Impl(HWND owner_window,
        HWND flutter_child,
        flutter::BinaryMessenger* messenger,
-       flutter::TextureRegistrar* texture_registrar)
+       flutter::TextureRegistrar* texture_registrar,
+       std::shared_ptr<const NativeLaunchConfiguration> launch_configuration)
       : owner_window_(owner_window),
         gate_(std::make_shared<CallbackGate>()),
-        supervisor_(),
+        supervisor_(SupervisorOptions(std::move(launch_configuration))),
         media_manager_(texture_registrar,
             [this, gate = gate_](const NativeMediaEvent& event) {
               GateLease lease(gate);
@@ -412,17 +433,38 @@ class NativeBridge::Impl final {
           // Chrome lives and emits only on the platform thread, never through
           // the worker operation queue. WindowChrome deduplicates snapshots.
           if (!destroying_.load(std::memory_order_acquire) && channel_) {
+#ifdef CHASTEADY_WINDOW_DIAGNOSTICS
+            if (window_chrome_) window_chrome_->RecordDiagnostic("dart-state-handoff");
+#endif
             channel_->InvokeMethod("windowStateChanged",
                 std::make_unique<EncodableValue>(WindowStateValue(state)));
           }
+        });
+    media_drop_ = std::make_unique<MediaDropTarget>(owner_window_, flutter_child,
+        [this] {
+          return bootstrap_ready_.load(std::memory_order_acquire) &&
+              !worker_session_failed_.load(std::memory_order_acquire) &&
+              !shutdown_in_progress_.load(std::memory_order_acquire) &&
+              !window_close_pending_.load(std::memory_order_acquire) &&
+              !destroying_.load(std::memory_order_acquire);
+        },
+        [this](const std::string& target, int64_t generation, const std::string& path) {
+          if (!channel_ || destroying_.load(std::memory_order_acquire)) return;
+          EncodableMap event;
+          event.emplace(EncodableValue("targetId"), EncodableValue(target));
+          event.emplace(EncodableValue("generation"), EncodableValue(generation));
+          event.emplace(EncodableValue("path"), EncodableValue(path));
+          channel_->InvokeMethod("mediaFileDropped",
+              std::make_unique<EncodableValue>(std::move(event)));
         });
     const std::shared_ptr<CallbackGate> gate = gate_;
     supervisor_.SetExitCallback([this, gate] {
       GateLease lease(gate);
       if (!lease) return;
-      worker_exited_.store(true, std::memory_order_release);
+      worker_session_failed_.store(true, std::memory_order_release);
       UiEvent event;
-      event.type = UiEvent::Type::kWorkerExited;
+      event.type = UiEvent::Type::kWorkerSessionFailed;
+      event.generation = supervisor_.ObserveOwnedProcess().generation;
       PostEvent(std::move(event));
     });
     channel_->SetMethodCallHandler([this, gate](const MethodCall& call,
@@ -437,15 +479,22 @@ class NativeBridge::Impl final {
     // Engine/window teardown cancels any MethodResults still pending; never
     // synthesize a Dart success after the channel owner begins destruction.
     destroying_.store(true, std::memory_order_release);
+    terminal_observer_active_.store(false, std::memory_order_release);
+    KillTimer(owner_window_, kOwnedProcessObservationTimer);
     if (channel_) channel_->SetMethodCallHandler(nullptr);
     gate_->CloseAndWait();
+    // 在 Flutter child / OLE apartment 析构之前撤销拖放注册及子类。
+    media_drop_.reset();
     // Remove the documented Flutter child subclass before engine/child teardown.
     window_chrome_.reset();
     KillTimer(owner_window_, kCloseRequestTimer);
     KillTimer(owner_window_, kShutdownWarningTimer);
     operation_queue_.Post([this] {
       media_manager_.DisposeAll();
-      player_leases_.clear();
+      // Stop 只转交原有清理链，返回本身不是终态；未 signaled 时不作可信清账。
+      supervisor_.Stop();
+      const OwnedWorkerProcessObservation observation = supervisor_.ObserveOwnedProcess();
+      player_leases_.ClearForTerminalWorker(observation);
     });
     operation_queue_.StopAndJoin();
     supervisor_.Stop();
@@ -463,7 +512,11 @@ class NativeBridge::Impl final {
   bool HandleWindowMessage(HWND window, UINT message, WPARAM wparam,
                            LPARAM lparam, LRESULT* result) {
     if (window != owner_window_) return false;
-    if (!destroying_.load(std::memory_order_acquire)) DrainDeferredReplies();
+    if (media_drop_) media_drop_->HandleWindowMessage(message, wparam, lparam);
+    if (!destroying_.load(std::memory_order_acquire)) {
+      DrainDeferredReplies();
+      EnsureOwnedProcessObservationTimer();
+    }
     if (window_chrome_ && window_chrome_->HandleWindowMessage(
         window, message, wparam, lparam, result)) return true;
     if (message == WM_CLOSE) {
@@ -481,6 +534,11 @@ class NativeBridge::Impl final {
         close_needs_dart_confirmation_ = false;
         ++close_generation_;
       }
+      if (result != nullptr) *result = 0;
+      return true;
+    }
+    if (message == WM_TIMER && wparam == kOwnedProcessObservationTimer) {
+      QueueOwnedProcessObservation();
       if (result != nullptr) *result = 0;
       return true;
     }
@@ -504,6 +562,7 @@ class NativeBridge::Impl final {
   }
 
   bool CloseRequest() {
+    if (media_drop_) media_drop_->Disable();
     if (close_committed_) return false;
     if (shutdown_requested_.load(std::memory_order_acquire) &&
         !shutdown_warning_pending_) {
@@ -577,10 +636,10 @@ class NativeBridge::Impl final {
 
   struct UiEvent final {
     enum class Type {
-      kMedia, kWebSession, kCloseReply, kCloseFallback, kWorkerExited,
-      kShutdownWarning, kShutdownWarningReply, kShutdownFailed,
+      kMedia, kWebSession, kCloseReply, kCloseFallback, kWorkerSessionFailed,
+      kShutdownWarning, kShutdownWarningReply, kShutdownFailed, kOwnedProcessObserved,
     };
-    Type type = Type::kWorkerExited;
+    Type type = Type::kWorkerSessionFailed;
     NativeMediaEvent media;
     uint64_t method_id = 0;
     uint64_t generation = 0;
@@ -588,6 +647,84 @@ class NativeBridge::Impl final {
     bool not_implemented = false;
     std::string url;
   };
+
+  // 平台线程只调度；账本与 Wait0 观测仍由同一个 operation_queue 独占。
+  void BeginOwnedProcessObservation(uint64_t generation) {
+    if (generation == 0 || destroying_.load(std::memory_order_acquire) ||
+        generation < terminal_observer_generation_.load(std::memory_order_acquire)) return;
+    terminal_observer_generation_.store(generation, std::memory_order_release);
+    terminal_observer_active_.store(true, std::memory_order_release);
+    EnsureOwnedProcessObservationTimer();
+    QueueOwnedProcessObservation();
+  }
+
+  void EnsureOwnedProcessObservationTimer() {
+    if (terminal_observer_timer_armed_ || !terminal_observer_active_.load(std::memory_order_acquire)) return;
+    const ULONGLONG now = GetTickCount64();
+    if (now < terminal_observer_retry_tick_) return;
+    terminal_observer_retry_tick_ = now + kOwnedProcessObservationMilliseconds;
+    terminal_observer_timer_armed_ = SetTimer(owner_window_, kOwnedProcessObservationTimer,
+        kOwnedProcessObservationMilliseconds, nullptr) != 0;
+    // timer 不可用时保留账本；一次观测及后续平台消息可重试，不伪造进程终态。
+    if (!terminal_observer_timer_armed_) QueueOwnedProcessObservation();
+  }
+
+  void StopOwnedProcessObservation(uint64_t generation) {
+    if (generation != terminal_observer_generation_.load(std::memory_order_acquire)) return;
+    terminal_observer_active_.store(false, std::memory_order_release);
+    KillTimer(owner_window_, kOwnedProcessObservationTimer);
+    terminal_observer_timer_armed_ = false;
+  }
+
+  void QueueOwnedProcessObservation() {
+    if (destroying_.load(std::memory_order_acquire) ||
+        !terminal_observer_active_.load(std::memory_order_acquire)) return;
+    bool pending = false;
+    if (!terminal_observer_poll_pending_.compare_exchange_strong(pending, true, std::memory_order_acq_rel)) return;
+    const uint64_t generation = terminal_observer_generation_.load(std::memory_order_acquire);
+    const std::shared_ptr<CallbackGate> gate = gate_;
+    if (!operation_queue_.Post([this, gate, generation] {
+          struct PendingPoll final {
+            std::atomic<bool>& pending;
+            ~PendingPoll() { pending.store(false, std::memory_order_release); }
+          } reset{terminal_observer_poll_pending_};
+          GateLease lease(gate);
+          if (!lease || destroying_.load(std::memory_order_acquire) ||
+              !terminal_observer_active_.load(std::memory_order_acquire) ||
+              generation != terminal_observer_generation_.load(std::memory_order_acquire)) return;
+          const OwnedWorkerProcessObservation observation = supervisor_.ObserveOwnedProcess();
+          const uint64_t ledger_generation = player_leases_.WorkerGeneration();
+          bool finished = observation.generation != generation ||
+              (ledger_generation != 0 && ledger_generation != generation);
+          if (!finished && observation.IsVerifiedTerminal()) {
+            if (ledger_generation == 0 && player_leases_.size() == 0) player_leases_.BindWorker(observation);
+            finished = player_leases_.ClearForTerminalWorker(observation);
+          }
+          if (finished && !destroying_.load(std::memory_order_acquire)) {
+            UiEvent event;
+            event.type = UiEvent::Type::kOwnedProcessObserved;
+            event.generation = generation;
+            PostEvent(std::move(event));
+          }
+        })) {
+      terminal_observer_poll_pending_.store(false, std::memory_order_release);
+    }
+  }
+
+  bool ConfirmTerminalPreviewWorker(uint64_t expected_generation) {
+    const OwnedWorkerProcessObservation observation = supervisor_.ObserveOwnedProcess();
+    if (player_leases_.CanCloseReapedStartupFailure(observation, expected_generation,
+        bootstrap_ready_.load(std::memory_order_acquire))) return true;
+    // startup 可在 Stop join 期间才建立身份；只允许空且未绑定账本接纳该已验证终态。
+    const bool late_startup_identity = expected_generation == 0 && observation.generation != 0 &&
+        player_leases_.WorkerGeneration() == 0 && player_leases_.size() == 0;
+    if (observation.generation != expected_generation && !late_startup_identity) return false;
+    // 只有 Supervisor 已确认的 pre-start shutdown 可没有原进程；此分支不调用清账 API。
+    if (observation.generation == 0) return player_leases_.WorkerGeneration() == 0 && player_leases_.size() == 0;
+    if (!observation.IsVerifiedTerminal()) return false;
+    if (player_leases_.WorkerGeneration() == 0 && player_leases_.size() == 0) player_leases_.BindWorker(observation);
+    return player_leases_.ClearForTerminalWorker(observation);
+  }
 
   uint64_t StoreReply(std::unique_ptr<MethodResult> result) {
     if (!result) return 0;
@@ -773,11 +910,21 @@ class NativeBridge::Impl final {
       case UiEvent::Type::kCloseFallback:
         HandleCloseFallback(event.generation, event.accepted);
         break;
-      case UiEvent::Type::kWorkerExited:
-        operation_queue_.Post([this] {
+      case UiEvent::Type::kWorkerSessionFailed:
+        if (media_drop_) media_drop_->Disable();
+        operation_queue_.Post([this, generation = event.generation] {
+          if (destroying_.load(std::memory_order_acquire)) return;
+          const OwnedWorkerProcessObservation observation = supervisor_.ObserveOwnedProcess();
+          if (generation == 0 || observation.generation != generation ||
+              (player_leases_.WorkerGeneration() != 0 && player_leases_.WorkerGeneration() != generation)) return;
           media_manager_.DisposeAll();
-          player_leases_.clear();
+          // 服务失效仅废弃旧 callback 并释放本地资源；原 Worker live 时仍持账。
+          player_leases_.InvalidatePending();
         });
+        BeginOwnedProcessObservation(event.generation);
+        break;
+      case UiEvent::Type::kOwnedProcessObserved:
+        StopOwnedProcessObservation(event.generation);
         break;
       case UiEvent::Type::kShutdownWarning:
         BeginShutdownWarning();
@@ -809,6 +956,36 @@ class NativeBridge::Impl final {
     if (!result) return;
     const std::string& method = call.method_name();
     const EncodableValue* arguments = call.arguments();
+
+#ifdef CHASTEADY_WINDOW_DIAGNOSTICS
+    if (method == "readWindowDiagnostics") {
+      if (!NoArguments(arguments)) {
+        result->Error("invalid_arguments", "Window diagnostics accepts no arguments.");
+        return;
+      }
+      flutter::EncodableList rows;
+      if (window_chrome_) {
+        for (const auto& record : window_chrome_->TakeDiagnostics()) {
+          EncodableMap row;
+          row.emplace(EncodableValue("sequence"), EncodableValue(static_cast<int64_t>(record.sequence)));
+          row.emplace(EncodableValue("tickMs"), EncodableValue(static_cast<int64_t>(record.tick_ms)));
+          row.emplace(EncodableValue("geometryGeneration"), EncodableValue(static_cast<int64_t>(record.geometry_generation)));
+          row.emplace(EncodableValue("stage"), EncodableValue(record.stage));
+          row.emplace(EncodableValue("message"), EncodableValue(static_cast<int64_t>(record.message)));
+          row.emplace(EncodableValue("wparam"), EncodableValue(static_cast<int64_t>(record.wparam)));
+          row.emplace(EncodableValue("result"), EncodableValue(record.result));
+          row.emplace(EncodableValue("maximized"), EncodableValue(record.maximized));
+          row.emplace(EncodableValue("customFrameEnabled"), EncodableValue(record.custom_frame_enabled));
+          row.emplace(EncodableValue("clientWidth"), EncodableValue(static_cast<int64_t>(record.client_width)));
+          row.emplace(EncodableValue("clientHeight"), EncodableValue(static_cast<int64_t>(record.client_height)));
+          row.emplace(EncodableValue("dpi"), EncodableValue(static_cast<int64_t>(record.dpi)));
+          rows.emplace_back(std::move(row));
+        }
+      }
+      result->Success(EncodableValue(std::move(rows)));
+      return;
+    }
+#endif
 
     // Owned-window control is deliberately independent of bootstrap, media,
     // worker capabilities, and the serialized worker operation queue.
@@ -900,6 +1077,41 @@ class NativeBridge::Impl final {
                       "The owned desktop window could not configure its frame; use the stock caption.");
       } else {
         result->Success(WindowStateValue(window_chrome_->GetState()));
+      }
+      return;
+    }
+
+    if (method == "configureMediaDrop") {
+      const EncodableMap* map = nullptr;
+      const EncodableMap* rect = nullptr;
+      MediaDropTarget::Configuration configuration;
+      bool enabled = false;
+      bool valid = IsMap(arguments, &map) && GetBoolean(FindValue(map, "enabled"), &enabled);
+      if (valid && enabled) {
+        valid = HasExactKeys(*map, {"enabled", "targetId", "generation", "rect", "clientWidth"}) &&
+            GetString(FindValue(map, "targetId"), &configuration.target_id) &&
+            GetPositiveGeneration(FindValue(map, "generation"), &configuration.generation) &&
+            GetFiniteNumber(FindValue(map, "clientWidth"), &configuration.client_width) &&
+            IsMap(FindValue(map, "rect"), &rect) && HasExactKeys(*rect, {"left", "top", "right", "bottom"}) &&
+            GetFiniteNumber(FindValue(rect, "left"), &configuration.left) &&
+            GetFiniteNumber(FindValue(rect, "top"), &configuration.top) &&
+            GetFiniteNumber(FindValue(rect, "right"), &configuration.right) &&
+            GetFiniteNumber(FindValue(rect, "bottom"), &configuration.bottom) &&
+            MediaDropTarget::IsValidConfiguration(configuration);
+      } else if (valid) {
+        valid = HasExactKeys(*map, {"enabled"});
+      }
+      if (!valid) {
+        if (media_drop_) media_drop_->Disable();
+        result->Error("media_drop_invalid_config", "Media drop requires a finite, bounded target configuration.");
+        return;
+      }
+      std::string error;
+      if (!media_drop_ || !media_drop_->Configure(enabled, configuration, &error)) {
+        result->Error(error.empty() ? "media_drop_unavailable" : error,
+                      "The owned media drop target is unavailable or its layout is stale.");
+      } else {
+        result->Success();
       }
       return;
     }
@@ -1038,6 +1250,7 @@ class NativeBridge::Impl final {
         return;
       }
       const uint64_t reply_id = StoreReply(std::move(result));
+      if (media_drop_) media_drop_->Disable();
       bool start_shutdown = false;
       bool already_terminal = false;
       bool merged_terminal_waiter = false;
@@ -1065,13 +1278,15 @@ class NativeBridge::Impl final {
       }
       if (merged_terminal_waiter || !start_shutdown) return;  // Share the pending shutdown response.
       if (!operation_queue_.Post([this] {
+            player_leases_.InvalidatePending();
             media_manager_.DisposeAll();
-            for (const auto& player : player_leases_) {
-              supervisor_.ReleaseMedia(player.second, [](WorkerReply) {});
+            for (const auto& player : player_leases_.Snapshot()) {
+              supervisor_.ReleaseMedia(player.lease_id, [](WorkerReply) {});
             }
-            player_leases_.clear();
+            // shutdown 被拒绝时仍保留原映射；成功 callback 也须另核原始对象终态。
+            const uint64_t worker_generation = supervisor_.ObserveOwnedProcess().generation;
             const std::shared_ptr<CallbackGate> gate = gate_;
-            supervisor_.RequestShutdown([this, gate](WorkerReply reply) mutable {
+            supervisor_.RequestShutdown([this, gate, worker_generation](WorkerReply reply) mutable {
               GateLease lease(gate);
               if (!lease) return;
               if (!reply.ok || !reply.shutting_down) {
@@ -1082,19 +1297,37 @@ class NativeBridge::Impl final {
                 FailShutdown(std::move(failure));
                 return;
               }
-              shutdown_requested_.store(true, std::memory_order_release);
-              if (reply.shutdown_timed_out) {
-                UiEvent warning;
-                warning.type = UiEvent::Type::kShutdownWarning;
-                if (!PostEvent(std::move(warning))) {
-                  WorkerFailure warning_failure;
-                  warning_failure.code = "shutdown_warning_delivery_failed";
-                  warning_failure.message_key = "nativeWorker.error.timeout";
-                  warning_failure.message = "The forced-shutdown warning could not be delivered.";
-                  FailShutdown(std::move(warning_failure));
-                }
-              } else {
-                CompleteShutdownWaiters();
+              const bool timed_out = reply.shutdown_timed_out;
+              if (!operation_queue_.Post([this, timed_out, worker_generation] {
+                    if (destroying_.load(std::memory_order_acquire)) return;
+                    if (!ConfirmTerminalPreviewWorker(worker_generation)) {
+                      WorkerFailure failure;
+                      failure.code = "worker_cleanup_unconfirmed";
+                      failure.message_key = "nativeWorker.error.exited";
+                      failure.message = "The original owned worker process has not reached a confirmed terminal state.";
+                      FailShutdown(std::move(failure));
+                      return;
+                    }
+                    shutdown_requested_.store(true, std::memory_order_release);
+                    if (timed_out) {
+                      UiEvent warning;
+                      warning.type = UiEvent::Type::kShutdownWarning;
+                      if (!PostEvent(std::move(warning))) {
+                        WorkerFailure warning_failure;
+                        warning_failure.code = "shutdown_warning_delivery_failed";
+                        warning_failure.message_key = "nativeWorker.error.timeout";
+                        warning_failure.message = "The forced-shutdown warning could not be delivered.";
+                        FailShutdown(std::move(warning_failure));
+                      }
+                    } else {
+                      CompleteShutdownWaiters();
+                    }
+                  })) {
+                WorkerFailure failure;
+                failure.code = "native_worker_stopped";
+                failure.message_key = "nativeWorker.error.stopped";
+                failure.message = "The terminal worker result could not reach the native operation queue.";
+                FailShutdown(std::move(failure));
               }
             });
           })) {
@@ -1108,6 +1341,35 @@ class NativeBridge::Impl final {
     }
 
     result->NotImplemented();
+  }
+
+  // 调用者与账本完成处理都在 operation_queue；Supervisor callback 只转交不可变结果。
+  void ReleaseTrackedPreviewLease(const PreviewLeaseBookkeeping::ReleaseToken& token,
+                                  uint64_t reply_id) {
+    const std::shared_ptr<CallbackGate> gate = gate_;
+    supervisor_.ReleaseMedia(token.lease_id,
+        [this, gate, token, reply_id](WorkerReply released) mutable {
+          GateLease gate_lease(gate);
+          if (!gate_lease) return;
+          auto outcome = std::make_shared<WorkerReply>(std::move(released));
+          if (!operation_queue_.Post([this, token, reply_id, outcome] {
+                if (destroying_.load(std::memory_order_acquire)) return;
+                // 协议 1 的 ok:true/released:false 是 Worker 确认已不存在，亦可幂等收账。
+                const auto confirmation = player_leases_.ConfirmRelease(token, outcome->ok);
+                if (reply_id == 0) return;
+                if (!outcome->ok) {
+                  CompleteError(reply_id, outcome->failure);
+                } else if (confirmation == PreviewLeaseBookkeeping::Confirmation::kStale) {
+                  CompleteError(reply_id, "player_dispose_stale", "nativeMedia.error.leaseUnavailable",
+                                "The preview release belongs to an obsolete lifetime.");
+                } else {
+                  CompleteSuccess(reply_id);
+                }
+              }) && reply_id != 0 && !destroying_.load(std::memory_order_acquire)) {
+            CompleteError(reply_id, "native_media_unavailable", "nativeMedia.error.unavailable",
+                          "The native media service is unavailable.");
+          }
+        });
   }
 
   void HandlePlayerMethod(const std::string& method,
@@ -1162,7 +1424,7 @@ class NativeBridge::Impl final {
 
     const uint64_t reply_id = StoreReply(std::move(result));
     if (!operation_queue_.Post([this, method, player_id, number, boolean, reply_id] {
-          if (worker_exited_.load(std::memory_order_acquire) && method != "disposePreview") {
+          if (worker_session_failed_.load(std::memory_order_acquire) && method != "disposePreview") {
             CompleteError(reply_id, "worker_exited", "nativeWorker.error.exited",
                           "The private worker is no longer available.");
             return;
@@ -1181,31 +1443,29 @@ class NativeBridge::Impl final {
           }
           if (method == "disposePreview") {
             std::string error;
-            const bool disposed = media_manager_.Dispose(player_id, &error);
-            const auto lease = player_leases_.find(player_id);
-            if (lease == player_leases_.end()) {
-              if (disposed) CompleteSuccess(reply_id);
-              else CompleteError(reply_id, error.empty() ? "player_not_found" : error,
-                                 "nativeMedia.error.playerNotFound",
-                                 "The native player is no longer available.");
-              return;
-            }
-            const std::string lease_id = lease->second;
-            player_leases_.erase(lease);
+            const auto lease = player_leases_.Find(player_id);
+            const bool disposed = (lease && lease->locally_disposed) ||
+                media_manager_.Dispose(player_id, &error);
             if (!disposed) {
-              supervisor_.ReleaseMedia(lease_id, [](WorkerReply) {});
+              // 本地资源仍活跃时不释放 Worker lease，也不忘记可重试映射。
               CompleteError(reply_id, error.empty() ? "player_dispose_failed" : error,
                             "nativeMedia.error.disposeFailed",
                             "The native player could not be disposed.");
               return;
             }
-            const std::shared_ptr<CallbackGate> gate = gate_;
-            supervisor_.ReleaseMedia(lease_id, [this, gate, reply_id](WorkerReply released) {
-              GateLease lease(gate);
-              if (!lease) return;
-              if (released.ok) CompleteSuccess(reply_id);
-              else CompleteError(reply_id, released.failure);
-            });
+            if (!lease) {
+              CompleteSuccess(reply_id);
+              return;
+            }
+            player_leases_.MarkLocallyDisposed(player_id);
+            const auto token = player_leases_.PrepareRelease(player_id);
+            if (!token) {
+              CompleteError(reply_id, "native_media_unavailable", "nativeMedia.error.leaseUnavailable",
+                            "The preview lease could not be prepared for release.");
+              return;
+            }
+            // queue-full/请求失败保留该 lease；即使 player 已幂等 Dispose，retry 仍发送原 lease。
+            ReleaseTrackedPreviewLease(*token, reply_id);
             return;
           }
           std::string error;
@@ -1238,6 +1498,15 @@ class NativeBridge::Impl final {
                     "A validated preview handle was not returned.");
       return;
     }
+    const OwnedWorkerProcessObservation observation = supervisor_.ObserveOwnedProcess();
+    if (!bootstrap_ready_.load(std::memory_order_acquire) ||
+        worker_session_failed_.load(std::memory_order_acquire) || destroying_.load(std::memory_order_acquire) ||
+        !supervisor_.IsReady() || !observation.IsVerifiedLive() || !player_leases_.BindWorker(observation)) {
+      supervisor_.ReleaseMedia(acquired.lease_id, [](WorkerReply) {});
+      CompleteError(reply_id, "worker_not_ready", "nativeWorker.error.notReady",
+                    "The owned private worker is not ready for a preview.");
+      return;
+    }
     const std::string lease_id = acquired.lease_id;
     NativeMediaCreateResult created = media_manager_.Create(
         acquired.owned_read_handle.release(), acquired.width, acquired.height);
@@ -1248,13 +1517,23 @@ class NativeBridge::Impl final {
                     "The native preview player could not be created.");
       return;
     }
-    player_leases_[created.player_id] = lease_id;
+    if (!player_leases_.Track(created.player_id, lease_id)) {
+      // 内部 player UUID 不应重复；不覆盖已有 lease 账本，也不释放仍活跃的本地资源。
+      if (media_manager_.Dispose(created.player_id, nullptr)) {
+        supervisor_.ReleaseMedia(lease_id, [](WorkerReply) {});
+      }
+      CompleteError(reply_id, "native_media_unavailable", "nativeMedia.error.unavailable",
+                    "The native preview identifier could not be tracked.");
+      return;
+    }
     NativeMediaEvent state;
     std::string state_error;
     if (!media_manager_.State(created.player_id, &state, &state_error)) {
-      media_manager_.Dispose(created.player_id, nullptr);
-      player_leases_.erase(created.player_id);
-      supervisor_.ReleaseMedia(lease_id, [](WorkerReply) {});
+      if (media_manager_.Dispose(created.player_id, nullptr)) {
+        player_leases_.MarkLocallyDisposed(created.player_id);
+        const auto token = player_leases_.PrepareRelease(created.player_id);
+        if (token) ReleaseTrackedPreviewLease(*token, 0);
+      }
       CompleteError(reply_id, state_error.empty() ? "player_state_unavailable" : state_error,
                     "nativeMedia.error.unavailable",
                     "The native preview state could not be read.");
@@ -1324,21 +1603,33 @@ class NativeBridge::Impl final {
     closing_before_bootstrap_.store(true, std::memory_order_release);
     shutdown_in_progress_.store(true, std::memory_order_release);
     if (!operation_queue_.Post([this, generation] {
+          player_leases_.InvalidatePending();
           media_manager_.DisposeAll();
-          for (const auto& player : player_leases_) {
-            supervisor_.ReleaseMedia(player.second, [](WorkerReply) {});
+          for (const auto& player : player_leases_.Snapshot()) {
+            supervisor_.ReleaseMedia(player.lease_id, [](WorkerReply) {});
           }
-          player_leases_.clear();
+          const uint64_t worker_generation = supervisor_.ObserveOwnedProcess().generation;
           const std::shared_ptr<CallbackGate> gate = gate_;
-          supervisor_.RequestShutdown([this, gate, generation](WorkerReply reply) mutable {
+          supervisor_.RequestShutdown([this, gate, generation, worker_generation](WorkerReply reply) mutable {
             GateLease lease(gate);
             if (!lease) return;
-            UiEvent event;
-            event.type = UiEvent::Type::kCloseFallback;
-            event.generation = generation;
-            event.accepted = reply.ok && reply.shutting_down;
-            if (event.accepted) shutdown_requested_.store(true, std::memory_order_release);
-            PostEvent(std::move(event));
+            const bool accepted = reply.ok && reply.shutting_down;
+            if (!operation_queue_.Post([this, generation, worker_generation, accepted] {
+                  if (destroying_.load(std::memory_order_acquire)) return;
+                  const bool confirmed = accepted && ConfirmTerminalPreviewWorker(worker_generation);
+                  if (confirmed) shutdown_requested_.store(true, std::memory_order_release);
+                  UiEvent event;
+                  event.type = UiEvent::Type::kCloseFallback;
+                  event.generation = generation;
+                  event.accepted = confirmed;
+                  PostEvent(std::move(event));
+                })) {
+              UiEvent event;
+              event.type = UiEvent::Type::kCloseFallback;
+              event.generation = generation;
+              event.accepted = false;
+              PostEvent(std::move(event));
+            }
           });
         })) {
       HandleCloseFallback(generation, false);
@@ -1485,6 +1776,7 @@ class NativeBridge::Impl final {
   NativeMediaManager media_manager_;
   std::unique_ptr<MethodChannel> channel_;
   std::unique_ptr<WindowChrome> window_chrome_;  // Platform thread only.
+  std::unique_ptr<MediaDropTarget> media_drop_;  // 仅平台线程。
   TaskQueue operation_queue_;
 
   std::mutex session_mutex_;
@@ -1499,7 +1791,7 @@ class NativeBridge::Impl final {
   std::atomic<bool> shutdown_in_progress_{false};
   std::atomic<bool> shutdown_requested_{false};
   std::atomic<bool> shutdown_result_delivered_{false};
-  std::atomic<bool> worker_exited_{false};
+  std::atomic<bool> worker_session_failed_{false};
   std::atomic<bool> window_close_pending_{false};
   std::atomic<bool> destroying_{false};
 
@@ -1514,15 +1806,21 @@ class NativeBridge::Impl final {
   bool close_needs_dart_confirmation_ = false;
   bool shutdown_warning_pending_ = false;
   uint64_t close_generation_ = 0;
-  std::map<std::string, std::string> player_leases_;  // Operation-queue thread only.
+  PreviewLeaseBookkeeping player_leases_;  // 仅原串行 operation_queue 访问。
+  std::atomic<uint64_t> terminal_observer_generation_{0};
+  std::atomic<bool> terminal_observer_active_{false};
+  std::atomic<bool> terminal_observer_poll_pending_{false};
+  bool terminal_observer_timer_armed_ = false;  // 仅平台线程。
+  ULONGLONG terminal_observer_retry_tick_ = 0;  // 仅平台线程。
 };
 
 NativeBridge::NativeBridge(HWND owner_window,
                            HWND flutter_child,
                            flutter::BinaryMessenger* messenger,
-                           flutter::TextureRegistrar* texture_registrar)
+                           flutter::TextureRegistrar* texture_registrar,
+                           std::shared_ptr<const NativeLaunchConfiguration> launch_configuration)
     : impl_(std::make_unique<Impl>(owner_window, flutter_child, messenger,
-                                   texture_registrar)) {}
+                                   texture_registrar, std::move(launch_configuration))) {}
 NativeBridge::~NativeBridge() = default;
 
 bool NativeBridge::HandleWindowMessage(HWND window, UINT message, WPARAM wparam,

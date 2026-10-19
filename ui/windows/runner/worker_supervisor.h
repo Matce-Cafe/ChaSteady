@@ -13,6 +13,9 @@
 
 namespace chasteady {
 
+class NativeLaunchConfiguration;
+struct OwnedWorkerProcessObservation;
+
 // An owned kernel handle. Move it into NativeMediaManager::Create to transfer
 // the duplicated worker lease for the full playback lifetime.
 class OwnedWorkerHandle final {
@@ -74,6 +77,8 @@ struct WorkerReply final {
 };
 
 struct WorkerSupervisorOptions final {
+  // 只接受 main 验收后的不可变原生配置，不提供任意路径字符串选项。
+  std::shared_ptr<const NativeLaunchConfiguration> launch_configuration;
   DWORD startup_timeout_ms = 30000;
   DWORD request_timeout_ms = 15000;
   DWORD graceful_shutdown_timeout_ms = 30000;
@@ -113,9 +118,12 @@ class WorkerSupervisor final {
   // cancels and reaps any process/pipes before completing.
   void RequestShutdown(ReplyCallback callback);
 
-  // Called after an unexpected EOF/process exit or any protocol/timeout fault.
-  // The callback runs on a supervisor thread and must not destroy this object.
+  // 这是会话不可用通知，含协议/超时失败；不保证原始进程已经结束。
+  // callback 在监督器线程调用，不可在其中销毁本对象。
   void SetExitCallback(ExitCallback callback);
+  // 仅观测本次 CreateProcess 的原始进程对象及其 duplicate，不按 PID 重新打开。
+  // Wait0、不可阻塞平台；duplicate 在 Stop 转移清理 handles 后仍保持有效。
+  OwnedWorkerProcessObservation ObserveOwnedProcess() const;
   bool IsReady() const noexcept;
 
   // Parent cleanup: close stdin to request the worker's EOF cleanup, then close

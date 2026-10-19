@@ -15,6 +15,8 @@ class TextureRegistrar;
 
 namespace chasteady {
 
+class NativeLaunchConfiguration;
+
 // Windows MethodChannel bridge for chasteady/native. Construct it on the
 // Flutter/platform thread after the owned HWND, parented Flutter child,
 // BinaryMessenger, and texture registrar exist; destroy it before those runner
@@ -24,7 +26,8 @@ class NativeBridge final {
   NativeBridge(HWND owner_window,
                HWND flutter_child,
                flutter::BinaryMessenger* messenger,
-               flutter::TextureRegistrar* texture_registrar);
+               flutter::TextureRegistrar* texture_registrar,
+               std::shared_ptr<const NativeLaunchConfiguration> launch_configuration);
   ~NativeBridge();
 
   NativeBridge(const NativeBridge&) = delete;
