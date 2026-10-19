@@ -10,7 +10,7 @@ on:
         type: boolean
         default: false
       window_fixture_only:
-        description: Diagnose only the owned Win32 fixture with reported preinstalled tools; no production build or artifacts
+        description: Preinstalled-only owned Win32 diagnostic; BLOCKED unless trusted isolated x64 CPython 3.15.0 matches; no downloads/build artifacts
         type: boolean
         default: false
 
@@ -138,6 +138,12 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $repo = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
           $ciRoot = '${{ steps.run-root.outputs.ci_root }}'
+          # 先做无子进程的数据检查；不匹配则明确 BLOCKED，不下载或尝试 native 工具。
+          & '${{ steps.host-python.outputs.path }}' -I -B (Join-Path $repo 'tools/ci_build_windows.py') `
+            --root $repo --check-owned-runtime-only
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
           $report = Join-Path $ciRoot 'preinstalled-window-toolchain.json'
           & (Join-Path $repo 'tools/ci_toolchain_preflight.ps1') `
             -OutputPath $report `
@@ -169,7 +175,7 @@ jobs:
           }
 
       - name: Create fresh Worker runtime using the current repository root
-        if: ${{ !inputs.ui_checks_only && !inputs.window_fixture_only }}
+        if: ${{ !inputs.window_fixture_only }}
         id: worker-runtime
         shell: pwsh
         run: |
@@ -197,6 +203,35 @@ jobs:
             exit $LASTEXITCODE
           }
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "path=$report" -Encoding utf8
+
+      - name: Bind fresh audited helper Python and check owned compatibility before SDK download
+        if: ${{ !inputs.window_fixture_only }}
+        id: helper-python
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repo = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
+          $ciRoot = '${{ steps.run-root.outputs.ci_root }}'
+          $receipt = '${{ steps.worker-runtime.outputs.path }}'
+          $result = Join-Path $ciRoot 'helper-runtime.json'
+          & '${{ steps.host-python.outputs.path }}' -I -B (Join-Path $repo 'tools/ci_build_windows.py') `
+            --root $repo --prepare-helper-runtime-only `
+            --helper-runtime-manifest $receipt --helper-runtime-result $result
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          $handoff = Get-Content -LiteralPath $result -Raw | ConvertFrom-Json
+          $helper = $handoff.python_executable
+          $digest = (Get-FileHash -LiteralPath $result -Algorithm SHA256).Hash.ToLowerInvariant()
+          & $helper -I -B (Join-Path $repo 'tools/ci_build_windows.py') `
+            --root $repo --check-owned-runtime-only `
+            --helper-runtime-manifest $receipt --helper-runtime-result $result --helper-runtime-sha256 $digest
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "path=$helper" -Encoding utf8
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "result=$result" -Encoding utf8
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "sha256=$digest" -Encoding utf8
 
       - name: Fetch and verify the pinned Noto font as ephemeral data
         if: ${{ !inputs.window_fixture_only }}
@@ -246,8 +281,11 @@ jobs:
           $repo = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
           $ciRoot = '${{ steps.run-root.outputs.ci_root }}'
           $stage = Join-Path $ciRoot ('flutter-preflight-' + [Guid]::NewGuid().ToString('N'))
-          & '${{ steps.host-python.outputs.path }}' -I (Join-Path $repo 'tools/ci_build_windows.py') `
+          & '${{ steps.helper-python.outputs.path }}' -I -B (Join-Path $repo 'tools/ci_build_windows.py') `
             --root $repo `
+            --helper-runtime-manifest '${{ steps.worker-runtime.outputs.path }}' `
+            --helper-runtime-result '${{ steps.helper-python.outputs.result }}' `
+            --helper-runtime-sha256 '${{ steps.helper-python.outputs.sha256 }}' `
             --preflight-flutter-only `
             --flutter-result '${{ steps.flutter.outputs.result }}' `
             --flutter-scratch '${{ steps.flutter.outputs.scratch }}' `
@@ -264,8 +302,11 @@ jobs:
           $repo = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
           $ciRoot = '${{ steps.run-root.outputs.ci_root }}'
           $stage = Join-Path $ciRoot ('flutter-ui-preflight-' + [Guid]::NewGuid().ToString('N'))
-          & '${{ steps.host-python.outputs.path }}' -I (Join-Path $repo 'tools/ci_build_windows.py') `
+          & '${{ steps.helper-python.outputs.path }}' -I -B (Join-Path $repo 'tools/ci_build_windows.py') `
             --root $repo `
+            --helper-runtime-manifest '${{ steps.worker-runtime.outputs.path }}' `
+            --helper-runtime-result '${{ steps.helper-python.outputs.result }}' `
+            --helper-runtime-sha256 '${{ steps.helper-python.outputs.sha256 }}' `
             --preflight-ui-only `
             --flutter-result '${{ steps.flutter.outputs.result }}' `
             --flutter-scratch '${{ steps.flutter.outputs.scratch }}' `
@@ -300,8 +341,11 @@ jobs:
           $repo = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
           $ciRoot = '${{ steps.run-root.outputs.ci_root }}'
           $artifactDirectory = Join-Path $ciRoot 'artifacts'
-          & '${{ steps.host-python.outputs.path }}' -I (Join-Path $repo 'tools/ci_build_windows.py') `
+          & '${{ steps.helper-python.outputs.path }}' -I -B (Join-Path $repo 'tools/ci_build_windows.py') `
             --root $repo `
+            --helper-runtime-manifest '${{ steps.worker-runtime.outputs.path }}' `
+            --helper-runtime-result '${{ steps.helper-python.outputs.result }}' `
+            --helper-runtime-sha256 '${{ steps.helper-python.outputs.sha256 }}' `
             --toolchain-report (Join-Path $ciRoot 'toolchain-preflight.json') `
             --flutter-result '${{ steps.flutter.outputs.result }}' `
             --flutter-scratch '${{ steps.flutter.outputs.scratch }}' `

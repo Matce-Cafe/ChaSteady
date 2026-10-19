@@ -86,6 +86,8 @@ CTB 与 GF 都读取同一原片；GF 不读取 CTB 输出，也不能先切掉 
 
 公开源码仓库：[Matce-Cafe/ChaSteady](https://github.com/Matce-Cafe/ChaSteady)。Actions 手动触发，不因每次 push 自动发布，也不自动创建 GitHub Release。失败历史不被后续成功改绿；专项检查成功不等于生成完整包。
 
+本轮首次 0.2.0 完整构建在解释器／进程管理前置契约处失败，未产生新包；相关 CI 运行时交接、批处理入口与清理已做源码修复和有界验证，完整 SDK／云构建仍待新提交复验。旧 0.1 包不是该次构建的产物。
+
 产品版本以 [ui/pubspec.yaml](ui/pubspec.yaml) 为准；Worker 组件版、通信协议及 Python 运行时版分别标记。未签名、构建或文件审计成功不等于完整本机验收。核对来源和摘要，不关闭 Defender／SmartScreen。
 
 本轮当前源码的本地后台回归为 234 项（233 项执行通过、1 项既有平台跳过，0 失败／错误），原三案例数学 golden 按原阈值通过并生成新来源摘要。界面回归 77 项通过，但最大化修复和同包真实 GUI 验收尚未完成；这些测试不代表自动 CTB／GF／fresh V9 全流程通过，详细范围见 [验证记录](docs/VERIFICATION.md)。

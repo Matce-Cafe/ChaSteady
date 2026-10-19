@@ -25,6 +25,7 @@ import stat
 import subprocess
 import sys
 import threading
+import traceback
 import uuid
 import zipfile
 
@@ -39,7 +40,9 @@ import ci_provision_flutter  # noqa: E402
 import freeze_worker  # noqa: E402
 import provision_worker_runtime  # noqa: E402
 from cha_stabilizer.owned_processes import (  # noqa: E402
+    OwnedProcessError,
     OwnedProcessRegistry,
+    _windows_popen_signature_supported,
     registry_scope,
     spawn_owned_process,
 )
@@ -109,8 +112,12 @@ class ValidationError(RuntimeError):
     pass
 
 
+# 未确认的原生 owner 必须保留强引用；只有完整清账后的显式重试才能释放。
+_RETAINED_CI_OWNERS: dict[int, OwnedProcessRegistry] = {}
+
+
 CI_STAGES = frozenset({
-    "checkout", "toolchain_report", "flutter_report", "font_report", "worker_report",
+    "helper_runtime", "checkout", "toolchain_report", "flutter_report", "font_report", "worker_report",
     "stage_ui", "product_version", "native_product_version", "flutter_environment", "flutter_version", "flutter_pub", "flutter_l10n",
     "flutter_analyze", "flutter_test", "flutter_windows", "native_toolchain", "flutter_web",
     "native_outputs", "native_fixture_configure", "native_fixture_build", "native_fixture_run",
@@ -124,6 +131,11 @@ CI_STAGES = frozenset({
 # Exact messages authored in this file only. Never print arbitrary exception
 # strings, a prefix-matched vendor log line, argv, paths, or protocol output.
 SAFE_VALIDATION_CODES = {
+    "Owned CI execution is BLOCKED: isolated Windows x64 CPython 3.15.0 and the audited Popen contract are required": "CI_HELPER_RUNTIME_CONTRACT",
+    "Fresh helper runtime receipt or handoff binding is invalid": "CI_HELPER_RUNTIME_BINDING",
+    "Fresh helper runtime canonical validation failed": "CI_HELPER_RUNTIME_VALIDATION",
+    "Flutter CI command is outside the finite unquoted BAT bridge contract": "CI_FLUTTER_CMD_CONTRACT",
+    "The native System32 cmd.exe entry could not be verified": "CI_FLUTTER_CMD_SYSTEM",
     "Build root differs from the repository containing this trusted CI helper": "CI_CHECKOUT_ROOT",
     "A complete Git checkout is required for the trusted runner build": "CI_CHECKOUT_MISSING",
     "A required regular JSON file is missing or outside its size bound": "CI_INPUT_JSON_FILE",
@@ -181,6 +193,10 @@ for _flutter_stage in ("bootstrap", "version", "pub", "l10n", "analyze", "test",
     SAFE_VALIDATION_CODES[
         "Flutter {} exited unsuccessfully; raw runner-local logs are not uploaded".format(_flutter_stage)
     ] = "CI_FLUTTER_{}_EXIT".format(_flutter_stage.upper())
+    for _outcome, _suffix in (("timed out", "TIMEOUT"), ("could not start", "START")):
+        SAFE_VALIDATION_CODES[
+            "Flutter {} {}; raw runner-local logs are not uploaded".format(_flutter_stage, _outcome)
+        ] = "CI_FLUTTER_{}_{}".format(_flutter_stage.upper(), _suffix)
 for _fixture_stage in ("configure", "build", "run"):
     SAFE_VALIDATION_CODES[
         "Windows fixture {} exited unsuccessfully; raw runner-local logs are not uploaded".format(_fixture_stage)
@@ -204,6 +220,8 @@ def ci_failure_diagnostic(error: Exception, stage) -> str:
     code = SAFE_VALIDATION_CODES.get(message) if type(message) is str else None
     if code is not None:
         detail = message
+    elif isinstance(error, OwnedProcessError):
+        code, detail = "CI_OWNED_PROCESS_CONTRACT", "The owned-process creation or cleanup contract failed closed."
     elif isinstance(error, ValidationError):
         code, detail = "CI_VALIDATION_FAILED", "A validation guard rejected this stage."
     else:
@@ -264,6 +282,143 @@ def _validate_hex_digest(value, label: str) -> str:
     if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
         raise ValidationError(label + " must be a lowercase SHA-256")
     return value
+
+
+def require_owned_ci_runtime() -> None:
+    # 只检查当前解释器数据；不探测创建进程，也不允许无 Job 降级。
+    if (os.name != "nt" or sys.platform != "win32" or sys.maxsize != 2 ** 63 - 1
+            or tuple(sys.version_info[:3]) != provision_worker_runtime.PYTHON_VERSION_TUPLE
+            or sys.flags.isolated != 1 or not _windows_popen_signature_supported()):
+        raise ValidationError("Owned CI execution is BLOCKED: isolated Windows x64 CPython 3.15.0 and the audited Popen contract are required")
+
+
+def _helper_path(path: Path, *, directory=False, limit=32 * 1024 * 1024) -> Path:
+    invalid = "Fresh helper runtime receipt or handoff binding is invalid"
+    try:
+        if not path.is_absolute() or any(is_reparse(item) for item in (path, *path.parents)):
+            raise ValidationError(invalid)
+        info = path.stat()
+        if not (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode) and 0 < info.st_size <= limit):
+            raise ValidationError(invalid)
+        return path.resolve(strict=True)
+    except OSError as error:
+        raise ValidationError(invalid) from error
+
+
+def _helper_runtime_facts(args) -> tuple[dict, dict]:
+    invalid = "Fresh helper runtime receipt or handoff binding is invalid"
+    root = _helper_path(args.root, directory=True)
+    if root != ROOT.resolve(strict=True):
+        raise ValidationError(invalid)
+    run_id, attempt = os.environ.get("GITHUB_RUN_ID", ""), os.environ.get("GITHUB_RUN_ATTEMPT", "")
+    if not re.fullmatch(r"[1-9][0-9]{0,19}", run_id) or not re.fullmatch(r"[1-9][0-9]{0,5}", attempt):
+        raise ValidationError(invalid)
+    receipt = _helper_path(args.helper_runtime_manifest, limit=16 * 1024 * 1024)
+    if (receipt.parent != root / "docs" or not re.fullmatch(
+            r"\.ci-worker-runtime-" + run_id + "-" + attempt + r"-[0-9a-f]{32}\.json", receipt.name)):
+        raise ValidationError(invalid)
+    receipt_hash = sha256_file(receipt)
+    report = read_json(receipt, max_bytes=16 * 1024 * 1024)
+    python = report.get("python", {})
+    if (type(python) is not dict or report.get("status") != "provisioned" or "previous_attempt" in report
+            or python.get("version") != provision_worker_runtime.PYTHON_VERSION
+            or python.get("published_sha256") != provision_worker_runtime.PYTHON_SHA256):
+        raise ValidationError(invalid)
+    selected = []
+    for value, directory in ((report.get("toolchain_root"), True), (python.get("runtime_root"), True),
+                             (python.get("interpreter"), False)):
+        if (type(value) is not str or "\\" in value or not value
+                or any(part in {"", ".", ".."} for part in value.split("/")) or ":" in value):
+            raise ValidationError(invalid)
+        selected.append(_helper_path(root.joinpath(*value.split("/")), directory=directory))
+    toolchain, runtime, executable = selected
+    if (toolchain.parent != root / "private/toolchains"
+            or not re.fullmatch(r"worker-runtime-[0-9a-f]{32}", toolchain.name)
+            or runtime.parent != toolchain / "audited-extractions"
+            or not re.fullmatch(r"cpython-[0-9a-f]{32}", runtime.name)
+            or executable != runtime / "python.exe"):
+        raise ValidationError(invalid)
+    pth = _helper_path(runtime / "python315._pth", limit=64 * 1024)
+    pth_hash = sha256_file(pth)
+    if pth_hash != python.get("python315_pth_sha256_after"):
+        raise ValidationError(invalid)
+    facts = {"schema_version": 1, "scope": "fresh_ci_owned_helper_runtime_only",
+             "root": str(root), "run_id": run_id, "run_attempt": attempt,
+             "receipt_path": str(receipt), "receipt_sha256": receipt_hash,
+             "toolchain_root": str(toolchain), "runtime_root": str(runtime),
+             "python_executable": str(executable), "python_executable_sha256": sha256_file(executable),
+             "python_version": python["version"], "pth_path": str(pth), "pth_sha256": pth_hash}
+    return facts, report
+
+
+def _helper_result_path(args) -> Path:
+    invalid = "Fresh helper runtime receipt or handoff binding is invalid"
+    result = args.helper_runtime_result
+    parent = _helper_path(result.parent, directory=True)
+    root = args.root.resolve(strict=True)
+    if (not result.is_absolute() or result.name != "helper-runtime.json" or is_reparse(result)
+            or parent.is_relative_to(root) or root.is_relative_to(parent)):
+        raise ValidationError(invalid)
+    return parent / result.name
+
+
+def prepare_helper_runtime(args) -> dict:
+    # Bootstrap 可以使用 runner Python；只有既有审计器验证后的 fresh receipt 才能交接。
+    before, report = _helper_runtime_facts(args)
+    result = _helper_result_path(args)
+    if result.exists():
+        raise ValidationError("Fresh helper runtime receipt or handoff binding is invalid")
+    try:
+        _toolchain, runtime, executable, _env, info = freeze_worker.validate_manifest(args.root, report)
+    except Exception as error:
+        raise ValidationError("Fresh helper runtime canonical validation failed") from error
+    after, _ = _helper_runtime_facts(args)
+    if (after != before or str(_toolchain.resolve(strict=True)) != before["toolchain_root"]
+            or str(runtime.resolve(strict=True)) != before["runtime_root"]
+            or str(executable.resolve(strict=True)) != before["python_executable"]
+            or info.get("version") != list(provision_worker_runtime.PYTHON_VERSION_TUPLE)
+            or info.get("isolated") != 1):
+        raise ValidationError("Fresh helper runtime receipt or handoff binding is invalid")
+    _write_json_new(result, before)
+    return before
+
+
+def bind_helper_runtime(args) -> dict:
+    require_owned_ci_runtime()
+    invalid = "Fresh helper runtime receipt or handoff binding is invalid"
+    result = _helper_path(_helper_result_path(args), limit=64 * 1024)
+    if (type(args.helper_runtime_sha256) is not str
+            or not re.fullmatch(r"[0-9a-f]{64}", args.helper_runtime_sha256)
+            or sha256_file(result) != args.helper_runtime_sha256):
+        raise ValidationError(invalid)
+    expected, _ = _helper_runtime_facts(args)
+    actual = read_json(result, max_bytes=64 * 1024)
+    if (actual != expected or type(actual.get("schema_version")) is not int
+            or _helper_path(Path(sys.executable)) != Path(expected["python_executable"])
+            or sha256_file(Path(sys.executable)) != expected["python_executable_sha256"]
+            or (getattr(args, "worker_manifest", None) is not None
+                and _helper_path(args.worker_manifest, limit=16 * 1024 * 1024) != Path(expected["receipt_path"]))):
+        raise ValidationError(invalid)
+    return expected
+
+
+def _save_private_failure(args, error: Exception) -> None:
+    # 只在可信 checkout 的 private 中保留原始异常链；公开输出仍是固定分类。
+    try:
+        root = _helper_path(args.root, directory=True)
+        if root != ROOT.resolve(strict=True) or not (root / ".git").exists():
+            return
+        parent = root
+        for component in ("private", "ci-helper-diagnostics"):
+            parent = parent / component
+            if not parent.exists():
+                parent.mkdir(exist_ok=False)
+            _helper_path(parent, directory=True)
+        with (parent / (uuid.uuid4().hex + ".traceback.txt")).open("x", encoding="utf-8") as stream:
+            traceback.print_exception(type(error), error, error.__traceback__, file=stream)
+    except Exception:
+        # 写诊断失败不能覆盖原始失败，也不能把私有异常输出到公共日志。
+        pass
 
 
 def _source_paths(root: Path) -> list[Path]:
@@ -712,24 +867,111 @@ def create_flutter_environment(base_env: dict, stage: Path) -> dict:
     return environment
 
 
+def _system_cmd_executable() -> Path:
+    invalid = "The native System32 cmd.exe entry could not be verified"
+    try:
+        if os.name != "nt" or sys.maxsize != 2 ** 63 - 1:
+            raise ValidationError(invalid)
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True, winmode=0x00000800)
+        query = kernel.GetSystemDirectoryW
+        query.argtypes, query.restype = (wintypes.LPWSTR, wintypes.UINT), wintypes.UINT
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = query(buffer, len(buffer))
+        if not 0 < length < len(buffer):
+            raise ValidationError(invalid)
+        system = Path(buffer.value)
+        if system.name.casefold() != "system32":
+            raise ValidationError(invalid)
+        return _helper_path(system / "cmd.exe")
+    except Exception as error:
+        raise ValidationError(invalid) from error
+
+
+def _unquoted_ci_path(path: Path) -> str:
+    # 所有 token 都无需 CRT 引号；这不是通用 cmd escaping，也不支持任意用户路径。
+    value = str(path)
+    if (not path.is_absolute() or len(value) > 4096
+            or not re.fullmatch(r"[A-Za-z]:[\\/][A-Za-z0-9_./\\:-]+", value)
+            or ntpath.normpath(value) != value or ":" in value[2:]
+            or any(part in {".", ".."} or part.endswith((".", " ")) for part in path.parts[1:])):
+        raise ValidationError("Flutter CI command is outside the finite unquoted BAT bridge contract")
+    return value
+
+
+def flutter_ci_command(label: str, sdk_root: Path, arguments: list[str]) -> list[str]:
+    invalid = "Flutter CI command is outside the finite unquoted BAT bridge contract"
+    fixed = {"bootstrap": ["--version"], "version": ["--version", "--machine"],
+             "pub": ["pub", "get", "--enforce-lockfile"], "l10n": ["gen-l10n"],
+             "analyze": ["analyze", "--no-pub"]}
+    if type(arguments) is not list or any(type(token) is not str or len(token) > 128 for token in arguments):
+        raise ValidationError(invalid)
+    if label in {"test", "windows", "web"}:
+        if len(arguments) < 2:
+            raise ValidationError(invalid)
+        version = re.fullmatch(r"--dart-define=CHASTEADY_PRODUCT_VERSION=([0-9]+\.[0-9]+\.[0-9]+)", arguments[-2])
+        build = re.fullmatch(r"--dart-define=CHASTEADY_BUILD_NUMBER=([0-9]+)", arguments[-1])
+        if not version or not build:
+            raise ValidationError(invalid)
+        try:
+            product = build_windows.parse_product_version(version[1] + "+" + build[1])
+        except build_windows.ProductVersionError as error:
+            raise ValidationError(invalid) from error
+        expected = dict(build_windows.flutter_commands(product_version=product))[label]
+    else:
+        expected = fixed.get(label)
+    if expected is None or arguments != expected:
+        raise ValidationError(invalid)
+    # 原生 applicationName 是固定 System32 EXE；BAT 仅作为 /c 后的有限参数。
+    bat = sdk_root / "bin/flutter.bat"
+    bat_text = _unquoted_ci_path(bat)
+    if (not bat.is_file() or any(is_reparse(path) for path in (bat, *bat.parents))
+            or bat.resolve(strict=True) != bat):
+        raise ValidationError(invalid)
+    command = _system_cmd_executable()
+    return [_unquoted_ci_path(command), "/d", "/v:off", "/s", "/c", bat_text,
+            "--suppress-analytics", "--no-version-check", *arguments]
+
+
+def _finish_owned_ci_registry(registry: OwnedProcessRegistry) -> None:
+    # snapshot 仅列 leader；native-start 与 pending HANDLE 也必须按完整 registry 合同清账。
+    try:
+        try:
+            registry.terminate_all()
+        finally:
+            registry.assert_quiescent()
+    except BaseException as error:
+        _RETAINED_CI_OWNERS[id(registry)] = registry
+        raise OwnedProcessError("ci_owned_cleanup_unconfirmed") from error
+    _RETAINED_CI_OWNERS.pop(id(registry), None)
+
+
 def run_flutter(label: str, sdk_root: Path, args: list[str], cwd: Path, env: dict,
                 logs_root: Path, timeout: int = 1200) -> bytes:
+    require_owned_ci_runtime()
+    command = flutter_ci_command(label, sdk_root, args)
+    # 仅复制并规范私有 child 环境，BAT 内部也使用同一已验证 cmd，不修改调用者或全局环境。
+    child_env = {name: value for name, value in env.items() if name.casefold() != "comspec"}
+    child_env["COMSPEC"] = command[0]
     stdout_path = logs_root / (label + ".stdout.log")
     stderr_path = logs_root / (label + ".stderr.log")
     if stdout_path.exists() or stderr_path.exists():
         raise ValidationError("Flutter diagnostic target is not new")
     registry = OwnedProcessRegistry(threading.Event())
-    command = [str(sdk_root / "bin" / "flutter.bat"), "--suppress-analytics", "--no-version-check"] + args
     try:
         with registry_scope(registry):
             with stdout_path.open("xb") as stdout, stderr_path.open("xb") as stderr:
-                process = spawn_owned_process(command, cwd=str(cwd), env=env, stdout=stdout, stderr=stderr,
-                                              stdin=subprocess.DEVNULL)
+                process = spawn_owned_process(command, cwd=str(cwd), env=child_env, stdout=stdout, stderr=stderr,
+                                              stdin=subprocess.DEVNULL, shell=False)
                 code = process.wait(timeout=timeout)
                 registry.discard(process)
+    except subprocess.TimeoutExpired as error:
+        raise ValidationError("Flutter {} timed out; raw runner-local logs are not uploaded".format(label)) from error
+    except OSError as error:
+        raise ValidationError("Flutter {} could not start; raw runner-local logs are not uploaded".format(label)) from error
     finally:
-        if registry.snapshot():
-            registry.terminate_all()
+        _finish_owned_ci_registry(registry)
     if code != 0:
         flutter_json_shape_diagnostic(stdout_path.read_bytes(), stderr_path, RuntimeError(), exit_code=code,
                                       path_roots={"sdk": str(sdk_root), "source": str(cwd),
@@ -1324,6 +1566,7 @@ def run_window_fixture_step(label: str, command: list[str], source: Path,
                             environment: dict, stage: Path, timeout: int) -> None:
     if label not in {"configure", "build", "run"}:
         raise ValueError("Unknown internal window fixture stage")
+    require_owned_ci_runtime()
     registry = OwnedProcessRegistry(threading.Event())
     stdout_path = stage / ("window-fixture-" + label + ".stdout.log")
     stderr_path = stage / ("window-fixture-" + label + ".stderr.log")
@@ -1340,8 +1583,7 @@ def run_window_fixture_step(label: str, command: list[str], source: Path,
     except OSError:
         outcome = "spawn_failed"
     finally:
-        if registry.snapshot():
-            registry.terminate_all()
+        _finish_owned_ci_registry(registry)
     if label == "run":
         try:
             window_fixture_diagnostic(code, stdout_path, stderr_path, outcome)
@@ -1500,6 +1742,8 @@ def window_probe_toolchain_diagnostic(report: dict, actual: dict | None = None) 
 
 
 def run_window_fixture_probe(args) -> dict:
+    mark_ci_stage(args, "helper_runtime")
+    require_owned_ci_runtime()
     mark_ci_stage(args, "checkout")
     root = args.root.resolve(strict=True)
     if root != ROOT.resolve(strict=True):
@@ -1834,6 +2078,13 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT)
     preflight_modes = parser.add_mutually_exclusive_group()
+    preflight_modes.add_argument("--prepare-helper-runtime-only", action="store_true",
+                                 help="Bootstrap validation of one fresh Worker receipt; no owned factory execution")
+    preflight_modes.add_argument("--check-owned-runtime-only", action="store_true",
+                                 help="Data-only owned-runtime guard before SDK downloads or native diagnostics")
+    parser.add_argument("--helper-runtime-manifest", type=Path)
+    parser.add_argument("--helper-runtime-result", type=Path)
+    parser.add_argument("--helper-runtime-sha256")
     preflight_modes.add_argument("--preflight-flutter-only", action="store_true",
                                  help="Verify only the pinned Flutter executable identity; never build native/Worker outputs")
     preflight_modes.add_argument("--preflight-ui-only", action="store_true",
@@ -1851,7 +2102,25 @@ def main(argv=None) -> int:
     parser.add_argument("--artifact-dir", type=Path)
     args = parser.parse_args(argv)
     full_fields = ("toolchain_report", "font_result", "font_scratch", "worker_manifest", "math_sidecar", "artifact_dir")
-    if args.window_fixture_only:
+    helper_fields = ("helper_runtime_manifest", "helper_runtime_result", "helper_runtime_sha256")
+    runtime_only = args.prepare_helper_runtime_only or args.check_owned_runtime_only
+    if runtime_only:
+        if any(getattr(args, field) is not None for field in (*full_fields, "flutter_result", "flutter_scratch", "preflight_stage")):
+            parser.error("Runtime-only modes cannot accept build, SDK, UI or native diagnostic inputs")
+        required = helper_fields[:2] if args.prepare_helper_runtime_only else helper_fields
+        if args.prepare_helper_runtime_only or any(getattr(args, field) is not None for field in helper_fields):
+            if any(getattr(args, field) is None for field in required):
+                parser.error("Helper runtime handoff requires its manifest, result and applicable digest")
+        if args.prepare_helper_runtime_only and args.helper_runtime_sha256 is not None:
+            parser.error("Bootstrap preparation cannot accept an existing handoff digest")
+    elif args.window_fixture_only:
+        if any(getattr(args, field) is not None for field in helper_fields):
+            parser.error("Preinstalled-only window diagnostics cannot provision or accept a fresh runtime handoff")
+    elif any(getattr(args, field) is None for field in helper_fields):
+        parser.error("Owned Flutter/full modes require the fresh helper runtime manifest, result and digest")
+    if runtime_only:
+        pass
+    elif args.window_fixture_only:
         missing = ["--" + field.replace("_", "-") for field in ("preflight_stage", "toolchain_report")
                    if getattr(args, field) is None]
         if missing:
@@ -1877,13 +2146,29 @@ def main(argv=None) -> int:
         if any(getattr(args, field) is not None for field in
                ("toolchain_report", "worker_manifest", "math_sidecar", "artifact_dir")):
             parser.error("--preflight-ui-only cannot accept native/Worker inputs or an artifact directory")
-    elif not args.window_fixture_only:
+    elif not args.window_fixture_only and not runtime_only:
         if args.preflight_stage is not None:
             parser.error("--preflight-stage requires a preflight-only mode")
         missing = ["--" + field.replace("_", "-") for field in full_fields if getattr(args, field) is None]
         if missing:
             parser.error("Full build requires " + ", ".join(missing))
     try:
+        mark_ci_stage(args, "helper_runtime")
+        if args.prepare_helper_runtime_only:
+            prepare_helper_runtime(args)
+            print("Fresh CI helper runtime handoff prepared; owned runtime compatibility must still be checked.", flush=True)
+            return 0
+        if args.helper_runtime_manifest is not None:
+            bind_helper_runtime(args)
+        else:
+            require_owned_ci_runtime()
+        if args.check_owned_runtime_only:
+            if args.helper_runtime_manifest is not None:
+                # Flutter 模式在大 SDK 下载前核对原生入口及 CI 路径前缀；不执行 cmd。
+                _unquoted_ci_path(_system_cmd_executable())
+                _unquoted_ci_path(args.helper_runtime_result.parent / "flutter.bat")
+            print("Owned CI runtime contract matched; no native diagnostic, build or download was executed.", flush=True)
+            return 0
         if args.window_fixture_only:
             run_window_fixture_probe(args)
         elif args.preflight_flutter_only or args.preflight_ui_only:
@@ -1891,8 +2176,8 @@ def main(argv=None) -> int:
         else:
             run_build(args)
     except Exception as error:
-        # Print only fixed stages/codes and exact allowlisted author messages.
-        # Unknown exception strings and all raw child/process logs stay private.
+        # 原始异常链仅保存在 private；公开日志只显示固定阶段与分类。
+        _save_private_failure(args, error)
         print(ci_failure_diagnostic(error, getattr(args, "_ci_stage", None)), file=sys.stderr, flush=True)
         return 1
     return 0

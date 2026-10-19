@@ -65,6 +65,7 @@ worker/cha_stabilizer 下 Python 源及冻结／回归／入口工具属于数�
 - 原生 stdio protocol 1、ready 精确字段、请求白名单与 capability 隔离必须保持契约，不随意加字段。
 - 产品版本以 ui/pubspec.yaml 为唯一来源；Windows PE、About、清单和包名应一致。Worker 组件版、协议版和 Python 运行时版另行标注。
 - 运行／测试命令以实际工具链和脚本参数为准；不假装本机已有 Flutter／MSVC，不用编译替代 GUI 验收。
+- Windows CI 的 PATH Python 仅用于 bootstrap；Full／UI 的 owned 子进程阶段必须交接该次已审 fresh CPython 3.15.0，并绑定 receipt、EXE 与路径配置。窗口专项诊断保留零下载，当前预装解释器不匹配则明确阻塞，不自动放宽 Worker 私有签名或改用无 Job 启动。Flutter BAT 仅通过固定系统入口、有限无歧义参数及私有 child 环境启动；调用失败也须按完整 registry 清账并保留未确认 owner。
 
 ## Git 提交规范
 

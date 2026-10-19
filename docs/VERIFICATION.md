@@ -161,6 +161,7 @@ job ID：`4f8c1ffb-a98e-49f6-b16a-f13f2c1dbd7a`。
 - 实际 trace 为 child HTTRANSPARENT → owner HTMAXBUTTON → WM_NCLBUTTONDOWN → 默认非客户区处理，但没有产生最大化系统命令，第一手势未最大化，测试为 FAIL。约 1.84 秒后原进程自然退出且 owned Job 为零，没有强制清理。
 - 这条真实失败只约束该独立夹具；其激活上下文不同于 MSVC 生产程序，不认证 Flutter、Snap、resize 或多显示器，也不证明根因已经全部排除。后续修复必须保持单一路由并在同一实际 release 再验。
 - 随后分离 UP 时机的私有诊断进入未确认输入释放的被动保留状态，并在用户中断后结束；没有完整 NC／SC 结果、原始进程正常退出或实际 Job 归零证明，结果为 INCOMPLETE_INTERRUPTED_NOT_PASS。后续原身份句柄不可得，不按旧 PID 重新接管或强清，也不重复运行该版本碰通过。
+- 新的持久日志夹具完整返回功能 FAIL，并确认输入释放、原始进程自然结束与实际 Job 为零。日志发现旧 64 位标记的高位未在观察消息中保留，导致认领失败，实际走保护性 250ms 分支；该次不能用于否定预期 50ms 时序。只调整为完整可保留的非零标记并通过 63 项纯验证后，另一新版本实测成功认领，DOWN→UP 为 63ms、scheduler succeeded／can_finish 为 true；仍未产生最大化 SC，因而本次排除了“仅调整该夹具的 UP 时机便能修复”的假设，而非认证真实 Flutter 路由或宣称最大化修复。两次新试验均无强制终止；stock 几何查询缺少成功 BOOL，仍不作为唯一根因。
 
 ### 后台独立复核与来源绑定状态
 
@@ -196,5 +197,13 @@ job ID：`4f8c1ffb-a98e-49f6-b16a-f13f2c1dbd7a`。
 - 含首次启动器失败和零子进程预检，累计执行约 26.07 秒，小于原 180 秒预算；两次监督均确认原进程 HANDLE 结束、实际 Job 为零、管道结束和句柄关闭，无 timeout／forced cleanup。完整 34 源文件与 19 测试文件前后不变，历史失败证据不回填。
 - 从该次真实证据生成全新的 [数学来源摘要](worker_math_golden_summary_20261019_16fb594d2e694096b442832ebf6c66cb.json)，摘要 SHA256 为 87544426b92b5459c6e2aa26c847a3dbff5012e3f1e0e8de645a15850b573344，既有 CI validator 通过。公开 34 源清单遵照既有末尾 LF 协议，摘要为 cb23c2b70e8080504a9072152a79092e750477d943bf4d735955d6018d1acc0c；私有无末尾 LF 的摘要另行计算，不混用。布局转换另有 16 项纯测试通过，转换过程未重跑 suite／golden。
 - 当前后台来源绑定已收口，但真实 GF 可用性仍 unverified、自动 CTB 为 0，最大化和同包真实 GUI 尚未完成。新摘要不升级这些层级的结论，也不代表新发行包已生成。
+
+### 已发布源码与首次新云构建
+
+- 已按获批范围仅对 main 执行固定旧提交保护的 force-with-lease：22 条规范重写历史加 4 条实现提交，共 26 条，GitHub 回读为 0f1f86cd0328ba0f350e533093575775cf9a3723。原历史 bundle 摘要在推送前重新核对，原工作区未改，未创建 Release、标签或 Marketplace 发布。
+- 唯一新完整构建 39216128663／attempt 1 的首次执行真实失败于 Flutter bootstrap 前置契约，官方 artifact 数为 0；UI、VS/SDK 更新及生产编译尚未执行。不是新包已交付，也不能以旧 0.1 包代替。
+- 相关修复保留 Worker 3.15／创建时 Job 守卫，改为 Full／UI 交接 fresh 受管解释器，并固定有限 BAT 桥及私有 COMSPEC；窗口专项诊断保留预装、零下载，契约不满足明确阻塞。独立复核发现并修复空 leader snapshot 漏掉创建期 owner 的清理问题，完整 quiescence 与未确认引用保留均已接线，独立精确复核收口。
+- 初版相关测试分为 156 项纯 Python／static 及 3 项固定 PowerShell 的隔离数据解析，均实际通过；此前长 TEMP 和禁止子进程导致的 159 项失败批保留。随后 COMSPEC 及 owner 清理各自保留红绿并通过对应 88／92 项 CI helper 回归，不把分批结果说成一次全套运行。
+- Main 另实测自写 ASCII BAT 的 bootstrap/version 两例，固定系统 Cmd、参数及 child COMSPEC 均正确，传入环境不变；原进程对象 signaled、实际 Job 归零、终止计数为 0，约 0.228 秒。测试只执行自有回显脚本，不是 Flutter SDK、真实产品或云构建验收；空 Job 仍遵循既有 TerminateJobObject 策略，未伪称从未调用该 API。私有入口的一字摘要转录错误在零子进程预检被拦截，按既有最终 manifest 核实后纠正，原失败与源码保留。
 
 本轮后续新报告继续区分源码／unit、真实 GUI、真实引擎、媒体完整性、内容对应和感知范围；没有实际执行的层级不写“通过”。

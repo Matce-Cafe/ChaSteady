@@ -5,10 +5,12 @@ from contextlib import redirect_stderr, redirect_stdout
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import re
 import sys
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -18,6 +20,7 @@ import build_windows
 import ci_build_windows as ci
 import ci_prepare_assets
 import provision_worker_runtime
+from cha_stabilizer import owned_processes as owned
 
 
 class CiBuildWindowsTests(unittest.TestCase):
@@ -32,12 +35,502 @@ class CiBuildWindowsTests(unittest.TestCase):
         (source / "pubspec.yaml").write_text("name: fixture\nversion: " + version + "\n", encoding="utf-8")
         return source
 
+    def runtime_fixture(self, name="runtime"):
+        checkout = self.root / name / "checkout"
+        (checkout / "docs").mkdir(parents=True)
+        (checkout / ".git").mkdir()
+        toolchain = checkout / "private/toolchains" / ("worker-runtime-" + "a" * 32)
+        runtime = toolchain / "audited-extractions" / ("cpython-" + "b" * 32)
+        runtime.mkdir(parents=True)
+        executable = runtime / "python.exe"
+        executable.write_bytes(b"inert interpreter fixture; never executed")
+        pth = runtime / "python315._pth"
+        pth.write_bytes(b"python315.zip\n.\nLib/site-packages\nimport site\n")
+        report = {"status": "provisioned", "toolchain_root": toolchain.relative_to(checkout).as_posix(),
+                  "python": {"version": provision_worker_runtime.PYTHON_VERSION,
+                             "published_sha256": provision_worker_runtime.PYTHON_SHA256,
+                             "runtime_root": runtime.relative_to(checkout).as_posix(),
+                             "interpreter": executable.relative_to(checkout).as_posix(),
+                             "python315_pth_sha256_after": ci.sha256_file(pth)}}
+        receipt = checkout / "docs" / (".ci-worker-runtime-123-1-" + "c" * 32 + ".json")
+        receipt.write_text(json.dumps(report), encoding="utf-8")
+        runner = checkout.parent / "runner"
+        runner.mkdir()
+        args = SimpleNamespace(root=checkout, helper_runtime_manifest=receipt,
+                               helper_runtime_result=runner / "helper-runtime.json", helper_runtime_sha256=None,
+                               worker_manifest=None)
+        validated = (toolchain, runtime, executable, {}, {"version": [3, 15, 0], "isolated": 1})
+        return args, validated
+
+    def test_owned_runtime_rejects_312_before_both_factories_and_native_metadata(self):
+        output = io.StringIO()
+        with mock.patch.object(ci.sys, "version_info", (3, 12, 10)), \
+                mock.patch.object(ci, "spawn_owned_process") as spawn, \
+                mock.patch.object(ci.subprocess, "run") as native, \
+                mock.patch.object(ci, "_system_cmd_executable") as cmd:
+            for operation in (lambda: ci.require_owned_ci_runtime(),
+                              lambda: ci.run_flutter("bootstrap", self.root, ["--version"], self.root, {}, self.root),
+                              lambda: ci.run_window_fixture_step("run", ["never-run"], self.root, {}, self.root, 1),
+                              lambda: ci.run_window_fixture_probe(SimpleNamespace(root=self.root))):
+                with redirect_stdout(output), self.assertRaises(ci.ValidationError) as failure:
+                    operation()
+                self.assertIn("CI_HELPER_RUNTIME_CONTRACT", ci.ci_failure_diagnostic(failure.exception, "helper_runtime"))
+            with redirect_stdout(output), redirect_stderr(output):
+                code = ci.main(["--root", str(self.root), "--check-owned-runtime-only"])
+            self.assertEqual(code, 1)
+            spawn.assert_not_called()
+            native.assert_not_called()
+            cmd.assert_not_called()
+        self.assertIn("BLOCKED", output.getvalue())
+        self.assertNotIn("contract matched", output.getvalue())
+
+    def test_owned_runtime_signature_x64_and_isolation_fail_closed_without_popen_fallback(self):
+        with mock.patch.object(ci.sys, "version_info", (3, 15, 0)), \
+                mock.patch.object(ci, "_windows_popen_signature_supported", return_value=True), \
+                mock.patch.object(ci, "spawn_owned_process") as owned, \
+                mock.patch.object(ci.subprocess, "Popen") as plain:
+            ci.require_owned_ci_runtime()
+            for target, key, value in ((ci, "_windows_popen_signature_supported", lambda: False),
+                                       (ci.sys, "maxsize", 2 ** 31 - 1),
+                                       (ci.sys, "flags", SimpleNamespace(isolated=0)),
+                                       (ci.sys, "platform", "linux")):
+                with self.subTest(key=key), mock.patch.object(target, key, value), self.assertRaises(ci.ValidationError):
+                    ci.require_owned_ci_runtime()
+            owned.assert_not_called()
+            plain.assert_not_called()
+
+    def test_fresh_helper_receipt_canonical_validation_and_current_exe_pth_binding(self):
+        args, validated = self.runtime_fixture()
+        before = dict(os.environ)
+        with mock.patch.object(ci, "ROOT", args.root), \
+                mock.patch.dict(os.environ, {"GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}), \
+                mock.patch.object(ci.freeze_worker, "validate_manifest", return_value=validated) as canonical, \
+                mock.patch.object(ci.sys, "version_info", (3, 15, 0)), \
+                mock.patch.object(ci, "_windows_popen_signature_supported", return_value=True), \
+                mock.patch.object(ci.sys, "executable", str(validated[2])), \
+                mock.patch.object(ci, "spawn_owned_process") as owned:
+            facts = ci.prepare_helper_runtime(args)
+            canonical.assert_called_once_with(args.root, ci.read_json(args.helper_runtime_manifest))
+            args.helper_runtime_sha256 = ci.sha256_file(args.helper_runtime_result)
+            args.worker_manifest = args.helper_runtime_manifest
+            self.assertEqual(ci.bind_helper_runtime(args), facts)
+            self.assertEqual(facts["python_executable_sha256"], ci.sha256_file(validated[2]))
+            self.assertEqual(facts["pth_sha256"], ci.sha256_file(validated[1] / "python315._pth"))
+            owned.assert_not_called()
+        self.assertEqual(dict(os.environ), before)
+
+    def test_helper_binding_rejects_changed_receipt_exe_pth_handoff_and_run_identity(self):
+        for target in ("receipt", "exe", "pth", "handoff", "run"):
+            args, validated = self.runtime_fixture(target)
+            with self.subTest(target=target), mock.patch.object(ci, "ROOT", args.root), \
+                    mock.patch.dict(os.environ, {"GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}), \
+                    mock.patch.object(ci.freeze_worker, "validate_manifest", return_value=validated), \
+                    mock.patch.object(ci.sys, "version_info", (3, 15, 0)), \
+                    mock.patch.object(ci, "_windows_popen_signature_supported", return_value=True), \
+                    mock.patch.object(ci.sys, "executable", str(validated[2])):
+                ci.prepare_helper_runtime(args)
+                args.helper_runtime_sha256 = ci.sha256_file(args.helper_runtime_result)
+                if target == "run":
+                    os.environ["GITHUB_RUN_ATTEMPT"] = "2"
+                else:
+                    path = {"receipt": args.helper_runtime_manifest, "exe": validated[2],
+                            "pth": validated[1] / "python315._pth", "handoff": args.helper_runtime_result}[target]
+                    with path.open("ab") as stream:
+                        stream.write(b" ")
+                with self.assertRaises(ci.ValidationError) as failure:
+                    ci.bind_helper_runtime(args)
+                self.assertIn("CI_HELPER_RUNTIME_BINDING", ci.ci_failure_diagnostic(failure.exception, "helper_runtime"))
+
+    def test_helper_binding_rejects_schema_scope_unknown_fields_wrong_current_exe_and_worker_receipt(self):
+        args, validated = self.runtime_fixture()
+        with mock.patch.object(ci, "ROOT", args.root), \
+                mock.patch.dict(os.environ, {"GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}), \
+                mock.patch.object(ci.freeze_worker, "validate_manifest", return_value=validated), \
+                mock.patch.object(ci.sys, "version_info", (3, 15, 0)), \
+                mock.patch.object(ci, "_windows_popen_signature_supported", return_value=True), \
+                mock.patch.object(ci.sys, "executable", str(validated[2])):
+            facts = ci.prepare_helper_runtime(args)
+            for changes in ({"schema_version": True}, {"scope": "old_receipt"}, {"unknown": True},
+                            {"python_version": "3.12.10"}, {"python_executable_sha256": "0" * 64}):
+                with self.subTest(changes=changes):
+                    args.helper_runtime_result.write_text(json.dumps({**facts, **changes}), encoding="utf-8")
+                    args.helper_runtime_sha256 = ci.sha256_file(args.helper_runtime_result)
+                    with self.assertRaises(ci.ValidationError):
+                        ci.bind_helper_runtime(args)
+            args.helper_runtime_result.write_text(json.dumps(facts), encoding="utf-8")
+            args.helper_runtime_sha256 = ci.sha256_file(args.helper_runtime_result)
+            other = validated[1] / "other.exe"
+            other.write_bytes(validated[2].read_bytes())
+            with mock.patch.object(ci.sys, "executable", str(other)), self.assertRaises(ci.ValidationError):
+                ci.bind_helper_runtime(args)
+            other_receipt = args.root / "docs/other.json"
+            other_receipt.write_bytes(args.helper_runtime_manifest.read_bytes())
+            args.worker_manifest = other_receipt
+            with self.assertRaises(ci.ValidationError):
+                ci.bind_helper_runtime(args)
+
+    def test_helper_prepare_rejects_stale_receipts_runtime_path_escape_and_wrong_pins(self):
+        changes = ({"previous_attempt": {}}, {"status": "failed"},
+                   {"python": {"version": "3.12.10"}}, {"python": {"published_sha256": "0" * 64}},
+                   {"python": {"interpreter": "../outside/python.exe"}},
+                   {"python": {"interpreter": "C:/old/python.exe"}},
+                   {"python": {"python315_pth_sha256_after": "0" * 64}})
+        for index, change in enumerate(changes):
+            args, validated = self.runtime_fixture("invalid-" + str(index))
+            report = ci.read_json(args.helper_runtime_manifest)
+            if "python" in change:
+                report["python"].update(change["python"])
+            else:
+                report.update(change)
+            args.helper_runtime_manifest.write_text(json.dumps(report), encoding="utf-8")
+            with self.subTest(change=change), mock.patch.object(ci, "ROOT", args.root), \
+                    mock.patch.dict(os.environ, {"GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}), \
+                    mock.patch.object(ci.freeze_worker, "validate_manifest") as canonical, \
+                    self.assertRaises(ci.ValidationError):
+                ci.prepare_helper_runtime(args)
+            canonical.assert_not_called()
+            self.assertFalse(args.helper_runtime_result.exists())
+
+    def test_helper_prepare_never_overwrites_or_accepts_changed_inputs_during_canonical_validation(self):
+        args, validated = self.runtime_fixture()
+        with mock.patch.object(ci, "ROOT", args.root), \
+                mock.patch.dict(os.environ, {"GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}), \
+                mock.patch.object(ci.freeze_worker, "validate_manifest", return_value=validated) as canonical:
+            args.helper_runtime_result.write_bytes(b"existing handoff must stay")
+            with self.assertRaises(ci.ValidationError):
+                ci.prepare_helper_runtime(args)
+            canonical.assert_not_called()
+            self.assertEqual(args.helper_runtime_result.read_bytes(), b"existing handoff must stay")
+            args.helper_runtime_result = args.root / "docs/helper-runtime.json"
+            with self.assertRaises(ci.ValidationError):
+                ci.prepare_helper_runtime(args)
+            canonical.assert_not_called()
+            args.helper_runtime_result = args.root.parent / "runner/helper-runtime.json"
+            # 保留原文件；另建新父目录，验证过程中变动必须拒绝交接。
+            fresh = args.root.parent / "fresh-runner"
+            fresh.mkdir()
+            args.helper_runtime_result = fresh / "helper-runtime.json"
+            def changed(*_args):
+                (validated[1] / "python315._pth").write_bytes(b"changed")
+                return validated
+            canonical.side_effect = changed
+            with self.assertRaises(ci.ValidationError):
+                ci.prepare_helper_runtime(args)
+            self.assertFalse(args.helper_runtime_result.exists())
+
+    def test_helper_canonical_failure_is_fixed_and_raw_cause_remains_private(self):
+        args, _validated = self.runtime_fixture()
+        error = RuntimeError("private-vendor-diagnostic bearer=not-for-public")
+        with mock.patch.object(ci, "ROOT", args.root), \
+                mock.patch.dict(os.environ, {"GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}), \
+                mock.patch.object(ci.freeze_worker, "validate_manifest", side_effect=error), \
+                self.assertRaises(ci.ValidationError) as failure:
+            ci.prepare_helper_runtime(args)
+        self.assertIs(failure.exception.__cause__, error)
+        diagnostic = ci.ci_failure_diagnostic(failure.exception, "helper_runtime")
+        self.assertIn("CI_HELPER_RUNTIME_VALIDATION", diagnostic)
+        self.assertNotIn("not-for-public", diagnostic)
+        with mock.patch.object(ci, "ROOT", args.root):
+            ci._save_private_failure(args, failure.exception)
+        logs = list((args.root / "private/ci-helper-diagnostics").glob("*.traceback.txt"))
+        self.assertEqual(len(logs), 1)
+        self.assertIn("not-for-public", logs[0].read_text(encoding="utf-8"))
+        self.assertFalse(args.helper_runtime_result.exists())
+
+    def test_runtime_cli_is_narrow_and_handoff_binding_precedes_all_flutter_routing(self):
+        prepare = ["--root", str(self.root), "--prepare-helper-runtime-only",
+                   "--helper-runtime-manifest", str(self.root / "receipt"),
+                   "--helper-runtime-result", str(self.root / "helper-runtime.json")]
+        with mock.patch.object(ci, "prepare_helper_runtime") as prepared, \
+                mock.patch.object(ci, "spawn_owned_process") as owned, redirect_stdout(io.StringIO()):
+            self.assertEqual(ci.main(prepare), 0)
+        prepared.assert_called_once()
+        owned.assert_not_called()
+        native_entry = self.root / "System32/cmd.exe"
+        with mock.patch.object(ci, "bind_helper_runtime") as bound, \
+                mock.patch.object(ci, "_system_cmd_executable", return_value=native_entry) as cmd, \
+                mock.patch.object(ci, "spawn_owned_process") as owned, redirect_stdout(io.StringIO()):
+            self.assertEqual(ci.main(["--check-owned-runtime-only"] + self.helper_cli()), 0)
+        bound.assert_called_once()
+        cmd.assert_called_once()
+        owned.assert_not_called()
+        for mode in ("--prepare-helper-runtime-only", "--check-owned-runtime-only"):
+            for flag in ("--toolchain-report", "--flutter-result", "--preflight-stage", "--worker-manifest", "--artifact-dir"):
+                with self.subTest(mode=mode, flag=flag), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    ci.main([mode, flag, str(self.root / "forbidden")])
+        argv = ["--root", str(self.root), "--preflight-flutter-only", "--flutter-result", "unused",
+                "--flutter-scratch", "unused", "--preflight-stage", "unused"]
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            ci.main(argv)
+        failure = ci.ValidationError("Fresh helper runtime receipt or handoff binding is invalid")
+        output = io.StringIO()
+        with mock.patch.object(ci, "bind_helper_runtime", side_effect=failure), \
+                mock.patch.object(ci, "run_flutter_preflight") as flutter, \
+                redirect_stdout(output), redirect_stderr(output):
+            self.assertEqual(ci.main(argv + self.helper_cli()), 1)
+        flutter.assert_not_called()
+        self.assertIn("CI_HELPER_RUNTIME_BINDING", output.getvalue())
+
+    def cmd_fixture(self):
+        sdk = self.root / "sdk/flutter"
+        (sdk / "bin").mkdir(parents=True)
+        (sdk / "bin/flutter.bat").write_bytes(b"inert BAT bytes; never executed")
+        command = self.root / "System32/cmd.exe"
+        command.parent.mkdir()
+        command.write_bytes(b"inert native bytes; never executed")
+        return sdk, command
+
+    def test_ci_bat_bridge_has_exact_native_cmd_entry_and_finite_product_bound_arguments(self):
+        sdk, cmd = self.cmd_fixture()
+        product = build_windows.parse_product_version("0.2.0+2")
+        commands = [("bootstrap", ["--version"]), ("version", ["--version", "--machine"])]
+        commands += build_windows.flutter_commands(product_version=product)
+        with mock.patch.object(ci, "_system_cmd_executable", return_value=cmd), \
+                mock.patch.object(ci, "spawn_owned_process") as spawn:
+            for label, arguments in commands:
+                with self.subTest(label=label):
+                    self.assertEqual(ci.flutter_ci_command(label, sdk, arguments),
+                                     [str(cmd), "/d", "/v:off", "/s", "/c", str(sdk / "bin/flutter.bat"),
+                                      "--suppress-analytics", "--no-version-check", *arguments])
+            spawn.assert_not_called()
+
+    def test_ci_bat_bridge_rejects_metacharacters_quotes_spaces_nonascii_and_unknown_grammar(self):
+        sdk, cmd = self.cmd_fixture()
+        with mock.patch.object(ci, "_system_cmd_executable", return_value=cmd):
+            for bad in ("%PATH%", "!name!", "x&whoami", "x|whoami", "x>out", "x<in", "x^x", "(x)",
+                        '"quoted"', "with space", "with\ttab", "x\r\ny", "x\x00y", "汉字"):
+                with self.subTest(path=repr(bad)), self.assertRaises(ci.ValidationError):
+                    ci.flutter_ci_command("bootstrap", self.root / bad / "flutter", ["--version"])
+                with self.subTest(argument=repr(bad)), self.assertRaises(ci.ValidationError):
+                    ci.flutter_ci_command("bootstrap", sdk, [bad])
+            for label, arguments in (("unknown", ["--version"]), ("bootstrap", ["call", "--version"]),
+                                     ("version", ["--version"]), ("test", ["test", "--no-pub"]),
+                                     ("bootstrap", ["--version", "extra"]), ("bootstrap", ("--version",)),
+                                     ("bootstrap", [None]), ("bootstrap", ["x" * 129])):
+                with self.subTest(label=label, arguments=arguments), self.assertRaises(ci.ValidationError):
+                    ci.flutter_ci_command(label, sdk, arguments)
+            wrong = dict(build_windows.flutter_commands(product_version=build_windows.parse_product_version("0.2.0+2")))["windows"]
+            wrong[3] = "--build-name=0.3.0"
+            with self.assertRaises(ci.ValidationError):
+                ci.flutter_ci_command("windows", sdk, wrong)
+            with self.assertRaises(ci.ValidationError):
+                ci.flutter_ci_command("bootstrap", Path("relative/flutter"), ["--version"])
+            with mock.patch.object(ci, "is_reparse", side_effect=lambda path: path == sdk.parent), self.assertRaises(ci.ValidationError):
+                ci.flutter_ci_command("bootstrap", sdk, ["--version"])
+
+    def test_ci_cmd_system_resolver_is_not_path_or_comspec_and_fails_closed_on_wrong_architecture(self):
+        with mock.patch.object(ci.sys, "maxsize", 2 ** 31 - 1), self.assertRaises(ci.ValidationError) as failure:
+            ci._system_cmd_executable()
+        self.assertIn("CI_FLUTTER_CMD_SYSTEM", ci.ci_failure_diagnostic(failure.exception, "flutter_version"))
+        module = ast.parse(Path(ci.__file__).read_text(encoding="utf-8"))
+        node = next(item for item in module.body if isinstance(item, ast.FunctionDef) and item.name == "_system_cmd_executable")
+        text = ast.get_source_segment(Path(ci.__file__).read_text(encoding="utf-8"), node)
+        self.assertIn("GetSystemDirectoryW", text)
+        self.assertIn("winmode=0x00000800", text)
+        for forbidden in ("COMSPEC", "shutil.which", "subprocess."):
+            self.assertNotIn(forbidden, text)
+
+    def invoke_owned_ci_caller(self, caller, registry, spawn, logs):
+        with mock.patch.object(ci, "require_owned_ci_runtime"), \
+                mock.patch.object(ci, "flutter_ci_command", return_value=[str(self.root / "System32/cmd.exe")]), \
+                mock.patch.object(ci, "OwnedProcessRegistry", return_value=registry), \
+                mock.patch.object(ci, "spawn_owned_process", side_effect=spawn), redirect_stdout(io.StringIO()):
+            if caller == "flutter":
+                return ci.run_flutter("bootstrap", self.root, ["--version"], self.root, {}, logs, 1)
+            return ci.run_window_fixture_step("build", ["fixture-never-executed"], self.root, {}, logs, 1)
+
+    def test_ci_owned_finally_retries_native_and_pending_owners_with_empty_snapshot(self):
+        for caller in ("flutter", "window"):
+            with self.subTest(caller=caller):
+                logs = self.root / caller
+                logs.mkdir()
+                registry = owned.OwnedProcessRegistry(threading.Event())
+                native, kernel = mock.Mock(), mock.Mock()
+                kernel.CloseHandle.return_value = True
+                def failed_start(*_args, **_kwargs):
+                    registry._native_starts.add(native)
+                    registry._pending_handles.add(12345)
+                    registry._cleanup_error = "native_start_cleanup_unconfirmed"
+                    self.assertEqual(registry.snapshot(), [])
+                    raise ci.OwnedProcessError("native_start_cleanup_unconfirmed")
+                with mock.patch.object(owned, "_windows_api", return_value=(kernel, None, None)), \
+                        self.assertRaises(ci.OwnedProcessError):
+                    self.invoke_owned_ci_caller(caller, registry, failed_start, logs)
+                native.cleanup.assert_called_once()
+                kernel.CloseHandle.assert_called_once_with(12345)
+                registry.assert_quiescent()
+                self.assertNotIn(id(registry), getattr(ci, "_RETAINED_CI_OWNERS", {}))
+
+    def test_ci_owned_finally_retains_unconfirmed_registry_until_explicit_retry_is_quiescent(self):
+        for caller in ("flutter", "window"):
+            with self.subTest(caller=caller):
+                logs = self.root / caller
+                logs.mkdir()
+                registry = owned.OwnedProcessRegistry(threading.Event())
+                native, kernel = mock.Mock(), mock.Mock()
+                native.cleanup.side_effect = ci.OwnedProcessError("native_start_cleanup_unconfirmed")
+                kernel.CloseHandle.return_value = False
+                def failed_start(*_args, **_kwargs):
+                    registry._native_starts.add(native)
+                    registry._pending_handles.add(12345)
+                    registry._cleanup_error = "native_start_cleanup_unconfirmed"
+                    raise ci.OwnedProcessError("native_start_cleanup_unconfirmed")
+                with mock.patch.object(owned, "_windows_api", return_value=(kernel, None, None)):
+                    try:
+                        with self.assertRaises(ci.OwnedProcessError) as failure:
+                            self.invoke_owned_ci_caller(caller, registry, failed_start, logs)
+                        self.assertIs(getattr(ci, "_RETAINED_CI_OWNERS", {}).get(id(registry)), registry)
+                        self.assertEqual(failure.exception.details["reason"], "ci_owned_cleanup_unconfirmed")
+                        self.assertIsNotNone(failure.exception.__cause__)
+                        self.assertIn("CI_OWNED_PROCESS_CONTRACT", ci.ci_failure_diagnostic(failure.exception, "flutter_version"))
+                        self.assertEqual(registry.snapshot(), [])
+                        self.assertEqual(registry._pending_handles, {12345})
+                        self.assertIn(native, registry._native_starts)
+                    finally:
+                        # 仅重试本例的惰性 native/handle fixture；确认完整清账后才能释放保留引用。
+                        native.cleanup.side_effect = None
+                        kernel.CloseHandle.return_value = True
+                        if id(registry) in getattr(ci, "_RETAINED_CI_OWNERS", {}):
+                            ci._finish_owned_ci_registry(registry)
+                    registry.assert_quiescent()
+                    self.assertNotIn(id(registry), ci._RETAINED_CI_OWNERS)
+
+    def test_ci_owned_finally_requires_quiescence_on_success_and_preserves_nonzero_exit(self):
+        for caller in ("flutter", "window"):
+            for code in (0, 7):
+                with self.subTest(caller=caller, code=code):
+                    logs = self.root / (caller + str(code))
+                    logs.mkdir()
+                    process, registry = mock.Mock(), mock.Mock(spec=owned.OwnedProcessRegistry)
+                    process.wait.return_value = code
+                    registry.snapshot.return_value = []
+                    if code:
+                        with self.assertRaises(ci.ValidationError) as failure:
+                            self.invoke_owned_ci_caller(caller, registry, lambda *_args, **_kwargs: process, logs)
+                        expected = "CI_FLUTTER_BOOTSTRAP_EXIT" if caller == "flutter" else "CI_WINDOW_FIXTURE_BUILD_EXIT"
+                        self.assertIn(expected, ci.ci_failure_diagnostic(failure.exception, "flutter_version"))
+                    else:
+                        self.invoke_owned_ci_caller(caller, registry, lambda *_args, **_kwargs: process, logs)
+                    registry.discard.assert_called_once_with(process)
+                    registry.terminate_all.assert_called_once_with()
+                    registry.assert_quiescent.assert_called_once_with()
+
+    def test_ci_owned_finally_cannot_pass_when_quiescence_fails_after_zero_exit(self):
+        for caller in ("flutter", "window"):
+            with self.subTest(caller=caller):
+                logs = self.root / caller
+                logs.mkdir()
+                process, registry = mock.Mock(), mock.Mock(spec=owned.OwnedProcessRegistry)
+                process.wait.return_value = 0
+                registry.snapshot.return_value = []
+                registry.assert_quiescent.side_effect = ci.OwnedProcessError("owned_processes_not_quiescent")
+                try:
+                    with self.assertRaises(ci.OwnedProcessError) as failure:
+                        self.invoke_owned_ci_caller(caller, registry, lambda *_args, **_kwargs: process, logs)
+                    self.assertEqual(failure.exception.details["reason"], "ci_owned_cleanup_unconfirmed")
+                    self.assertIs(getattr(ci, "_RETAINED_CI_OWNERS", {}).get(id(registry)), registry)
+                    registry.terminate_all.assert_called_once_with()
+                    registry.assert_quiescent.assert_called_once_with()
+                finally:
+                    registry.assert_quiescent.side_effect = None
+                    if id(registry) in getattr(ci, "_RETAINED_CI_OWNERS", {}):
+                        ci._finish_owned_ci_registry(registry)
+                self.assertNotIn(id(registry), getattr(ci, "_RETAINED_CI_OWNERS", {}))
+
+    def test_ci_flutter_child_comspec_is_canonical_and_parent_environment_unchanged(self):
+        sdk, cmd = self.cmd_fixture()
+        global_before = dict(os.environ)
+        inherited_cases = ({"COMSPEC": "C:/malicious-upper.cmd", "ComSpec": "C:/malicious-mixed.cmd",
+                            "cOmSpEc": "C:/malicious-other.cmd", "KEEP": "retained"},
+                           {"ComSpec": "C:/malicious.cmd", "PATH": "unchanged-parent-path"}, {})
+        for index, inherited in enumerate(inherited_cases):
+            logs = self.root / ("comspec-" + str(index))
+            logs.mkdir()
+            parent_before = dict(inherited)
+            process, registry = mock.Mock(), mock.Mock(spec=owned.OwnedProcessRegistry)
+            process.wait.return_value = 0
+            registry.snapshot.return_value = []
+            with self.subTest(index=index), mock.patch.object(ci, "require_owned_ci_runtime"), \
+                    mock.patch.object(ci, "_system_cmd_executable", return_value=cmd), \
+                    mock.patch.object(ci, "OwnedProcessRegistry", return_value=registry), \
+                    mock.patch.object(ci, "spawn_owned_process", return_value=process) as spawn:
+                ci.run_flutter("bootstrap", sdk, ["--version"], self.root, inherited, logs, 1)
+            child = spawn.call_args.kwargs["env"]
+            self.assertIsNot(child, inherited)
+            self.assertEqual([key for key in child if key.casefold() == "comspec"], ["COMSPEC"])
+            self.assertEqual(child["COMSPEC"], str(cmd))
+            self.assertEqual(child, {**{key: value for key, value in parent_before.items()
+                                       if key.casefold() != "comspec"}, "COMSPEC": str(cmd)})
+            self.assertEqual(spawn.call_args.args[0][0], str(cmd))
+            self.assertIs(spawn.call_args.kwargs.get("shell"), False)
+            self.assertEqual(inherited, parent_before)
+            self.assertEqual(dict(os.environ), global_before)
+
+    def test_ci_flutter_bridge_keeps_owned_factory_and_fixed_start_timeout_exit_codes(self):
+        sdk, cmd = self.cmd_fixture()
+        for outcome in ("ok", "start", "timeout", "exit"):
+            logs = self.root / outcome
+            logs.mkdir()
+            process, registry = mock.Mock(), mock.Mock(spec=owned.OwnedProcessRegistry)
+            registry.snapshot.return_value = []
+            process.wait.return_value = 1 if outcome == "exit" else 0
+            if outcome == "timeout":
+                process.wait.side_effect = subprocess_error = ci.subprocess.TimeoutExpired("private", 1)
+            else:
+                subprocess_error = OSError("private-start-error bearer=not-for-public")
+            with self.subTest(outcome=outcome), mock.patch.object(ci, "require_owned_ci_runtime"), \
+                    mock.patch.object(ci, "_system_cmd_executable", return_value=cmd), \
+                    mock.patch.object(ci, "OwnedProcessRegistry", return_value=registry), \
+                    mock.patch.object(ci, "spawn_owned_process", return_value=process,
+                                      side_effect=subprocess_error if outcome == "start" else None) as spawn, \
+                    mock.patch.object(ci.subprocess, "Popen") as fallback, redirect_stdout(io.StringIO()):
+                if outcome == "ok":
+                    self.assertEqual(ci.run_flutter("bootstrap", sdk, ["--version"], self.root, {}, logs, 1), b"")
+                else:
+                    with self.assertRaises(ci.ValidationError) as failure:
+                        ci.run_flutter("bootstrap", sdk, ["--version"], self.root, {}, logs, 1)
+                    suffix = {"start": "START", "timeout": "TIMEOUT", "exit": "EXIT"}[outcome]
+                    self.assertIn("CI_FLUTTER_BOOTSTRAP_" + suffix, ci.ci_failure_diagnostic(failure.exception, "flutter_version"))
+                    self.assertNotIn("not-for-public", str(failure.exception))
+                argv = spawn.call_args.args[0]
+                self.assertEqual(argv[0], str(cmd))
+                self.assertEqual(argv[1:5], ["/d", "/v:off", "/s", "/c"])
+                self.assertNotIn("call", argv)
+                self.assertIs(spawn.call_args.kwargs["shell"], False)
+                self.assertEqual(spawn.call_args.kwargs["env"]["COMSPEC"], str(cmd))
+                fallback.assert_not_called()
+
+    def test_workflow_all_flutter_owned_modes_bind_fresh315_before_sdk_without_expanding_ui_scope(self):
+        workflow = (Path(ci.ROOT) / ".github/workflows/build-windows.yml").read_text(encoding="utf-8")
+        handoff = workflow.index("- name: Bind fresh audited helper Python")
+        sdk = workflow.index("- name: Download and verify the pinned official Flutter SDK")
+        self.assertLess(handoff, sdk)
+        prepare = workflow[handoff:].split("      - name:", 1)[0]
+        for token in ("--prepare-helper-runtime-only", "--check-owned-runtime-only", "--helper-runtime-sha256", "-I -B"):
+            self.assertIn(token, prepare)
+        self.assertLess(prepare.index("--prepare-helper-runtime-only"), prepare.index("--check-owned-runtime-only"))
+        for name in ("Verify Flutter executable identity", "Analyze and test isolated UI", "Build, rerun backend tests"):
+            block = workflow[workflow.index("- name: " + name):].split("      - name:", 1)[0]
+            for token in ("steps.helper-python.outputs.path", "--helper-runtime-manifest", "--helper-runtime-result", "--helper-runtime-sha256", "-I -B"):
+                self.assertIn(token, block)
+            self.assertNotIn("steps.host-python.outputs.path", block)
+        for name in ("Update official stable Visual Studio", "Build, rerun backend tests"):
+            block = workflow[workflow.index("- name: " + name):].split("      - name:", 1)[0]
+            self.assertIn("if: ${{ !inputs.ui_checks_only && !inputs.window_fixture_only }}", block)
+
+    def helper_cli(self):
+        return ["--helper-runtime-manifest", str(self.root / "fresh-receipt.json"),
+                "--helper-runtime-result", str(self.root / "helper-runtime.json"),
+                "--helper-runtime-sha256", "a" * 64]
+
     def test_flutter_only_cli_routes_without_full_build_inputs(self):
         argv = ["--preflight-flutter-only", "--flutter-result", str(self.root / "flutter-result.json"),
                 "--flutter-scratch", str(self.root / "scratch"), "--preflight-stage", str(self.root / "new-stage")]
         with mock.patch.object(ci, "run_flutter_preflight", return_value={}) as preflight, \
+                mock.patch.object(ci, "bind_helper_runtime") as bound, \
                 mock.patch.object(ci, "run_build") as full:
-            self.assertEqual(ci.main(argv), 0)
+            self.assertEqual(ci.main(argv + self.helper_cli()), 0)
+        bound.assert_called_once()
         full.assert_not_called()
         supplied = preflight.call_args.args[0]
         self.assertIsNone(supplied.toolchain_report)
@@ -52,6 +545,7 @@ class CiBuildWindowsTests(unittest.TestCase):
     def test_flutter_only_cli_rejects_full_build_inputs_or_artifact_output(self):
         base = ["--preflight-flutter-only", "--flutter-result", str(self.root / "result.json"),
                 "--flutter-scratch", str(self.root / "scratch"), "--preflight-stage", str(self.root / "stage")]
+        base += self.helper_cli()
         for forbidden in ("--toolchain-report", "--artifact-dir", "--worker-manifest", "--font-result"):
             with self.subTest(forbidden=forbidden), redirect_stderr(io.StringIO()), \
                     mock.patch.object(ci, "run_flutter_preflight") as preflight, self.assertRaises(SystemExit) as failure:
@@ -118,11 +612,14 @@ class CiBuildWindowsTests(unittest.TestCase):
         base = ["--preflight-ui-only", "--flutter-result", str(self.root / "result.json"),
                 "--flutter-scratch", str(self.root / "scratch")]
         required = {"--preflight-stage": "new-stage", "--font-result": "font.json", "--font-scratch": "font-scratch"}
+        base += self.helper_cli()
         complete = base + [item for flag, value in required.items() for item in (flag, str(self.root / value))]
         with mock.patch.object(ci, "run_flutter_preflight", return_value={}) as preflight, \
+                mock.patch.object(ci, "bind_helper_runtime") as bound, \
                 mock.patch.object(ci, "run_build") as full:
             self.assertEqual(ci.main(complete), 0)
         self.assertTrue(preflight.call_args.args[0].preflight_ui_only)
+        bound.assert_called_once()
         full.assert_not_called()
         for missing in required:
             incomplete = base + [item for flag, value in required.items() if flag != missing
@@ -201,7 +698,9 @@ class CiBuildWindowsTests(unittest.TestCase):
         self.assertIn("--preflight-ui-only", workflow[early:update])
         self.assertIn("--font-result", workflow[early:update])
         self.assertIn("type: boolean\n        default: false", workflow)
-        for name in ("Create fresh Worker runtime", "Update official stable Visual Studio and Windows SDK",
+        runtime = workflow[workflow.index("- name: Create fresh Worker runtime"):].split("      - name:", 1)[0]
+        self.assertIn("if: ${{ !inputs.window_fixture_only }}", runtime)
+        for name in ("Update official stable Visual Studio and Windows SDK",
                      "Build, rerun backend tests, validate local math identity"):
             step = workflow[workflow.index("- name: " + name):].split("      - name:", 1)[0]
             self.assertIn("if: ${{ !inputs.ui_checks_only && !inputs.window_fixture_only }}", step)
@@ -395,9 +894,11 @@ class CiBuildWindowsTests(unittest.TestCase):
         base = ["--window-fixture-only", "--toolchain-report", str(self.root / "report.json"),
                 "--preflight-stage", str(self.root / "new-stage")]
         with mock.patch.object(ci, "run_window_fixture_probe", return_value={}) as probe, \
+                mock.patch.object(ci, "require_owned_ci_runtime") as guard, \
                 mock.patch.object(ci, "run_flutter_preflight") as flutter, mock.patch.object(ci, "run_build") as full:
             self.assertEqual(ci.main(base), 0)
         self.assertTrue(probe.call_args.args[0].window_fixture_only)
+        guard.assert_called_once()
         flutter.assert_not_called()
         full.assert_not_called()
         for flag in ("--flutter-result", "--flutter-scratch", "--font-result", "--font-scratch",
@@ -478,6 +979,7 @@ class CiBuildWindowsTests(unittest.TestCase):
                 output.parent.mkdir(parents=True)
                 output.write_bytes(b"fake PE-shaped filename; never executed")
         with mock.patch.object(ci, "ROOT", root), mock.patch.object(ci, "read_json", return_value=report), \
+                mock.patch.object(ci, "require_owned_ci_runtime"), \
                 mock.patch.object(ci.subprocess, "run", side_effect=metadata), \
                 mock.patch.object(ci, "run_window_fixture_step", side_effect=fake_step) as run, \
                 mock.patch.object(ci, "validate_window_probe_cache", return_value={"architecture": "x64",
@@ -537,13 +1039,14 @@ class CiBuildWindowsTests(unittest.TestCase):
         for outcome in ("timeout", "spawn_failed"):
             logs = self.root / outcome
             logs.mkdir()
-            registry = mock.Mock()
+            registry = mock.Mock(spec=owned.OwnedProcessRegistry)
             registry.snapshot.return_value = []
             process = mock.Mock()
             process.wait.side_effect = ci.subprocess.TimeoutExpired("private-command", 60)
             spawn_error = OSError("D:/PRIVATE/profile.json bearer=do-not-print")
             output = io.StringIO()
-            with mock.patch.object(ci, "OwnedProcessRegistry", return_value=registry), \
+            with mock.patch.object(ci, "require_owned_ci_runtime"), \
+                        mock.patch.object(ci, "OwnedProcessRegistry", return_value=registry), \
                     mock.patch.object(ci, "spawn_owned_process", return_value=process,
                                       side_effect=spawn_error if outcome == "spawn_failed" else None), \
                     mock.patch.object(ci, "window_fixture_diagnostic") as diagnostic, \
@@ -559,12 +1062,13 @@ class CiBuildWindowsTests(unittest.TestCase):
         for code in (0, 1):
             logs = self.root / ("exit-" + str(code))
             logs.mkdir()
-            registry = mock.Mock()
+            registry = mock.Mock(spec=owned.OwnedProcessRegistry)
             registry.snapshot.return_value = []
             process = mock.Mock()
             process.wait.return_value = code
             output = io.StringIO()
-            with mock.patch.object(ci, "OwnedProcessRegistry", return_value=registry), \
+            with mock.patch.object(ci, "require_owned_ci_runtime"), \
+                        mock.patch.object(ci, "OwnedProcessRegistry", return_value=registry), \
                     mock.patch.object(ci, "spawn_owned_process", return_value=process), \
                     mock.patch.object(ci, "window_fixture_diagnostic", side_effect=RuntimeError("private-secret")), \
                     redirect_stdout(output):
@@ -593,11 +1097,12 @@ class CiBuildWindowsTests(unittest.TestCase):
             for fail_flush in (False, True):
                 logs = self.root / ("broken-output-{}-{}".format(code, fail_flush))
                 logs.mkdir()
-                registry = mock.Mock()
+                registry = mock.Mock(spec=owned.OwnedProcessRegistry)
                 registry.snapshot.return_value = []
                 process = mock.Mock()
                 process.wait.return_value = code
-                with mock.patch.object(ci, "OwnedProcessRegistry", return_value=registry), \
+                with mock.patch.object(ci, "require_owned_ci_runtime"), \
+                        mock.patch.object(ci, "OwnedProcessRegistry", return_value=registry), \
                         mock.patch.object(ci, "spawn_owned_process", return_value=process), \
                         redirect_stdout(BrokenOutput(fail_flush)):
                     if code:
@@ -628,6 +1133,7 @@ class CiBuildWindowsTests(unittest.TestCase):
                 raise ci.ValidationError("Windows fixture run exited unsuccessfully; raw runner-local logs are not uploaded")
 
         with mock.patch.object(ci, "ROOT", root), mock.patch.object(ci, "read_json", return_value=report), \
+                mock.patch.object(ci, "require_owned_ci_runtime"), \
                 mock.patch.object(ci, "prepare_window_probe_source", return_value=[]), \
                 mock.patch.object(ci.subprocess, "run", side_effect=metadata), \
                 mock.patch.object(ci, "validate_window_probe_cache", return_value=actual), \
@@ -659,7 +1165,9 @@ class CiBuildWindowsTests(unittest.TestCase):
         self.assertIn("if: ${{ inputs.window_fixture_only }}", block)
         self.assertIn("-FixtureProbeOnly", block)
         self.assertIn("--window-fixture-only", block)
-        for name in ("Fetch and verify the pinned Noto font", "Download and verify the pinned official Flutter SDK",
+        self.assertLess(block.index("--check-owned-runtime-only"), block.index("tools/ci_toolchain_preflight.ps1"))
+        self.assertNotIn("--prepare-helper-runtime-only", block)
+        for name in ("Create fresh Worker runtime", "Bind fresh audited helper Python", "Fetch and verify the pinned Noto font", "Download and verify the pinned official Flutter SDK",
                      "Verify Flutter executable identity", "Analyze and test isolated UI"):
             step = workflow[workflow.index("- name: " + name):].split("      - name:", 1)[0]
             self.assertIn("if: ${{ !inputs.window_fixture_only }}", step)
@@ -730,8 +1238,9 @@ class CiBuildWindowsTests(unittest.TestCase):
             argv.extend([flag, str(self.root / "private-fixture")])
         stdout, stderr = io.StringIO(), io.StringIO()
         with mock.patch.object(ci, "run_build", side_effect=rejected), \
+                mock.patch.object(ci, "bind_helper_runtime"), \
                 redirect_stdout(stdout), redirect_stderr(stderr):
-            code = ci.main(argv)
+            code = ci.main(argv + self.helper_cli())
         self.assertEqual(code, 1)
         self.assertIn("stage=flutter_version started", stdout.getvalue())
         self.assertIn("code=CI_VALIDATION_FAILED stage=flutter_version", stderr.getvalue())
@@ -1486,11 +1995,12 @@ class CiBuildWindowsTests(unittest.TestCase):
             with self.subTest(label=label):
                 logs = self.root / label
                 logs.mkdir()
-                registry = mock.Mock()
+                registry = mock.Mock(spec=owned.OwnedProcessRegistry)
                 registry.snapshot.return_value = []
                 process = mock.Mock()
                 process.wait.return_value = 1
-                with mock.patch.object(ci, "OwnedProcessRegistry", return_value=registry), \
+                with mock.patch.object(ci, "require_owned_ci_runtime"), \
+                        mock.patch.object(ci, "OwnedProcessRegistry", return_value=registry), \
                         mock.patch.object(ci, "spawn_owned_process", return_value=process) as spawn, \
                         self.assertRaises(ci.ValidationError) as failure:
                     ci.run_window_fixture_step(label, ["fixture-never-executed"], self.root, {}, logs, 60)
