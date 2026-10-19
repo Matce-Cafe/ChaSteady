@@ -7,6 +7,7 @@
 #include <windows.h>
 
 #include <functional>
+#include <cstdint>
 #include <memory>
 #include <string>
 #ifdef CHASTEADY_WINDOW_DIAGNOSTICS
@@ -63,6 +64,10 @@ class WindowChrome final {
   bool ToggleMaximize(std::string* error);
   bool SetAlwaysOnTop(bool value, std::string* error);
   bool StartDrag(std::string* error);
+  // 仅平台线程；关闭只取消输入能力，不绕过受管关闭链。
+  void SetClosing(bool closing);
+  bool HasActiveMaximizeCapture() const;
+  uint64_t ActiveMaximizePressEpoch() const;
 
   // Call before Flutter's plugin and runner default procedures. State-only
   // observations (notably WM_SIZE and WM_DPICHANGED) ALWAYS return false.
@@ -87,6 +92,15 @@ class WindowChrome final {
   };
   void RecordDiagnostic(const char* stage, UINT message = 0, WPARAM wparam = 0, LRESULT result = 0);
   std::vector<DiagnosticRecord> TakeDiagnostics();
+  // 私有诊断只读 ring 视图；不会消费原73/Trial的记录。
+  template <typename Visitor>
+  void VisitDiagnosticsForPrivateProbe(Visitor&& visitor) const {
+    const size_t count = diagnostic_count_;
+    const uint64_t first = diagnostic_sequence_ - count;
+    for (size_t index = 0; index < count; ++index)
+      visitor(diagnostics_[(first + index) % diagnostics_.size()], index, count);
+  }
+
 #endif
 
  private:
@@ -102,7 +116,24 @@ class WindowChrome final {
   bool RemoveChildSubclass();
   bool RestoreStockFrame();
   LRESULT HitTest(POINT screen_point) const;
-  void ResetInteraction();
+  bool ResetInteraction();
+  enum class PressPhase { kIdle, kPressedInside, kPressedOutside };
+  struct PressSnapshot {
+    uint64_t epoch = 0;
+    bool maximized = false;
+    UINT dpi = 0;
+    LONG client_width = 0;
+    LONG client_height = 0;
+    LONG_PTR style = 0;
+  };
+  bool AdvanceInteractionEpoch();
+  bool CancelMaximizePress(bool release_owned = true);
+  bool MaximizePressEligible(POINT screen) const;
+  bool PressSnapshotCurrent(const PressSnapshot& snapshot) const;
+  bool BeginMaximizePress(POINT screen);
+  bool MoveMaximizePress(POINT screen);
+  bool EndMaximizePress(POINT screen);
+  bool SubmitMaximize(bool was_maximized, uint64_t expected_epoch, std::string* error);
   void UpdateHoverFromCursor();
   void NotifyStateIfChanged();
 
@@ -120,6 +151,17 @@ class WindowChrome final {
   bool maximize_button_pressed_ = false;
   bool owner_destroying_ = false;
   bool frame_transition_ = false;
+  // 正式 epoch/capture 状态不依赖 DIAGNOSTICS，溢出不回卷。
+  uint64_t interaction_epoch_ = 0;
+  PressPhase press_phase_ = PressPhase::kIdle;
+  PressSnapshot press_;
+  bool capture_claimed_ = false;
+  bool capture_confirmed_ = false;
+  bool acquiring_capture_ = false;
+  bool releasing_capture_ = false;
+  bool command_in_progress_ = false;
+  bool closing_ = false;
+  bool destructing_ = false;
 #ifdef CHASTEADY_WINDOW_DIAGNOSTICS
   std::array<DiagnosticRecord, 512> diagnostics_{};
   uint64_t diagnostic_sequence_ = 0;

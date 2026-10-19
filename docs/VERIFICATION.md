@@ -163,6 +163,16 @@ job ID：`4f8c1ffb-a98e-49f6-b16a-f13f2c1dbd7a`。
 - 随后分离 UP 时机的私有诊断进入未确认输入释放的被动保留状态，并在用户中断后结束；没有完整 NC／SC 结果、原始进程正常退出或实际 Job 归零证明，结果为 INCOMPLETE_INTERRUPTED_NOT_PASS。后续原身份句柄不可得，不按旧 PID 重新接管或强清，也不重复运行该版本碰通过。
 - 新的持久日志夹具完整返回功能 FAIL，并确认输入释放、原始进程自然结束与实际 Job 为零。日志发现旧 64 位标记的高位未在观察消息中保留，导致认领失败，实际走保护性 250ms 分支；该次不能用于否定预期 50ms 时序。只调整为完整可保留的非零标记并通过 63 项纯验证后，另一新版本实测成功认领，DOWN→UP 为 63ms、scheduler succeeded／can_finish 为 true；仍未产生最大化 SC，因而本次排除了“仅调整该夹具的 UP 时机便能修复”的假设，而非认证真实 Flutter 路由或宣称最大化修复。两次新试验均无强制终止；stock 几何查询缺少成功 BOOL，仍不作为唯一根因。
 
+### 单一路径 capture 候选的真实鼠标补证
+
+- 新私有候选不再把自定义最大化按钮的 DOWN 送入默认 NC tracker，也不叠加 Dart toggle；使用原生 capture 按压状态机，并在通知重入后重新检查关闭状态、epoch 和命令资格。旧源的重入红测真实失败，新源 445 项受控隐藏检查、原 22 项 pure 通过，独立精确复核未发现该补丁的新具体残余。这些检查本身不算物理输入验收。
+- 随后仅执行一次新二进制的真实鼠标试验：两次手势分别完成最大化和还原，maxSC=1、restoreSC=1；每次 MOVE／DOWN 前缀 2/2、唯一 UP 1/1，两个 scheduler succeeded／can_finish 均为 true，incomplete 均为 false。不是直接调用 ToggleMaximize 或发送 SC 代替点击。
+- 源先输出等待释放证明的保守 incomplete 提示，随后给出 generation 2 的 source_released；父侧两次独立严格释放观测相隔约 102.525ms。只有后续实际释放证明才授权 FINISH，未把早期提示、诊断或日志解析当作关闭授权。
+- 约 3.732 秒后原始进程 HANDLE 已结束、实际 Job 为零，termination_attempted=false，41 份冻结输入前后不变。持久日志 129 个事件、6 个原始 chunk 与 122 行 source 逐项一致，无半行尾部；只认证采集前缀，不声称观察到全流 EOF。
+- 首个私有离线解析器漏识别既有的 pre-resume 身份记录而失败，原脚本和失败保留；新解析器增加该记录核对后通过，没有重跑真实输入、修改日志或重放控制。真实 Flutter 发布程序、Snap、多显示器与同包退出均未获该次认证。
+- 同一 WindowChrome CPP／header 与已复核的关闭接线先在全新私有副本组合。使用现有 Flutter 3.47.7 的 18 个真实 vendor 头文件闭包，对 NativeBridge、WindowChrome 两个 TU 独立执行 release 模式 -Wall／-Wextra／-Werror 语法检查，均通过，实际依赖确认没有误取旧 header；无 stub、无 SDK 执行或新输入。这是 LLVM 源码检查，不是 MSVC 链接或正式构建。
+- 随后先独占备份三份原件，再将同一候选字节精确合入应用源码；实际 diff 与已审组合逐字节相同。72 个原输入中恰好 3 个计划变化，其余 69 个及 52 个受保护私有源码／旧证据不变。生产集成已完成到源码层，完整云构建与同包运行结果仍须另行记录；Worker 与数学绑定没有因此变化。
+
 ### 后台独立复核与来源绑定状态
 
 - 首轮独立复核的六项问题包括改名引擎并发识别、超限元数据持久化、十进制时长舍入、备份目录自包含、能力降级及模板实际身份。首轮修正后完整 185 项（含 1 项原有平台跳过）和原三案例通过，但复核仍发现进程身份与其他 mutator 写失败的残余，因此该轮摘要不是最终发布绑定。
@@ -212,5 +222,6 @@ job ID：`4f8c1ffb-a98e-49f6-b16a-f13f2c1dbd7a`。
 - 失败批中 provisioning 13 项、assets 12 项、build helper 24 项通过；CI helper 92 项出现 4 failure／11 error。正向临时夹具路径被未改的有限 BAT 路径校验拒绝，后续 mock 断言连锁失败；原日志没有实际路径，不猜具体拼写或字符。
 - 仅修改测试文件，优先使用已存在且规范化的 RUNNER_TEMP，再对新夹具根 resolve(strict=True) 并实际检查有限语法。新增回归证明 raw≠canonical 时正向 SDK／Cmd 使用 canonical，诊断仅固定布尔和长度；原负例、生产路径守卫、window-only 零下载语义、Worker 及数学摘要保持不变。
 - 真实红测 1 项失败、绿测 1 项通过，随后 CI helper 完整 93/93 通过，0 skip、0 实际子进程，新增测试共约 2.239 秒。旧失败和证据保留；这些结果不是实际 Flutter、云端成功、真实 GUI 或产品验收。新源码的云端结果另行记录。
+- 随后新提交 1b5419076f819b3c7a11a27e9bbd1922f29fbbac 的唯一 UI-only 检查 39228160625／attempt 1 实际成功。官方 run/job API 确认 CI guard、fresh 运行时交接、固定 Flutter 身份和 UI 分析／测试步骤通过；没有以本地纯测试代替该结果。完整构建、Worker 冻结、打包和上传按 UI-only 设计 skipped，artifact 为 0，不是新 Windows 包或真实窗口验收。
 
 本轮后续新报告继续区分源码／unit、真实 GUI、真实引擎、媒体完整性、内容对应和感知范围；没有实际执行的层级不写“通过”。

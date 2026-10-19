@@ -53,6 +53,7 @@ ChaSteady 是面向 Windows 的本地视频增稳工作台，使用 Flutter／Ma
 - 导航形态改变不得丢失草稿或选中状态。任务面板共享控制器和唯一轮询器，避免隐藏页面重复持有原生播放器或租约。
 - picker、手输和拖入经过相同的源变更／失效／Worker 验收链。Web 不得用 fakepath 假装取得本机绝对路径。
 - Widget 点击不能直接调用 onPressed／onChanged 代替命中和滚动；原生最大化必须包含真实鼠标路径，真实拖入必须覆盖 OLE，而非只调 handler。
+- 自定义最大化按钮只使用单一原生 capture 路线，不同时交默认 NC tracker 或补 Dart toggle；按压 epoch、释放后的资格及同步通知重入都须复核。关闭状态合并、取消和最终 WM_CLOSE 沿用受管退出，不把私有 Win32 点击成功升级为同包 Flutter、Snap 或关闭验收。
 - 模拟引擎、真实 Worker、真实 GUI 和完整媒体流程分开记录。没有实际运行的测试不得写“通过”；强关后的清理不能登记为正常退出成功。
 
 ## 数学绑定与构建

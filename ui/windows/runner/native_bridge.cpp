@@ -479,6 +479,7 @@ class NativeBridge::Impl final {
     // Engine/window teardown cancels any MethodResults still pending; never
     // synthesize a Dart success after the channel owner begins destruction.
     destroying_.store(true, std::memory_order_release);
+    if (window_chrome_) window_chrome_->SetClosing(true);
     terminal_observer_active_.store(false, std::memory_order_release);
     KillTimer(owner_window_, kOwnedProcessObservationTimer);
     if (channel_) channel_->SetMethodCallHandler(nullptr);
@@ -533,6 +534,7 @@ class NativeBridge::Impl final {
         window_close_pending_.store(false, std::memory_order_release);
         close_needs_dart_confirmation_ = false;
         ++close_generation_;
+        SyncChromeClosing();
       }
       if (result != nullptr) *result = 0;
       return true;
@@ -561,7 +563,14 @@ class NativeBridge::Impl final {
     return false;
   }
 
+  void SyncChromeClosing() {
+    if (window_chrome_) window_chrome_->SetClosing(destroying_.load(std::memory_order_acquire) ||
+        close_committed_ || close_pending_ || window_close_pending_.load(std::memory_order_acquire) ||
+        shutdown_in_progress_.load(std::memory_order_acquire) || shutdown_requested_.load(std::memory_order_acquire));
+  }
+
   bool CloseRequest() {
+    if (window_chrome_) window_chrome_->SetClosing(true);
     if (media_drop_) media_drop_->Disable();
     if (close_committed_) return false;
     if (shutdown_requested_.load(std::memory_order_acquire) &&
@@ -940,6 +949,7 @@ class NativeBridge::Impl final {
           ++close_generation_;
           KillTimer(owner_window_, kCloseRequestTimer);
         }
+        SyncChromeClosing();
         break;
     }
   }
@@ -1272,6 +1282,7 @@ class NativeBridge::Impl final {
           }
         }
       }
+      if ((already_terminal || merged_terminal_waiter || start_shutdown) && window_chrome_) window_chrome_->SetClosing(true);
       if (already_terminal) {
         CompleteSuccess(reply_id);
         return;
@@ -1587,6 +1598,7 @@ class NativeBridge::Impl final {
       window_close_pending_.store(false, std::memory_order_release);
       close_needs_dart_confirmation_ = false;
       KillTimer(owner_window_, kCloseRequestTimer);
+      SyncChromeClosing();
       return;
     }
     if (shutdown_requested_.load(std::memory_order_acquire)) {
@@ -1600,6 +1612,7 @@ class NativeBridge::Impl final {
   }
 
   void ShutdownForClose(uint64_t generation) {
+    if (window_chrome_) window_chrome_->SetClosing(true);
     closing_before_bootstrap_.store(true, std::memory_order_release);
     shutdown_in_progress_.store(true, std::memory_order_release);
     if (!operation_queue_.Post([this, generation] {
@@ -1757,6 +1770,7 @@ class NativeBridge::Impl final {
     close_needs_dart_confirmation_ = false;
     shutdown_in_progress_.store(false, std::memory_order_release);
     KillTimer(owner_window_, kCloseRequestTimer);
+    SyncChromeClosing();
   }
 
   void CommitClose(uint64_t generation) {
@@ -1766,6 +1780,7 @@ class NativeBridge::Impl final {
     window_close_pending_.store(false, std::memory_order_release);
     close_needs_dart_confirmation_ = false;
     close_committed_ = true;
+    if (window_chrome_) window_chrome_->SetClosing(true);
     KillTimer(owner_window_, kCloseRequestTimer);
     PostMessage(owner_window_, WM_CLOSE, 0, 0);
   }

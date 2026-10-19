@@ -45,6 +45,12 @@ UI 检查 [39225218101](https://github.com/Matce-Cafe/ChaSteady/actions/runs/392
 
 修复只改测试文件：优先选用已存在并 resolve 后的 RUNNER_TEMP，规范化新建夹具根，再实际验证原有有限路径语法；canonical 不自动等于语法合规。新增回归覆盖 raw spelling 与 canonical 不同时的父目录选择及正向 SDK／Cmd 参数，诊断只输出固定布尔和长度。原空格、引号、百分号、感叹号等负例保留；生产桥、运行时、窗口专项零下载策略与数学绑定均未改。真实 red 1 项失败保留，green 1 项及 CI helper 93/93 通过，0 skip、没有实际子进程；这仍是本机纯测试，后续云端检查必须绑定新提交，不重试旧失败版本碰通过。
 
+### 新提交的 UI 专项检查已通过
+
+UI 检查 [39228160625](https://github.com/Matce-Cafe/ChaSteady/actions/runs/39228160625)／attempt 1 绑定新提交 1b5419076f819b3c7a11a27e9bbd1922f29fbbac。官方 run 与 job API 均为 completed／success；CI guard、fresh 运行时创建与交接、字体和 Flutter SDK 校验、Flutter executable identity、UI analyze／test 步骤均成功。该次没有重试两个旧失败版本，生产路径守卫和受管进程契约保持不变。
+
+这是 UI-only 验证：Microsoft 更新、Windows/Web release 编译、Worker 测试／冻结、打包及上传步骤按设计 skipped，artifact 清单为 0。它确认本次早期 UI 门禁通过，不是完整云构建、新 Windows 包、原生最大化或同包 GUI 验收。
+
 ### Early executable identity gate
 
 The workflow provisions the Worker runtime, font and pinned Flutter archive **before** the long Visual Studio/Windows SDK update. It binds the fresh audited Worker CPython 3.15.0 receipt, executable/hash and path configuration before SDK download; the runner's PATH Python remains bootstrap-only. It then invokes the restricted `--preflight-flutter-only` mode with the Flutter provision result, scratch root, a new isolated `--preflight-stage`, and the helper-runtime manifest/result/digest handoff. That mode reuses the pinned receipt/path checks, child-only environment and strict executable-version gate; it does not require a Microsoft toolchain report and cannot accept an artifact directory or other full-build inputs. Its receipt is explicitly identity-only, not native compilation, Worker testing, mathematical reproduction or runtime acceptance.
