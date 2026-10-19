@@ -88,7 +88,7 @@
   ],
   "sources": {
     "canonicalization": "utf-8-lf-v1",
-    "inventory_sha256": "6cdef086323592d6dbd534a608c27553de61bcaf0e125280ec6d6adbf021664c",
+    "inventory_sha256": "cb23c2b70e8080504a9072152a79092e750477d943bf4d735955d6018d1acc0c",
     "files": [
       {
         "path": "tools/freeze_worker.py",
@@ -104,7 +104,7 @@
       },
       {
         "path": "worker/cha_stabilizer/__init__.py",
-        "sha256": "649f49c1f45974eff17dc99f51f618e1754564b5a139b4681cf468c050b51bf7"
+        "sha256": "67e30ad576368f180fc8760e2810160fb4b1cccbc31963d31a731769e3fa8a8d"
       },
       {
         "path": "worker/cha_stabilizer/adapters/__init__.py",
@@ -120,7 +120,7 @@
       },
       {
         "path": "worker/cha_stabilizer/adapters/gyroflow.py",
-        "sha256": "94007daef2c7a045ed55f333461b36b0f4ce64911175932637c2fd75fa48cbcb"
+        "sha256": "01e5cc231890e712e78aad2fb96b77d0ed64bed41ea55e62b7b3efcd33e641d8"
       },
       {
         "path": "worker/cha_stabilizer/cli.py",
@@ -129,6 +129,10 @@
       {
         "path": "worker/cha_stabilizer/core/__init__.py",
         "sha256": "5fffaa8f48dcbc3201652296e3a525eb84f57b9e149249480533d0f55495a5d0"
+      },
+      {
+        "path": "worker/cha_stabilizer/core/bounded_io.py",
+        "sha256": "5429642a075e489a81f599ccfa584905e14ad71d73d9591db180fdb9a5974aee"
       },
       {
         "path": "worker/cha_stabilizer/core/cache.py",
@@ -148,7 +152,7 @@
       },
       {
         "path": "worker/cha_stabilizer/core/pipeline.py",
-        "sha256": "8925f1bf674a31820eb27bc884d2ae9d62d29e5b713e9ee718027d6d19fac17b"
+        "sha256": "f9c04432b4afdec8e75a7cbf1ea8f1cfc88ffd425e316981620f0d3e5b2d499a"
       },
       {
         "path": "worker/cha_stabilizer/core/registration.py",
@@ -157,6 +161,10 @@
       {
         "path": "worker/cha_stabilizer/core/render.py",
         "sha256": "40cab0baf60418eba587ac8146dc283fb684c379ec8025b7206436933739895d"
+      },
+      {
+        "path": "worker/cha_stabilizer/core/stabilize.py",
+        "sha256": "b47c41b6742838e1d494f423109ec3486974afdee86476603320159e7ec59ff8"
       },
       {
         "path": "worker/cha_stabilizer/core/streams.py",
@@ -180,19 +188,19 @@
       },
       {
         "path": "worker/cha_stabilizer/errors.py",
-        "sha256": "4c77c76d6d5b3274c8e095488251fb0166059017a5552f56f56f438ed504ac3a"
+        "sha256": "15f15a68e2f9240f39c407a078e53c2ec3c93f9b4fb29055143ff75e3a1df176"
       },
       {
         "path": "worker/cha_stabilizer/job_runner.py",
-        "sha256": "5a310db66aa0b4d11135848082227b0b3e62854f4e90b8d119db55b8c0e4f578"
+        "sha256": "32b36135d65b404b35de856d64720731b0a56b9e60c5ab3e3bdcbd14bde3a8ae"
       },
       {
         "path": "worker/cha_stabilizer/job_store.py",
-        "sha256": "07727d36c090230ed300ad1cc8d0797378ec34a51b9fd58931ae3a43ec1e1dea"
+        "sha256": "1f2058c1a2bab11a88898f66a16ea690a4be8b1fe290abe6fedc8073f1bd2202"
       },
       {
         "path": "worker/cha_stabilizer/local_server.py",
-        "sha256": "7969dd41e46f91f2f3c65f761d3d3fa4f6dabe62fb2e0dbda0f99c28ad54e63b"
+        "sha256": "974c14b8435c02680f81bffa703a56f7f62ed477740b506c026c57747e16480c"
       },
       {
         "path": "worker/cha_stabilizer/media_leases.py",
@@ -200,15 +208,19 @@
       },
       {
         "path": "worker/cha_stabilizer/models.py",
-        "sha256": "12e3b5985abf6e3d403b080c9c1c84bf21d3267ea638136125bac4007bd6504a"
+        "sha256": "82364721a0fccd82f474858dbaa7fd168e168a9ffb04d7c04a94d90ef3cf4802"
       },
       {
         "path": "worker/cha_stabilizer/owned_processes.py",
-        "sha256": "99cc0911c86374861e81bcc8a54be57927bcec684b872595ee111e3226f827e7"
+        "sha256": "e22cbb8300aac3edf1055e155f3b34aaa2a04a692818f95eb8d49191cc40b470"
       },
       {
         "path": "worker/cha_stabilizer/paths.py",
         "sha256": "f573a8c5be24d8ffb019bf6abd1050e0f6d9bf3bad2b905731938d9024279b68"
+      },
+      {
+        "path": "worker/cha_stabilizer/runtime_context.py",
+        "sha256": "ee0b2f99fe291f0beb60f3a9754e727041b5eeb74ddcf2caea51043f520053bd"
       },
       {
         "path": "worker/cha_stabilizer/windows_pipe_reader.py",
@@ -218,9 +230,9 @@
   },
   "backend_tests": {
     "passed": true,
-    "minimum_expected_test_count": 127,
-    "test_count": 127,
-    "executed_test_count": 126,
+    "minimum_expected_test_count": 234,
+    "test_count": 234,
+    "executed_test_count": 233,
     "skipped_count": 1
   },
   "thresholds": {

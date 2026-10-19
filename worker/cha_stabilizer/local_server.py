@@ -26,12 +26,15 @@ from .job_runner import JobRunner, discover_c7037_presets
 from .job_store import JobStore, PreferenceStore, _json_safe, _public_job_value
 from .models import (
     RequestValidationError,
+    STABILIZE_PROFILE,
+    STABILIZE_PARAMETERS,
+    STABILIZE_PARAMETER_BOUNDS,
     validate_job_request,
     validate_media_inspect,
     validate_media_pick,
     validate_preset_discovery,
 )
-from .owned_processes import OwnedProcessRegistry, registry_scope
+from .owned_processes import OwnedProcessError, OwnedProcessRegistry, registry_scope
 from .paths import (
     UnsafePathError,
     _assert_no_reparse_components,
@@ -108,31 +111,53 @@ class LocalApplication:
         self.static_root = _select_static_root(self.resource_root)
         self.preferences = PreferenceStore(self.data_root, desktop=self.desktop)
         self.jobs = JobStore(self.data_root)
-        self.runner = JobRunner(self.jobs, self.preferences)
+        self.runner = JobRunner(self.jobs, self.preferences, resource_root=self.resource_root)
         self.nonce = secrets.token_urlsafe(48)
         self.media_cookie = secrets.token_urlsafe(32)
         self._closed = False
+        self._cleanup_complete = False
         self._inspection_lock = threading.RLock()
         self._inspection_registries = set()
         self._inspection_threads = {}
 
     def close(self) -> None:
         with self._inspection_lock:
-            if self._closed:
+            if self._closed and self._cleanup_complete:
                 return
             self._closed = True
             inspections = list(self._inspection_registries)
             inspection_threads = list(self._inspection_threads.values())
-        # Mark submissions closed before doing any potentially slow cleanup.
-        self.runner.shutdown(wait=0.0)
+        # 先阻止新提交，再逐项清理；一个未确认不能跳过其余 own registry。
+        failures = []
+        try:
+            self.runner.shutdown(wait=0.0)
+        except (AppError, OSError):
+            failures.append("runner")
         for registry in inspections:
             registry.cancel_event.set()
-            registry.terminate_all()
-        self.runner.shutdown(wait=None)
+            try:
+                registry.terminate_all()
+                registry.assert_quiescent()
+            except (AppError, OSError):
+                failures.append("inspection")
+            else:
+                with self._inspection_lock:
+                    self._inspection_registries.discard(registry)
+                    self._inspection_threads.pop(registry, None)
+        try:
+            self.runner.shutdown(wait=None)
+        except (AppError, OSError):
+            failures.append("runner")
         current = threading.current_thread()
         for thread in inspection_threads:
             if thread is not current and thread.is_alive():
-                thread.join()
+                thread.join(timeout=0.25 if failures else None)
+                if thread.is_alive():
+                    failures.append("inspection_thread")
+        if failures:
+            raise OwnedProcessError("service_shutdown_cleanup_unconfirmed")
+        with self._inspection_lock:
+            self._cleanup_complete = True
 
     def configured_tool(self, key: str) -> Tuple[Optional[Path], Optional[str]]:
         raw = self.preferences.get()["tool_paths"].get(key)
@@ -166,12 +191,8 @@ class LocalApplication:
         try:
             module = importlib.import_module(".adapters.gyroflow", package="cha_stabilizer")
             capability_fn = getattr(module, "capabilities")
-            value = capability_fn({
-                "executable": executable,
-                "probe_report": report,
-                "development_identity": self.preferences.development_config["gyroflow_identity"]
-                if not self.desktop else {},
-            })
+            trusted = self.runner._toolchain()
+            value = capability_fn(dict(trusted, executable=executable, probe_report=report))
         except Exception:
             # An absent or unreadable audit manifest must never inherit a prior
             # verification claim from another Gyroflow installation.
@@ -180,7 +201,7 @@ class LocalApplication:
             return result
         result["detected"] = value.get("detected") is True
         result["mode"] = "cli"
-        for key in ("version", "sha256", "probe_report", "cli_status", "validation_status"):
+        for key in ("version", "sha256", "probe_report", "cli_status", "validation_status", "actual_file_version", "identity_source", "identity_verified", "execution_supported", "content_correspondence_verified"):
             field = value.get(key)
             if isinstance(field, (str, int, float, bool)) or field is None:
                 result[key] = str(field) if key == "probe_report" and field is not None else field
@@ -200,7 +221,24 @@ class LocalApplication:
         for preset in discover_c7037_catalog():
             catalog.append(preset)
         gyroflow = self._gyroflow_capability(tools["gyroflow"])
+        try:
+            module = importlib.import_module(".core.stabilize", package="cha_stabilizer")
+            stabilize = module.capability(self.runner._toolchain())
+        except ImportError as exc:
+            missing = str(getattr(exc, "name", "") or "").split(".", 1)[0]
+            if missing not in ("numpy", "scipy", "cv2"):
+                raise
+            # 仅已知数学依赖缺失降级；未知导入缺陷仍暴露为错误，不能一概吞掉。
+            stabilize = {
+                "workflow_version": 1, "available": False, "automatic_ctb_exports": 0,
+                "ctb_automatic": False, "continuation_supported": False,
+                "blocking_codes": ["worker_math_dependencies_unavailable", "ctb_executor_unavailable"],
+                "missing_dependencies": [missing], "content_correspondence_verified": False,
+                "profiles": [{"id": STABILIZE_PROFILE, "parameters": dict(STABILIZE_PARAMETERS),
+                              "parameter_bounds": {key: dict(value) for key, value in STABILIZE_PARAMETER_BOUNDS.items()}}],
+            }
         return {
+            "stabilize": stabilize,
             "ffmpeg": {
                 "detected": tools["ffmpeg"][0] is not None and tools["ffprobe"][0] is not None,
                 "path": tools["ffmpeg"][1],
@@ -253,11 +291,19 @@ class LocalApplication:
             raise AppError("Media inspection failed. Confirm the selected file and configured ffprobe executable.") from exc
         finally:
             timer.cancel()
-            if cancel_event.is_set():
-                registry.terminate_all()
-            with self._inspection_lock:
-                self._inspection_registries.discard(registry)
-                self._inspection_threads.pop(registry, None)
+            cleanup_confirmed = False
+            try:
+                if cancel_event.is_set():
+                    registry.terminate_all()
+                registry.assert_quiescent()
+                cleanup_confirmed = True
+            except (AppError, OSError) as error:
+                raise OwnedProcessError("inspection_cleanup_unconfirmed") from error
+            finally:
+                if cleanup_confirmed:
+                    with self._inspection_lock:
+                        self._inspection_registries.discard(registry)
+                        self._inspection_threads.pop(registry, None)
         if cancel_event.is_set():
             raise CapabilityUnavailable("Media inspection was stopped with its owned ffprobe process.")
         if not isinstance(summary, dict):
@@ -347,7 +393,11 @@ class CapabilityUnavailable(RuntimeError):
 
 def _stop_owned_probe(event: threading.Event, registry: OwnedProcessRegistry) -> None:
     event.set()
-    registry.terminate_all()
+    try:
+        registry.terminate_all()
+    except (AppError, OSError):
+        # timer 只锁存失败；inspect/close 必须消费它，不能称为 safely stopped。
+        registry._cleanup_error = "inspection_timer_cleanup_unconfirmed"
 
 
 def _native_picker_available() -> bool:

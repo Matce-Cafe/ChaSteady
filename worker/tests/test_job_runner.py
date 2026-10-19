@@ -141,5 +141,68 @@ class JobRunnerTests(unittest.TestCase):
         self.assertTrue(self.source.is_file())
 
 
+class OwnedCleanupGateTests(unittest.TestCase):
+    """只用 mock 验证失败发布与 shutdown 哨兵，不启动媒体子进程。"""
+
+    def setUp(self):
+        self.fixture = JobRunnerTests()
+        self.fixture.setUp()
+        def cleanup_fixture():
+            # 只清理本测试注入的合成对象；断言完成前不能消除故障。
+            self.fixture.runner._ownership_fault = None
+            self.fixture.runner._registries.clear()
+            self.fixture.tearDown()
+        self.addCleanup(cleanup_fixture)
+
+    def test_cleanup_unknown_blocks_verified_publication(self):
+        fixture = self.fixture
+        job = fixture.store.create("validate", {"source": str(fixture.source)})
+        job_id = job["id"]
+        fixture.store.set_state(job_id, "running")
+        directory = fixture.store.get_run_dir(job_id)
+        manifest = directory / "manifest.json"
+        manifest.write_text("{}", encoding="utf-8")
+        def unconfirmed():
+            raise AppError("Owned cleanup is unconfirmed.", {"ownership_unconfirmed": True})
+        registry = SimpleNamespace(assert_quiescent=unconfirmed, snapshot=lambda: [], terminate_all=unconfirmed)
+        fixture.runner._registries[job_id] = registry
+        self.addCleanup(lambda: fixture.runner._registries.pop(job_id, None))
+        result = {"outputs": [{"path": manifest, "kind": "manifest", "mime": "application/json"}],
+                  "manifest": manifest, "validation": {"status": "verified_media", "scope": "media_only"}}
+        module = SimpleNamespace(run_validation=lambda *args: result)
+        with patch("cha_stabilizer.job_runner.importlib.import_module", return_value=module):
+            fixture.runner._execute(job_id, [fixture.source], threading.Event())
+        self.assertEqual(fixture.store.get(job_id)["state"], "failed")
+        self.assertEqual(fixture.store.get(job_id)["artifacts"], [])
+
+    def test_ownership_fault_blocks_new_submission_without_enqueuing(self):
+        fixture = self.fixture
+        fixture.runner._ownership_fault = "owned_cleanup_unconfirmed"
+        with patch.object(fixture.runner._queue, "put") as enqueue:
+            with self.assertRaises(AppError):
+                fixture.runner.submit({"kind": "validate", "request": {"source": str(fixture.source)}})
+        enqueue.assert_not_called()
+
+    def test_shutdown_failure_still_posts_sentinel_and_keeps_owner(self):
+        fixture = self.fixture
+        job = fixture.store.create("validate", {"source": str(fixture.source)})
+        fixture.store.set_state(job["id"], "running")
+        fixture.runner._events[job["id"]] = threading.Event()
+        def unconfirmed(*args, **kwargs):
+            raise AppError("Owned cleanup is unconfirmed.", {"ownership_unconfirmed": True})
+        registry = SimpleNamespace(terminate_all=unconfirmed, snapshot=lambda: [object()])
+        fixture.runner._registries[job["id"]] = registry
+        self.addCleanup(lambda: fixture.runner._registries.pop(job["id"], None))
+        try:
+            with self.assertRaises(AppError):
+                fixture.runner.shutdown(wait=0.5)
+            fixture.runner._thread.join(timeout=0.5)
+            self.assertFalse(fixture.runner._thread.is_alive())
+            self.assertIs(fixture.runner._registries[job["id"]], registry)
+        finally:
+            fixture.runner._queue.put(None)
+            fixture.runner._thread.join(timeout=1.0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -60,7 +60,7 @@ class LocalApiTests(unittest.TestCase):
 
         status, headers, body = self.request("GET", "/api/health", headers=self.auth)
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body), {"version": "0.1.0", "session_ready": True})
+        self.assertEqual(json.loads(body), {"version": "0.2.0", "session_ready": True})
         self.assertIsNone(headers.get("Access-Control-Allow-Origin"))
 
     def test_unbuilt_ui_never_serves_flutter_source_template(self):
@@ -387,6 +387,74 @@ class LocalApiTests(unittest.TestCase):
         self.assertEqual(status, 401)
         self.assertIsNone(headers.get("Access-Control-Allow-Origin"))
         self.assertEqual(json.loads(body)["error"]["code"], "unauthorized")
+
+
+class InspectionCleanupContractTests(unittest.TestCase):
+    """纯 mock 验证 inspection 与 close 必须消费未确认的 owned cleanup。"""
+
+    def setUp(self):
+        from cha_stabilizer.local_server import LocalApplication
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.app = LocalApplication(None, app_root=self.root)
+        def cleanup():
+            self.app._inspection_registries.clear()
+            self.app._inspection_threads.clear()
+            self.app.runner._ownership_fault = None
+            self.app.runner._registries.clear()
+            self.app.runner.shutdown()
+            self.temp.cleanup()
+        self.addCleanup(cleanup)
+
+    def test_close_attempts_every_owned_registry_before_reporting_unknown(self):
+        from types import SimpleNamespace
+        attempted = []
+        class FaultedRegistry:
+            def __init__(self, label):
+                self.label = label
+                self.cancel_event = threading.Event()
+            def terminate_all(self):
+                attempted.append(self.label)
+                raise AppError("Owned cleanup is unconfirmed.", {"ownership_unconfirmed": True})
+        first, second = FaultedRegistry("first"), FaultedRegistry("second")
+        self.app._inspection_registries.update((first, second))
+        with patch.object(self.app.runner, "shutdown"):
+            with self.assertRaises(AppError):
+                self.app.close()
+        self.assertEqual(set(attempted), {"first", "second"})
+        self.assertEqual(self.app._inspection_registries, {first, second})
+
+    def test_repeated_close_does_not_erase_previous_unconfirmed_cleanup(self):
+        class FaultedRegistry:
+            cancel_event = threading.Event()
+            def terminate_all(self):
+                raise AppError("Owned cleanup is unconfirmed.", {"ownership_unconfirmed": True})
+        registry = FaultedRegistry()
+        self.app._inspection_registries.add(registry)
+        with patch.object(self.app.runner, "shutdown"):
+            for _ in range(2):
+                with self.assertRaises(AppError):
+                    self.app.close()
+        self.assertIn(registry, self.app._inspection_registries)
+
+    def test_failed_inspection_retains_unconfirmed_owned_registry(self):
+        from types import SimpleNamespace
+        from cha_stabilizer.owned_processes import get_active_registry
+        source = self.root / "fake.mp4"
+        source.write_bytes(b"fake-only-not-media")
+        self.app.preferences.update({"tool_paths": {"ffprobe": sys.executable}})
+        observed = []
+        def probe(*args, **kwargs):
+            registry = get_active_registry()
+            observed.append(registry)
+            registry._cleanup_error = "mock_cleanup_unconfirmed"
+            registry.cancel_event.set()
+            raise AppError("Owned cleanup is unconfirmed.", {"ownership_unconfirmed": True})
+        with patch("cha_stabilizer.local_server.importlib.import_module", return_value=SimpleNamespace(probe=probe)):
+            with self.assertRaises(AppError):
+                self.app.inspect_media(str(source))
+        self.assertEqual(len(observed), 1)
+        self.assertIn(observed[0], self.app._inspection_registries)
 
 
 if __name__ == "__main__":

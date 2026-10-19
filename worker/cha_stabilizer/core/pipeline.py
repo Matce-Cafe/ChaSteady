@@ -9,7 +9,7 @@ from ..errors import NeedsReviewError
 from ..models import validate_job_request
 from ..paths import validate_owned_file, ensure_not_alias, _assert_no_reparse_components
 from .cache import load_legacy
-from .fusion import anchored_blend, interval_gains
+from .fusion import FusionSettings, anchored_blend, interval_gains
 from .geometry import check_unit
 from .media import local_file, probe, check_cfr, fingerprint, VIDEO_EXTENSIONS
 from .registration import register_videos
@@ -145,7 +145,14 @@ def run_fusion(request, workdir, toolchain, cancel, on_event):
             details["trajectory_provenance"] = {"mode": "fresh", "missing_measurement_filler_used": False,
                                                  "coordinate_gauge_first_frame": "identity_not_motion_measurement"}
         on_event("fusion", None, "计算双锚点全局刚性轨迹，不混合GF像素")
-        result = anchored_blend(quiet, reference, requested, fps, size)
+        controller_keys = ("alignment_tau_seconds", "minimum_weight_transition_seconds", "weight_corner_speed", "anchor_corner_speed")
+        if any(key in request for key in controller_keys):
+            settings = FusionSettings(**{key: request[key] for key in controller_keys if key in request})
+            result = anchored_blend(quiet, reference, requested, fps, size, settings)
+            details["fusion_settings"] = {key: getattr(settings, key) for key in controller_keys}
+        else:
+            # 历史请求沿用原调用及默认数学语义；不改变旧 golden 的入口。
+            result = anchored_blend(quiet, reference, requested, fps, size)
         check_unit(result.matrices)
         trajectory = workdir / "trajectory.npz"
         with trajectory.open("xb") as stream:

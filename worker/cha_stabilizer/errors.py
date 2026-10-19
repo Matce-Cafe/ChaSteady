@@ -9,6 +9,8 @@ _ERROR_MESSAGE_KEYS = {
     "cancelled": "job.error.cancelled",
     "worker_interrupted": "job.error.workerInterrupted",
     "missing_capability": "job.error.missingCapability",
+    "ctb_executor_unavailable": "job.error.ctbExecutorUnavailable",
+    "full_content_correspondence_unverified": "job.error.fullContentCorrespondenceUnverified",
     "processing_failed": "job.error.processingFailed",
     "media_lease_unavailable": "nativeMedia.error.leaseUnavailable",
     "unsupported_action": "nativeProtocol.error.unsupportedAction",
@@ -36,6 +38,17 @@ _PROGRESS_MESSAGE_KEYS = {
     "queued": "job.progress.queued",
     "starting": "job.progress.starting",
     "inspect": "job.progress.inspect",
+    "source_acceptance": "job.progress.sourceAcceptance",
+    "capability_preflight": "job.progress.capabilityPreflight",
+    "ctb": "job.progress.ctb",
+    "gf": "job.progress.gf",
+    "correspondence": "job.progress.correspondence",
+    "fresh_measurement": "job.progress.freshMeasurement",
+    "final_validation": "job.progress.finalValidation",
+    "gyroflow_preflight": "job.progress.gyroflowPreflight",
+    "gyroflow_export": "job.progress.gyroflowExport",
+    "gyroflow_export_verified": "job.progress.gyroflowExportVerified",
+    "cancellation_requested": "job.progress.cancellationRequested",
     "cached_trajectory": "job.progress.cachedTrajectory",
     "fusion": "job.progress.fusion",
     "render": "job.progress.render",
@@ -107,6 +120,14 @@ class NeedsReviewError(AppError):
 
 class NeedsManualError(AppError):
     code = "needs_manual"
+
+
+class CtbExecutorUnavailableError(NeedsManualError):
+    code = "ctb_executor_unavailable"
+
+
+class ContentCorrespondenceUnverifiedError(NeedsReviewError):
+    code = "full_content_correspondence_unverified"
 
 
 class CancelledError(AppError):

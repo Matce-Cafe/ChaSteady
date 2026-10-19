@@ -2,6 +2,7 @@
 import copy
 import hashlib
 import importlib
+import json
 import math
 import queue
 import re
@@ -14,16 +15,18 @@ from .errors import AppError, CancelledError, NeedsManualError, NeedsReviewError
 from .diagnostics import checkpoint
 from .job_store import JobStore, PreferenceStore
 from .models import RequestValidationError, validate_job_request
-from .owned_processes import OwnedProcessRegistry, get_active_registry, registry_scope
+from .owned_processes import OwnedProcessError, OwnedProcessRegistry, get_active_registry, registry_scope
 from .paths import UnsafePathError, ensure_not_alias, path_is_within, resolve_local_input, same_file_or_alias, validate_owned_file
+from .runtime_context import RunnerContext
 
 
 class JobRunner:
     """Run at most one accepted job at a time on one owned worker thread."""
 
-    def __init__(self, store: JobStore, preferences: PreferenceStore):
+    def __init__(self, store: JobStore, preferences: PreferenceStore, *, resource_root: Optional[Path] = None):
         self.store = store
         self.preferences = preferences
+        self.resource_root = Path(resource_root or store.app_root).resolve(strict=True)
         self._queue = queue.Queue()
         self._events: Dict[str, threading.Event] = {}
         self._registries: Dict[str, OwnedProcessRegistry] = {}
@@ -32,14 +35,20 @@ class JobRunner:
         self._cache_bindings: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.RLock()
         self._stopping = False
+        self._shutdown_sent = False
+        self._ownership_fault: Optional[str] = None
         self._thread = threading.Thread(target=self._work, name="cha-stabilizer-job-worker", daemon=True)
         self._thread.start()
 
     def submit(self, payload: Any) -> Dict[str, Any]:
         normalized = validate_job_request(payload)
         kind, request = normalized["kind"], normalized["request"]
+        if kind == "stabilize_continue":
+            request = self._continuation_request(request)
         resolved_request, input_paths = self._resolve_inputs(kind, request)
         with self._lock:
+            if self._ownership_fault:
+                raise OwnedProcessError(self._ownership_fault)
             if self._stopping:
                 raise RuntimeError("local worker is shutting down")
             cache_binding = None
@@ -53,12 +62,29 @@ class JobRunner:
             self._queue.put((job_id, input_paths))
             return job
 
+    def _continuation_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        parent_id = request["parent_job_id"]
+        parent = self.store.get(parent_id)
+        if parent["kind"] not in ("stabilize", "stabilize_continue") or parent["state"] not in ("needs_manual", "needs_review"):
+            raise RequestValidationError("continuation requires a terminal stabilize parent needing manual action or review")
+        identity = self.store.get_workflow_identity(parent_id)
+        if not isinstance(identity.get("original"), dict) or not identity["original"].get("sha256"):
+            raise RequestValidationError("parent has no immutable full source identity; submit a new stabilize job")
+        parent_request = self.store.get_request(parent_id)
+        # 只从父任务读取原片和参数；客户端的续跑请求没有覆盖这些值的通道。
+        return {
+            "original": parent_request["original"], "profile": parent_request["profile"],
+            "parameters": copy.deepcopy(parent_request["parameters"]), "full_source": True,
+            "parent_job_id": parent_id, "manual_ctb": copy.deepcopy(request["manual_ctb"]),
+            "_parent_identity": copy.deepcopy(identity),
+        }
+
     def _resolve_inputs(self, kind: str, request: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Path]]:
-        resolved = dict(request)
+        resolved = copy.deepcopy(request)
         path_fields: List[str]
         if kind == "fusion":
             path_fields = ["original", "ctb", "reference", "legacy_quiet_cache", "legacy_reference_cache"]
-        elif kind in ("gyroflow_export", "catalyst_assisted"):
+        elif kind in ("gyroflow_export", "catalyst_assisted", "stabilize", "stabilize_continue"):
             path_fields = ["original", "project_template"] if kind == "gyroflow_export" else ["original"]
         else:
             path_fields = ["source"]
@@ -73,6 +99,13 @@ class JobRunner:
                 raise RequestValidationError(str(exc)) from exc
             resolved[field] = str(path)
             inputs.append(path)
+        if kind == "stabilize_continue":
+            try:
+                manual_path = resolve_local_input(resolved["manual_ctb"]["source"], "manual_ctb.source")
+            except UnsafePathError as exc:
+                raise RequestValidationError(str(exc)) from exc
+            resolved["manual_ctb"]["source"] = str(manual_path)
+            inputs.append(manual_path)
         # Distinct roles must not silently refer to one aliased file.
         for index, first in enumerate(inputs):
             for second in inputs[index + 1:]:
@@ -146,32 +179,48 @@ class JobRunner:
             registry = self._registries.get(job_id)
             self.store.update_progress(job_id, "cancellation_requested", None, "Cancellation requested; stopping only this job's owned child processes.")
         if registry is not None:
-            registry.terminate_all()
+            try:
+                registry.terminate_all()
+                registry.assert_quiescent()
+            except AppError:
+                self._ownership_fault = "owned_cleanup_unconfirmed"
+                raise
         return self.store.get(job_id)
 
     def shutdown(self, wait: Optional[float] = 3.0) -> None:
+        failures = []
         with self._lock:
-            if not self._stopping:
-                self._stopping = True
-                for job_id, event in list(self._events.items()):
+            self._stopping = True
+            for job_id, event in list(self._events.items()):
+                event.set()
+                try:
+                    job = self.store.get(job_id)
+                except (KeyError, AppError):
+                    continue
+                if job["state"] == "queued":
                     try:
-                        job = self.store.get(job_id)
-                    except KeyError:
-                        continue
-                    if job["state"] == "queued":
-                        event.set()
-                        try:
-                            self.store.cancel_queued(job_id)
-                        except ValueError:
-                            pass
-                    elif job["state"] == "running":
-                        event.set()
-                        registry = self._registries.get(job_id)
-                        if registry is not None:
-                            registry.terminate_all()
-                self._queue.put(None)
+                        self.store.cancel_queued(job_id)
+                    except (OSError, ValueError, TypeError):
+                        self._write_failure_summary(job_id)
+            registries = list(self._registries.items())
+        try:
+            for job_id, registry in registries:
+                try:
+                    registry.terminate_all()
+                    registry.assert_quiescent()
+                except (AppError, OSError):
+                    failures.append(job_id)
+                    self._ownership_fault = "shutdown_cleanup_unconfirmed"
+        finally:
+            # 未确认的 registry 仍持有原对象；哨兵不能被第一个清理异常跳过。
+            with self._lock:
+                if not self._shutdown_sent:
+                    self._queue.put(None)
+                    self._shutdown_sent = True
         if self._thread is not threading.current_thread() and self._thread.is_alive():
             self._thread.join(None if wait is None else max(0.0, wait))
+        if failures:
+            raise OwnedProcessError("shutdown_cleanup_unconfirmed")
 
     def _work(self) -> None:
         while True:
@@ -182,37 +231,57 @@ class JobRunner:
             with self._lock:
                 try:
                     job = self.store.get(job_id)
-                except KeyError:
+                except (KeyError, AppError):
                     self._cache_bindings.pop(job_id, None)
                     continue
                 if job["state"] != "queued":
                     self._cache_bindings.pop(job_id, None)
                     continue
                 event = self._events[job_id]
+                if self._ownership_fault:
+                    message = "Owned process cleanup remains unconfirmed; no new engine was started."
+                    self._safe_set_state(job_id, "failed", message=message,
+                                         error={"code": "processing_failed", "message": message})
+                    self._cache_bindings.pop(job_id, None)
+                    continue
                 if event.is_set():
                     try:
                         self.store.cancel_queued(job_id)
-                    except ValueError:
-                        pass
+                    except (OSError, ValueError, TypeError):
+                        self._write_failure_summary(job_id)
                     self._cache_bindings.pop(job_id, None)
                     continue
                 try:
                     self.store.set_state(job_id, "running", stage="starting", progress=None, message="Starting the local worker.")
-                except ValueError:
+                except (OSError, ValueError, TypeError):
+                    self._write_failure_summary(job_id)
                     continue
                 checkpoint("job.running_state_written")
                 registry = OwnedProcessRegistry(event)
                 checkpoint("job.registry_constructed")
                 self._registries[job_id] = registry
+            cleanup_confirmed = False
             try:
                 with registry_scope(registry):
                     checkpoint("job.registry_scope_entered")
                     self._execute(job_id, input_paths, event)
+            except AppError:
+                self._ownership_fault = "owned_cleanup_unconfirmed"
+                self._safe_set_state(job_id, "failed", message="Owned process cleanup remains unconfirmed.",
+                                     error={"code": "processing_failed", "message": "Owned process cleanup remains unconfirmed."})
             finally:
-                if registry.snapshot():
-                    registry.terminate_all()
+                try:
+                    if registry.snapshot() or registry._cleanup_error:
+                        registry.terminate_all()
+                    registry.assert_quiescent()
+                    cleanup_confirmed = True
+                except (AppError, OSError):
+                    self._ownership_fault = "owned_cleanup_unconfirmed"
+                    self._safe_set_state(job_id, "failed", message="Owned process cleanup remains unconfirmed.",
+                                         error={"code": "processing_failed", "message": "Owned process cleanup remains unconfirmed."})
                 with self._lock:
-                    self._registries.pop(job_id, None)
+                    if cleanup_confirmed:
+                        self._registries.pop(job_id, None)
                     self._cache_bindings.pop(job_id, None)
 
     def _execute(self, job_id: str, input_paths: List[Path], cancel_event: threading.Event) -> None:
@@ -227,7 +296,7 @@ class JobRunner:
             workdir = self.store.get_run_dir(job_id)
             checkpoint("job.get_run_dir.end")
             checkpoint("job.toolchain.begin")
-            toolchain = self._toolchain()
+            toolchain = self._toolchain(job_id)
             checkpoint("job.toolchain.end")
             if kind == "fusion" and request.get("mode") == "cached_v9":
                 with self._lock:
@@ -248,7 +317,12 @@ class JobRunner:
                 return
             if cancel_event.is_set():
                 raise CancelledError("Job was cancelled before processing began.")
-            if kind == "fusion":
+            if kind in ("stabilize", "stabilize_continue"):
+                module = importlib.import_module(".core.stabilize", package="cha_stabilizer")
+                action = lambda request, workdir, tools, cancel, notify: module.run_stabilize(
+                    request, workdir, tools, cancel, notify, store=self.store, job_id=job_id,
+                )
+            elif kind == "fusion":
                 checkpoint("job.adapter_import.fusion.begin")
                 module = importlib.import_module(".core.pipeline", package="cha_stabilizer")
                 checkpoint("job.adapter_import.fusion.end")
@@ -288,7 +362,9 @@ class JobRunner:
                     raise AppError("Worker returned before its owned subprocesses exited.")
             if cancel_event.is_set():
                 raise CancelledError("Cancellation requested; owned work was stopped.")
-            self._finish_result(job_id, result, input_paths, cancel_event)
+            result_persisted = self._finish_result(job_id, result, input_paths, cancel_event)
+            if result_persisted and kind in ("stabilize", "stabilize_continue") and self.store.get(job_id)["state"] == "verified_media":
+                self._schedule_preview(job_id)
         except CancelledError as exc:
             self._safe_set_state(job_id, "cancelled", stage="cancelled", message=exc.message)
         except NeedsManualError as exc:
@@ -311,6 +387,12 @@ class JobRunner:
                                  error={"code": exc.code, "message": message},
                                  result={"details": public_details, "retained_artifact_ids": retained})
         except AppError as exc:
+            if (getattr(exc, "details", {}) or {}).get("ownership_unconfirmed"):
+                self._ownership_fault = "owned_cleanup_unconfirmed"
+                message = "Owned process startup or cleanup could not be confirmed; no completion is claimed."
+                self._safe_set_state(job_id, "failed", stage="owned_cleanup_unconfirmed", message=message,
+                                     error={"code": "processing_failed", "message": message})
+                return
             if cancel_event.is_set():
                 self._safe_set_state(job_id, "cancelled", stage="cancelled", message="Cancellation requested; owned work was stopped.")
                 return
@@ -401,7 +483,10 @@ class JobRunner:
         result: Any,
         input_paths: List[Path],
         cancel_event: Optional[threading.Event] = None,
-    ) -> None:
+    ) -> bool:
+        registry = self._registries.get(job_id) or get_active_registry()
+        if registry is not None:
+            registry.assert_quiescent()
         if not isinstance(result, dict):
             raise AppError("Worker returned an invalid result; it was not marked complete.")
         outputs = result.get("outputs")
@@ -458,7 +543,7 @@ class JobRunner:
         validation = result.get("validation")
         if not isinstance(validation, dict):
             validation = {}
-        validation = _public_error_details(validation)
+        validation = _validation_for_record(validation)
         if not isinstance(validation, dict):
             validation = {}
         validation_state = validation.get("status")
@@ -467,6 +552,15 @@ class JobRunner:
             validation.get("verified_media") is True
             or validation_state == "verified_media"
         )
+        if kind in ("stabilize", "stabilize_continue"):
+            workflow = self.store.get(job_id).get("workflow", {})
+            explicitly_verified = bool(
+                explicitly_verified and workflow.get("stages")
+                and all(stage.get("state") == "passed" for stage in workflow["stages"])
+                and scope == "stabilize_full_source_declared_gates_and_media"
+                and validation.get("content_correspondence_verified") is True
+                and validation.get("fresh_measurement_verified") is True
+            )
         if explicitly_verified and isinstance(scope, str) and scope.strip():
             state = "verified_media"
             message = "Media evidence verified within the reported scope; this is not a perceptual winner or original-FOV certificate."
@@ -481,8 +575,35 @@ class JobRunner:
         }
         if cancel_event is not None and cancel_event.is_set():
             raise CancelledError("Cancellation requested; owned work was stopped.")
-        self._safe_set_state(job_id, state, stage=state, progress=1.0 if state == "verified_media" else None,
-                             message=message, error=error, result=public_result)
+        return self._safe_set_state(job_id, state, stage=state, progress=1.0 if state == "verified_media" else None,
+                                    message=message, error=error, result=public_result)
+
+    def _schedule_preview(self, parent_job_id: str) -> None:
+        # 父任务不等待同队列子任务；预览失败与父任务媒体验收分别可见。
+        with self._lock:
+            parent = self.store.get(parent_job_id)
+            if parent.get("workflow", {}).get("preview", {}).get("job_id"):
+                return
+            try:
+                if self._stopping:
+                    self.store.set_workflow_preview(parent_job_id, "blocked")
+                    return
+                source = next((item for item in parent["artifacts"] if item.get("kind") == "stabilized_media"
+                               and item.get("mime") == "video/mp4"), None)
+                if source is None:
+                    self.store.set_workflow_preview(parent_job_id, "blocked")
+                    return
+                child = self.store.create_linked_preview(parent_job_id, source["id"])
+                child_id = child["id"]
+                request = self.store.get_request(child_id)
+                self._events[child_id] = threading.Event()
+                self._queue.put((child_id, [Path(request["source"])]))
+            except (OSError, ValueError, KeyError, TypeError, AppError):
+                # 父媒体终态不改写成失败；预览状态也写不回时必须明确锁存存储故障。
+                try:
+                    self.store.set_workflow_preview(parent_job_id, "failed")
+                except (OSError, ValueError, KeyError, TypeError, AppError):
+                    self.store.mark_storage_unavailable(parent_job_id)
 
     def _on_event(self, job_id: str, cancel_event: threading.Event, stage: Any, progress: Any, message: Any) -> None:
         if cancel_event.is_set():
@@ -493,17 +614,52 @@ class JobRunner:
         safe_message = _public_text(str(message or "Processing."))
         self.store.update_progress(job_id, safe_stage, progress, safe_message)
 
-    def _safe_set_state(self, job_id: str, state: str, **kwargs: Any) -> None:
+    def _write_failure_summary(self, job_id: str) -> bool:
+        # 正常状态写入失败后只尝试一次小型失败摘要；不能循环重试或伪造已保存的终态。
         try:
             current = self.store.get(job_id)["state"]
-            if current == "running":
-                self.store.set_state(job_id, state, **kwargs)
-            elif current == "queued" and state in ("cancelled", "failed"):
-                self.store.set_state(job_id, state, **kwargs)
-        except (KeyError, ValueError):
-            pass
+        except (KeyError, AppError):
+            return False
+        if current not in ("queued", "running"):
+            return False
+        message = "The completion record could not be saved; this task was not marked verified."
+        try:
+            self.store.set_state(job_id, "failed", stage="record_write_failed", message=message,
+                                 error={"code": "processing_failed", "message": message},
+                                 result={"reason": "completion_record_persistence_failed"})
+            return True
+        except (OSError, ValueError, TypeError):
+            self.store.mark_storage_unavailable(job_id)
+            return False
 
-    def _toolchain(self) -> Dict[str, Any]:
+    def _safe_set_state(self, job_id: str, state: str, **kwargs: Any) -> bool:
+        if state in ("verified_media", "cancelled"):
+            registry = self._registries.get(job_id) or get_active_registry()
+            if registry is not None:
+                try:
+                    if state == "cancelled":
+                        registry.terminate_all()
+                    registry.assert_quiescent()
+                except (AppError, OSError):
+                    self._ownership_fault = "owned_cleanup_unconfirmed"
+                    state = "failed"
+                    message = "Owned process cleanup remains unconfirmed; cancellation or completion was not certified."
+                    kwargs = {"stage": "owned_cleanup_unconfirmed", "message": message,
+                              "error": {"code": "processing_failed", "message": message}}
+        try:
+            current = self.store.get(job_id)["state"]
+        except (KeyError, AppError):
+            return False
+        if current != "running" and not (current == "queued" and state in ("cancelled", "failed")):
+            return False
+        try:
+            self.store.set_state(job_id, state, **kwargs)
+            return True
+        except (OSError, ValueError, TypeError):
+            self._write_failure_summary(job_id)
+            return False
+
+    def _toolchain(self, job_id: str = "") -> Dict[str, Any]:
         checkpoint("toolchain.preferences_get.begin")
         preference_value = self.preferences.get()
         checkpoint("toolchain.preferences_get.end")
@@ -521,9 +677,11 @@ class JobRunner:
             except (OSError, ValueError):
                 result[name] = None
             checkpoint("toolchain.path.{}.end".format(name))
-        result["development_identity"] = (
-            self.preferences.development_config["gyroflow_identity"]
-            if not self.preferences.desktop else {}
+        if not self.preferences.desktop:
+            result["development_identity"] = copy.deepcopy(self.preferences.development_config["gyroflow_identity"])
+        result["_runner_context"] = RunnerContext(
+            data_root=self.store.app_root, runs_root=self.store.runs_root, resource_root=self.resource_root,
+            job_id=job_id, production=self.preferences.desktop,
         )
         return result
 
@@ -543,31 +701,85 @@ def _public_text(value: str, limit: int = 1000) -> str:
     return text[:limit]
 
 
-def _public_error_details(value: Any, key: str = "", depth: int = 0) -> Any:
+def _public_error_details(value: Any, key: str = "", depth: int = 0, _budget: Optional[Dict[str, Any]] = None) -> Any:
+    root = _budget is None
+    if _budget is None:
+        _budget = {"bytes": 65536, "nodes": 2048, "truncated": False}
     key_name = str(key).casefold()
-    if key_name in _PRIVATE_DETAIL_KEYS or "token" in key_name or "nonce" in key_name or "path" in key_name or key_name.endswith("_source"):
+    if (key_name in _PRIVATE_DETAIL_KEYS or "token" in key_name or "nonce" in key_name or "path" in key_name
+            or (key_name.endswith("_source") and not (key == "full_source" and type(value) is bool))):
         return None
     if isinstance(value, Path):
         return None
-    if depth > 8:
+    if depth > 8 or _budget["bytes"] <= 0 or _budget["nodes"] <= 0:
+        _budget["truncated"] = True
         return None
+    _budget["nodes"] -= 1
     if isinstance(value, dict):
         clean = {}
-        for item_key, item_value in list(value.items())[:100]:
+        _budget["bytes"] -= 2
+        for index, (item_key, item_value) in enumerate(value.items()):
+            if index >= 100 or _budget["bytes"] <= 0 or _budget["nodes"] <= 0:
+                _budget["truncated"] = True
+                break
             safe_key = _public_text(str(item_key), 80)
-            item = _public_error_details(item_value, str(item_key), depth + 1)
+            _budget["bytes"] -= len(json.dumps(safe_key, ensure_ascii=False).encode("utf-8", errors="replace")) + 2
+            item = _public_error_details(item_value, str(item_key), depth + 1, _budget)
             if item is not None:
                 clean[safe_key] = item
+        if root and _budget["truncated"]:
+            clean["details_truncated"] = True
         return clean
     if isinstance(value, (list, tuple)):
-        return [item for item in (_public_error_details(entry, depth=depth + 1) for entry in list(value)[:100]) if item is not None]
+        result = []
+        _budget["bytes"] -= 2
+        for index, entry in enumerate(value):
+            if index >= 100 or _budget["bytes"] <= 0 or _budget["nodes"] <= 0:
+                _budget["truncated"] = True
+                break
+            item = _public_error_details(entry, depth=depth + 1, _budget=_budget)
+            if item is not None:
+                result.append(item)
+                _budget["bytes"] -= 1
+        return result
     if isinstance(value, str):
-        return _public_text(value)
-    if value is None or isinstance(value, (bool, int, float)):
+        result = _public_text(value)
+    elif value is None or isinstance(value, (bool, int, float)):
         if isinstance(value, float) and not math.isfinite(value):
             return None
-        return value
-    return _public_text(str(value))
+        result = "[large integer omitted]" if isinstance(value, int) and value.bit_length() > 256 else value
+    else:
+        result = _public_text(str(value))
+    cost = len(json.dumps(result, ensure_ascii=False, allow_nan=False).encode("utf-8", errors="replace"))
+    if cost > _budget["bytes"]:
+        _budget["truncated"] = True
+        _budget["bytes"] = 0
+        return None
+    _budget["bytes"] -= cost
+    return result
+
+
+def _validation_for_record(value: Dict[str, Any]) -> Dict[str, Any]:
+    # 门禁事实先保留；任意多流 tags 留在 own manifest，不复制进受限 job.json。
+    keys = ("status", "verified_media", "scope", "frame_count_verified", "full_decode_passed", "full_decode_verified",
+            "decode_scope", "frame_timestamp_spacing_verified", "trim_mapping_verified", "content_correspondence_verified",
+            "fresh_measurement_verified", "profile_post_matches_pre", "tool_directory_post_matches_pre",
+            "template_source_unchanged", "template_snapshot_unchanged", "project_input_unchanged",
+            "template_used_sha256", "project_input_sha256_before", "original_fov_verified", "perceptual_winner_claimed")
+    result = {key: value[key] for key in keys if key in value and (value[key] is None or isinstance(value[key], (str, bool, int, float)))}
+    metadata = value.get("metadata")
+    if isinstance(metadata, dict):
+        fields = ("width", "height", "fps", "frames", "duration", "duration_seconds", "video_codec", "pixel_format", "audio_codec",
+                  "bit_depth", "start_time", "time_base", "color_transfer", "color_primaries", "color_space", "cfr_status")
+        result["metadata"] = {key: metadata[key] for key in fields if key in metadata and (metadata[key] is None or isinstance(metadata[key], (str, bool, int, float)))}
+    for key in ("frame_timestamps", "frame_mapping", "decode"):
+        details = value.get(key)
+        if isinstance(details, dict):
+            result[key] = {item: content for item, content in list(details.items())[:32]
+                           if content is None or isinstance(content, (str, bool, int, float))}
+    result["record_summary_only"] = True
+    clean = _public_error_details(result)
+    return clean if isinstance(clean, dict) else {}
 
 
 def _fold_path(value: Any) -> str:

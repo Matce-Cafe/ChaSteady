@@ -3,11 +3,34 @@
 The public API deliberately accepts paths and typed options, never commands,
 output destinations, or per-job executable overrides.
 """
+import datetime
 import math
+import uuid
 from typing import Any, Dict, List, Mapping, Optional
 
 
-JOB_KINDS = frozenset(("fusion", "preview", "gyroflow_export", "catalyst_assisted", "validate"))
+STABILIZE_PROFILE = "recommended-v1"
+STABILIZE_PARAMETERS = {
+    "quiet_sigma_seconds": 1.3,
+    "reference_fov": 1.0,
+    "alignment_tau_seconds": 0.12,
+    "minimum_weight_transition_seconds": 0.30,
+    "weight_corner_speed": 12.5,
+    "anchor_corner_speed": 5.0,
+}
+STABILIZE_PARAMETER_BOUNDS = {
+    "quiet_sigma_seconds": {"min": 0.0, "min_exclusive": True, "max": 10.0, "unit": "seconds"},
+    "reference_fov": {"min": 1.0, "max": 4.0, "unit": "analysis_fov_multiplier"},
+    "alignment_tau_seconds": {"min": 0.01, "max": 2.0, "unit": "seconds"},
+    "minimum_weight_transition_seconds": {"min": 0.04, "max": 5.0, "unit": "seconds"},
+    "weight_corner_speed": {"min": 0.0, "min_exclusive": True, "max": 100.0, "unit": "analysis_1280px_per_second"},
+    "anchor_corner_speed": {"min": 0.0, "min_exclusive": True, "max": 100.0, "unit": "analysis_1280px_per_second"},
+}
+STABILIZE_STAGES = (
+    "source_acceptance", "capability_preflight", "ctb", "gf", "correspondence",
+    "fresh_measurement", "fusion", "render", "final_validation",
+)
+JOB_KINDS = frozenset(("fusion", "preview", "gyroflow_export", "catalyst_assisted", "validate", "stabilize", "stabilize_continue"))
 JOB_STATES = frozenset(("queued", "running", "needs_manual", "needs_review", "failed", "cancelled", "verified_media"))
 TERMINAL_STATES = frozenset(("needs_manual", "needs_review", "failed", "cancelled", "verified_media"))
 THEME_MODES = frozenset(("system", "light", "dark"))
@@ -82,11 +105,62 @@ def validate_job_request(payload: Any) -> Dict[str, Any]:
         raise RequestValidationError("kind must be one of the supported job kinds")
     request = _object(raw.get("request", {}), "request")
 
+    if kind == "stabilize":
+        _reject_unknown(request, {"original", "profile", "full_source", "parameters"}, "stabilize request")
+        profile = request.get("profile", STABILIZE_PROFILE)
+        if profile != STABILIZE_PROFILE:
+            raise RequestValidationError("profile must be recommended-v1")
+        if request.get("full_source", True) is not True:
+            raise RequestValidationError("stabilize currently requires full_source=true")
+        parameters = _object(request.get("parameters", {}), "parameters")
+        _reject_unknown(parameters, set(STABILIZE_PARAMETERS), "parameters")
+        normalized_parameters = dict(STABILIZE_PARAMETERS)
+        for key, value in parameters.items():
+            number = _finite_number(value, key)
+            bounds = STABILIZE_PARAMETER_BOUNDS[key]
+            if number < bounds["min"] or number > bounds["max"] or (
+                bounds.get("min_exclusive") and number == bounds["min"]
+            ):
+                raise RequestValidationError("{} is outside the supported range".format(key))
+            normalized_parameters[key] = number
+        return {"kind": kind, "request": {
+            "original": _path_text(request.get("original"), "original"),
+            "profile": profile, "full_source": True, "parameters": normalized_parameters,
+        }}
+
+    if kind == "stabilize_continue":
+        _reject_unknown(request, {"parent_job_id", "manual_ctb"}, "stabilize_continue request")
+        parent_id = request.get("parent_job_id")
+        try:
+            if not isinstance(parent_id, str) or str(uuid.UUID(parent_id)) != parent_id:
+                raise ValueError("noncanonical UUID")
+        except (ValueError, AttributeError, TypeError) as exc:
+            raise RequestValidationError("parent_job_id must be a canonical UUID") from exc
+        manual = _object(request.get("manual_ctb"), "manual_ctb")
+        _reject_unknown(manual, {"source", "origin_seconds", "declared_at"}, "manual_ctb")
+        origin = _finite_number(manual.get("origin_seconds"), "manual_ctb.origin_seconds")
+        if origin < 0:
+            raise RequestValidationError("manual_ctb.origin_seconds must be non-negative")
+        declared_at = manual.get("declared_at")
+        try:
+            if not isinstance(declared_at, str) or len(declared_at) > 40 or not declared_at.endswith("Z"):
+                raise ValueError("UTC declaration required")
+            declared = datetime.datetime.fromisoformat(declared_at[:-1] + "+00:00")
+            if declared.utcoffset() != datetime.timedelta(0):
+                raise ValueError("UTC declaration required")
+        except (ValueError, TypeError) as exc:
+            raise RequestValidationError("manual_ctb.declared_at must be an ISO8601 UTC Z timestamp") from exc
+        return {"kind": kind, "request": {"parent_job_id": parent_id, "manual_ctb": {
+            "source": _path_text(manual.get("source"), "manual_ctb.source"),
+            "origin_seconds": origin, "declared_at": declared_at,
+        }}}
+
     if kind == "fusion":
         allowed = {
             "original", "ctb", "reference", "start", "end", "ctb_origin",
             "reference_origin", "reference_intervals", "reference_fov", "quiet_sigma_seconds",
             "mode", "legacy_quiet_cache", "legacy_reference_cache",
+            "alignment_tau_seconds", "minimum_weight_transition_seconds", "weight_corner_speed", "anchor_corner_speed",
         }
         _reject_unknown(request, allowed, "fusion request")
         result: Dict[str, Any] = {
@@ -120,10 +194,19 @@ def validate_job_request(payload: Any) -> Dict[str, Any]:
         if quiet_sigma <= 0 or quiet_sigma > 10.0:
             raise RequestValidationError("quiet_sigma_seconds must be greater than 0 and at most 10")
         result["quiet_sigma_seconds"] = quiet_sigma
+        for key in ("alignment_tau_seconds", "minimum_weight_transition_seconds", "weight_corner_speed", "anchor_corner_speed"):
+            if key in request:
+                number = _finite_number(request[key], key)
+                bounds = STABILIZE_PARAMETER_BOUNDS[key]
+                if number < bounds["min"] or number > bounds["max"] or (bounds.get("min_exclusive") and number == bounds["min"]):
+                    raise RequestValidationError("{} is outside the supported range".format(key))
+                result[key] = number
         mode = request.get("mode", "fresh")
         if mode not in ("fresh", "cached_v9"):
             raise RequestValidationError("mode must be fresh or cached_v9")
         result["mode"] = mode
+        if mode == "cached_v9" and any(key in request for key in ("alignment_tau_seconds", "minimum_weight_transition_seconds", "weight_corner_speed", "anchor_corner_speed")):
+            raise RequestValidationError("controller parameter overrides require fresh mode")
         quiet_cache = _path_text(request.get("legacy_quiet_cache"), "legacy_quiet_cache", optional=True)
         reference_cache = _path_text(request.get("legacy_reference_cache"), "legacy_reference_cache", optional=True)
         if mode == "cached_v9" and (quiet_cache is None or reference_cache is None):
