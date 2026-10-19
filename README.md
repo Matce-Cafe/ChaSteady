@@ -86,7 +86,19 @@ CTB 与 GF 都读取同一原片；GF 不读取 CTB 输出，也不能先切掉 
 
 公开源码仓库：[Matce-Cafe/ChaSteady](https://github.com/Matce-Cafe/ChaSteady)。Actions 手动触发，不因每次 push 自动发布，也不自动创建 GitHub Release。失败历史不被后续成功改绿；专项检查成功不等于生成完整包。
 
+以下早期构建与 UI 专项的失败／待验收描述按当时时点保留：
+
 本轮首次 0.2.0 完整构建在解释器／进程管理前置契约处失败，未产生新包；相关 CI 运行时交接、批处理入口与清理已做源码修复和有界验证。后续 UI 专项检查在测试夹具路径守卫处失败，尚未执行 Flutter；仅规范化夹具后本地 93 项纯回归通过，没有放宽生产校验。随后新提交的 [UI 专项检查](https://github.com/Matce-Cafe/ChaSteady/actions/runs/39228160625) 已通过运行时交接、Flutter 身份及界面分析／测试；完整原生构建与打包未在该专项执行。旧 0.1 包不是这些检查的产物，新的 Windows 包仍待整合与验收。
+
+### 2026-10-19 后续：Full 构建与本地数据交付
+
+[完整构建 39233475590](https://github.com/Matce-Cafe/ChaSteady/actions/runs/39233475590)／attempt 1 已成功，实际 CI 源码为 `7082e0676510db4e0251e59892f9a901bbfdaec3`；唯一 artifact 为 `12180437313`（`ChaSteady-0.2.0+2-Windows-x64-39233475590-1`）。产品版本为 `0.2.0+2`，主程序 PE 的数值 FileVersion／ProductVersion 均为 `0.2.0.2`，字符串均为 `0.2.0+2`。
+
+artifact 内的应用 ZIP `ChaSteady-Windows-x64.zip` 为 `157127435 B`，SHA-256 为 `46c09c6fa7e96a192a9f443e71b971d9681a2129e6236266b9e46acbf9f97221`，不是外层下载传输容器的摘要。1228 个文件的数据审计、受控提取及完整逐文件摘要回比通过；独立测试副本受控提取保留 `ChaSteady/` 前缀，1228 个文件合计 `383881616 B`；另行本地交付应用 ZIP 及清单／摘要。未启动应用、Worker 或 GUI。
+
+同包真实 GUI 尚未验收；CTB 自动导出仍为 0，GF 生产身份／模板管理和 strict 全长 fresh V9 仍阻塞。当前本机仅对包内一个 Python DLL 取得 fresh `Valid`；manifest 的源签名状态仍为 `null`，不回填。主程序／整包未签名、未获法律分发认证，没有 GitHub Release／Marketplace 发布；私有数学 golden 未上传 CI。
+
+本段是构建之后的文档跟进，不是该 run 的构建源码；后续文档提交不改变包的 `7082` 来源，也不重写原包内文档、manifest 或 BUILD_STATUS。
 
 产品版本以 [ui/pubspec.yaml](ui/pubspec.yaml) 为准；Worker 组件版、通信协议及 Python 运行时版分别标记。未签名、构建或文件审计成功不等于完整本机验收。核对来源和摘要，不关闭 Defender／SmartScreen。
 

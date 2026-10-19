@@ -4,7 +4,7 @@ The GitHub Actions workflow is **manual only** (`workflow_dispatch`) and builds 
 
 ## Product version and run identity
 
-The 2026-10-19 development candidate is **0.2.0+2**, read from the bounded, validated `ui/pubspec.yaml`. This documentation does not claim a completed 0.2.0 cloud build or desktop acceptance. The Worker component version and stdio protocol are separate identities.
+The 2026-10-19 development candidate is **0.2.0+2**, read from the bounded, validated `ui/pubspec.yaml`. Full run **39233475590 / attempt 1** has completed successfully from source `7082e0676510db4e0251e59892f9a901bbfdaec3`; artifact data auditing and controlled local extraction have also passed, but same-package desktop acceptance remains unverified. See the dated follow-up below; subsequent documentation commits are not the source of that build. The Worker component version and stdio protocol are separate identities.
 
 Workflow titles distinguish **Full Windows build**, **UI checks**, and **Window diagnostic**, with the source ref, full commit SHA and attempt. GitHub evaluates `run-name` before checkout, so it does not invent a product version there. After checkout, the product version appears in the job summary and outer artifact name; the three inner payload filenames stay unchanged.
 
@@ -26,6 +26,8 @@ All toolchain updates happen only on the disposable hosted runner. The workflow 
 ## Build and validation scope
 
 `tools/ci_provision_flutter.py` downloads Flutter 3.47.7 stable only from Google's official Flutter release bucket. It rejects redirects, verifies the pinned archive byte count and SHA-256 before ZIP inspection, audits bounded safe members, and extracts to a separate new UUID directory. The font helper fetches the Noto Sans SC variable font by its pinned Google Fonts Git blob through the official GitHub API, verifies Git blob SHA-1/SHA-256/size and TrueType structure, and puts it only in an ephemeral build directory. The TTF binary is intentionally not part of the public source checkout; its SIL Open Font License and provenance text remain available. Full run `39034525328` stopped before Flutter/toolchain provisioning when the GitHub API request returned explicit HTTP 403 rate-limit exhaustion. The font step now supplies only its ephemeral read-only Actions token through a step-scoped environment variable, not command arguments or persistent Git credentials. The helper attaches it only after validating the same exact `api.github.com` blob URL, refuses redirects, and never includes the header/token in receipts or diagnostics. No alternate host, relaxed hash/TLS check or local PAT fallback is used; authentication does not certify the pending build. Follow-up run `39034937054` failed locally before making the font request because the initial credential-format guard assumed a particular opaque token encoding. The guard now accepts bounded ASCII RFC 6750 bearer-token syntax (including periods, hyphens and padding) up to 8 KiB while still rejecting whitespace, control characters and non-ASCII text. No token contents are inspected or published to infer its actual encoding; the same URL, redirect and cryptographic checks remain mandatory.
+
+以下早期失败、修复及 UI-only 结果按当时时点保留；其中“完整构建仍待复验”等描述不回填为后续 Full 成功。新的完整构建与数据交付结果另列于同日后续记录。
 
 ### 2026-10-19 开发候选预检失败记录
 
@@ -50,6 +52,16 @@ UI 检查 [39225218101](https://github.com/Matce-Cafe/ChaSteady/actions/runs/392
 UI 检查 [39228160625](https://github.com/Matce-Cafe/ChaSteady/actions/runs/39228160625)／attempt 1 绑定新提交 1b5419076f819b3c7a11a27e9bbd1922f29fbbac。官方 run 与 job API 均为 completed／success；CI guard、fresh 运行时创建与交接、字体和 Flutter SDK 校验、Flutter executable identity、UI analyze／test 步骤均成功。该次没有重试两个旧失败版本，生产路径守卫和受管进程契约保持不变。
 
 这是 UI-only 验证：Microsoft 更新、Windows/Web release 编译、Worker 测试／冻结、打包及上传步骤按设计 skipped，artifact 清单为 0。它确认本次早期 UI 门禁通过，不是完整云构建、新 Windows 包、原生最大化或同包 GUI 验收。
+
+### 2026-10-19 后续：Full 构建成功与本地数据交付
+
+[Full run 39233475590](https://github.com/Matce-Cafe/ChaSteady/actions/runs/39233475590)／attempt 1 的官方 run／job 结果为 completed／success，实际构建源码为 `7082e0676510db4e0251e59892f9a901bbfdaec3`，不是旧失败版本的 retry。后续文档提交不等于该 CI 源码；原包内文档、manifest 和 BUILD_STATUS 不因此改写。
+
+- 唯一 artifact 为 `12180437313`，名称为 `ChaSteady-0.2.0+2-Windows-x64-39233475590-1`。产品版本为 `0.2.0+2`；主程序 PE 数值 FileVersion／ProductVersion 均为 `0.2.0.2`，静态读取的版本字符串均为 `0.2.0+2`。
+- artifact 内应用 ZIP `ChaSteady-Windows-x64.zip` 为 `157127435 B`，SHA-256 为 `46c09c6fa7e96a192a9f443e71b971d9681a2129e6236266b9e46acbf9f97221`。这是内层应用 ZIP，不是 GitHub artifact 下载传输容器；三份 inner asset 仍使用下文固定名称。
+- 包内 1228 个文件的安全路径、CRC、manifest 清单、逐文件摘要与源码／数学摘要绑定数据审计通过；本地受控提取后完整逐文件摘要再次一致。独立测试副本受控提取保留 `ChaSteady/` 前缀，1228 个文件合计 `383881616 B`；另行本地交付应用 ZIP 及清单／摘要。没有启动应用、Worker 或 GUI。
+- fresh 签名补证仅表明当前本机这一个包内 Python DLL 为 `Valid`；manifest 的源签名状态仍为 `null`，没有回填，不证明主程序／整包签名、运行、安全或法律分发认证。主程序／整包仍未签名，法律分发未认证，没有 GitHub Release／Marketplace 发布。
+- 同包真实 GUI 尚未验收；CTB 自动导出仍为 0，GF 生产身份／模板管理和 strict 全长 fresh V9 仍阻塞。私有三案例 golden 未上传 CI；CI 消费来源绑定摘要不是重跑私有 golden，本次数据审计与提取也未重跑它们。
 
 ### Early executable identity gate
 
